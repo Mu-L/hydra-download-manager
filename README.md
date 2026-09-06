@@ -43,6 +43,7 @@
   - [CLI Compatibility (`wget` / `curl` Mode)](#cli-compatibility-wget--curl-mode)
   - [Interactive Queue Manager (TUI)](#interactive-queue-manager-tui)
   - [Remote Checksum Lookup & Verification](#remote-checksum-lookup--verification)
+  - [Portable GUI Profile](#portable-gui-profile)
 - [Benchmark](#benchmark)
   - [A fair 100 ms path](#a-fair-100-ms-path)
   - [Four public mirrors](#four-public-mirrors)
@@ -94,6 +95,7 @@
 - **Browser Integration** — Chrome, Edge, Firefox, and Safari extensions hand off downloads
 - **Queue & Scheduler** — scheduled start/stop times with retry tracking
 - **Desktop Niceties** — tray icon, sounds, launch-on-startup, localized UI
+- **Portable Profile** — `hydra-gui --config ./here` keeps settings, downloads list and logs in that directory
 
 </td></tr>
 </table>
@@ -535,6 +537,23 @@ hydra checksum https://example.com/release.tar.gz
 # Download with target hash verification
 hydra --checksum sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 https://example.com/file.tar.gz
 ```
+
+### Portable GUI Profile
+
+The desktop app keeps `config.toml`, its download list (`state.redb`), `logs/` and `locales/` in
+`~/.config/hydra` (Linux/macOS) or `%APPDATA%\hydra` (Windows). `--config` points all of it
+somewhere else — a USB stick, a project folder, a second profile:
+
+```bash
+hydra-gui --config ./here
+```
+
+The path may be relative (it is resolved against the working directory at launch) and is created
+if missing. Such an instance is fully independent: it has its own download list and its own
+single-instance lock, so it runs alongside an ordinary Hydra. Two per-user registrations stay
+with the ordinary install and are left untouched — the login item ("launch on startup") and the
+browser native-messaging host, neither of which can carry the flag. The browser extension still
+reaches a running portable instance over its WebSocket port.
 
 ---
 

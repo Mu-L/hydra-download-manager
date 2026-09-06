@@ -766,14 +766,42 @@ pub fn pick_queue_color(existing: &[QueueDef]) -> u32 {
     pool[seed % pool.len()]
 }
 
-/// The application directory holding `config.toml`, `gui-state.json`,
+/// The `--config DIR` the app was started with, absolute, when one was
+/// given. Written once in `main` before anything reads [`app_dir`].
+static APP_DIR_OVERRIDE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Run out of `dir` instead of the platform application directory. Called
+/// from `main` for `--config DIR`, before the first [`app_dir`] read; a
+/// second call is ignored, since half the process would already be pointing
+/// at the first answer.
+pub fn set_app_dir(dir: PathBuf) {
+    let _ = APP_DIR_OVERRIDE.set(dir);
+}
+
+/// The `--config DIR` in force, if any.
+///
+/// Callers that hand this instance's identity to some OTHER process — the
+/// login item that relaunches it, the native-messaging host the browser
+/// spawns — have to know the directory is not the one that process would
+/// otherwise assume.
+pub fn app_dir_override() -> Option<&'static std::path::Path> {
+    APP_DIR_OVERRIDE.get().map(|p| p.as_path())
+}
+
+/// The application directory holding `config.toml`, `state.redb`,
 /// `locales/` and `logs/`.
 ///
-/// Deliberately NOT `dirs::config_dir()` everywhere: on macOS that resolves to
-/// `~/Library/Application Support`, and hydra's convention (shared with the
-/// CLI) is `~/.config/hydra` on both Linux and macOS. Windows uses
-/// `%APPDATA%\hydra` (`Users\{user}\AppData\Roaming\hydra`).
+/// `--config DIR` moves all of it, so a portable install (a USB stick, a
+/// second profile) keeps its settings and download list beside itself.
+/// Without the flag: deliberately NOT `dirs::config_dir()` everywhere — on
+/// macOS that resolves to `~/Library/Application Support`, and hydra's
+/// convention (shared with the CLI) is `~/.config/hydra` on both Linux and
+/// macOS. Windows uses `%APPDATA%\hydra`
+/// (`Users\{user}\AppData\Roaming\hydra`).
 pub fn app_dir() -> PathBuf {
+    if let Some(dir) = APP_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
     #[cfg(target_os = "windows")]
     {
         dirs::config_dir()
