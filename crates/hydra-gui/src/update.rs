@@ -293,6 +293,14 @@ async fn drive(
         }
         (None, None) => return Err(std::io::Error::other("nothing was extracted to install")),
     }
+    // The finisher restarts us; a `--config DIR` instance has to come back
+    // on the same profile rather than on the default one.
+    if let Some(dir) = crate::model::app_dir_override() {
+        cmd.arg("--relaunch-arg")
+            .arg("--config")
+            .arg("--relaunch-arg")
+            .arg(dir);
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

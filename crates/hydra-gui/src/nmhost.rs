@@ -282,6 +282,20 @@ fn register_windows(host: &Path) {
 /// Runs off the UI thread; failures are logged and otherwise ignored, since
 /// the WebSocket transport still works whenever the app is already running.
 pub fn ensure_registered() {
+    // A `--config DIR` instance registers nothing. The manifest is
+    // machine-wide per user and carries no arguments, so `hydra-host` always
+    // reads ipc.json from the DEFAULT application directory: registering
+    // here would point every browser at a host that talks to the ordinary
+    // install (or to nothing at all), and overwrite that install's
+    // registration on the way. The WebSocket transport still reaches this
+    // instance while it is running.
+    if let Some(dir) = crate::model::app_dir_override() {
+        crate::log::info(&format!(
+            "nmhost: --config {} — browser registration left to the default profile",
+            dir.display()
+        ));
+        return;
+    }
     std::thread::Builder::new()
         .name("nmhost-register".into())
         .spawn(|| {
