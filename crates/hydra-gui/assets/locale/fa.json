@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "تعداد تلاش مجدد برای هر فایل در صورت شکست دانلود:",
   "OK": "تأیید",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "خاموش (پیش‌فرض): هر دانلود در پوشه دسته خودش ذخیره می‌شود، مثلاً Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "خاموش = تا زمانی که «شروع دانلود» زده نشود چیزی دریافت نمی‌شود، بنابراین تغییر نام یا تغییر پوشه پیش از انتقال انجام می‌شود نه در حین آن.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "روشن: پوشه‌های بالا نادیده گرفته می‌شوند و دانلودهای جدید مستقیماً در پوشه دسته General ذخیره می‌شوند. دانلودهایی که از قبل در فهرست هستند پوشه خود را حفظ می‌کنند.",
   "Once": "یک‌بار",
   "One-time downloading": "دانلود یک‌باره",

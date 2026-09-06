@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "ダウンロード失敗時の再試行回数:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "オフ（デフォルト）: ダウンロードはカテゴリフォルダに保存されます（例: Downloads/Video）。",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "オフ = 「ダウンロード開始」を押すまで何も取得しません。名前やフォルダーの変更は転送中ではなく転送前に行えます。",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "オン: 上記のフォルダは無視され、新しいダウンロードは「一般」カテゴリフォルダに直接保存されます。リストに既にあるダウンロードは元のフォルダのままです。",
   "Once": "1回のみ",
   "One-time downloading": "1回限りのダウンロード",

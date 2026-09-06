@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Az újrapróbálkozások száma fájlonként sikertelen letöltés esetén:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Kikapcsolva (alapértelmezett): a letöltés a kategóriája szerinti mappába kerül, pl. Letöltések/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Kikapcsolva = semmi sem töltődik le, amíg meg nem nyomja a „Letöltés indítása” gombot, így az átnevezés vagy a mappaváltás az átvitel előtt történik, nem közben.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Bekapcsolva: a fenti mappák figyelmen kívül maradnak, és az új letöltések közvetlenül az Általános kategóriamappába kerülnek mentésre. A listán már szereplő letöltések megtartják mappájukat.",
   "Once": "Egyszer",
   "One-time downloading": "Egyszeri letöltés",

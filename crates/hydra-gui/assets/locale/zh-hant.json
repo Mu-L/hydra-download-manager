@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "下載失敗時，每個檔案的重試次數：",
   "OK": "確定",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "關閉（預設）：下載內容將歸檔到其分類檔案夾中，例如 Downloads/Video。",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "關閉 = 在按下“開始下載”之前不會下載任何內容，因此重新命名或變更資料夾是在傳輸前完成，而非傳輸過程中。",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "開啟後：以上檔案夾將被忽略，新下載的檔案將直接儲存到「一般」分類檔案夾中。清單中已有的下載檔案將保留在其原始檔案夾中。",
   "Once": "一次",
   "One-time downloading": "一次下載",

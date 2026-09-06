@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Počet opakování pro každý soubor při selhání stahování:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Vypnuto (výchozí): stahování se uloží do složky své kategorie, např. Stahování/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Vypnuto = nic se nestahuje, dokud nestisknete „Spustit stahování“, takže přejmenování nebo změna složky proběhne před přenosem, ne během něj.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Zapnuto: složky uvedené výše se ignorují a nová stahování se ukládají přímo do složky kategorie Obecné. Stahování již v seznamu si svou složku ponechají.",
   "Once": "Jednou",
   "One-time downloading": "Jednorázové stahování",

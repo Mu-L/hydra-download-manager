@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Số lần thử lại cho mỗi tệp nếu tải xuống thất bại:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Tắt (mặc định): mỗi lượt tải được lưu vào thư mục danh mục của nó, ví dụ Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Tắt = không tải gì cho đến khi nhấn \"Bắt đầu tải xuống\", nên việc đổi tên hay đổi thư mục diễn ra trước khi truyền, không phải trong lúc truyền.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Bật: các thư mục ở trên bị bỏ qua và các lượt tải mới được lưu trực tiếp vào thư mục danh mục Chung. Các lượt tải đã có trong danh sách vẫn giữ nguyên thư mục của chúng.",
   "Once": "Một lần",
   "One-time downloading": "Tải xuống một lần",

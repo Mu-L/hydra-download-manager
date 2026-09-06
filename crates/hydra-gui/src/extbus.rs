@@ -41,6 +41,8 @@ pub struct ExtDownload {
     /// Verbatim `Cookie:` header assembled by the extension for this URL.
     #[serde(default)]
     pub cookies: Option<String>,
+    /// The page the file was linked from, replayed as `Referer:` on every
+    /// request: a CDN with hotlink protection refuses the object without it.
     #[serde(default)]
     pub referer: Option<String>,
     #[serde(default)]
@@ -453,8 +455,9 @@ fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
         }
         Some("download") => match serde_json::from_value::<ExtDownload>(req.clone()) {
             Ok(dl) if !dl.url.is_empty() => {
-                // referer/user_agent/size arrive for the log today; the
-                // engine's StartSpec grows per-download headers later.
+                // The referer travels with the item and onto every request
+                // (`DownloadItem::referer`); user_agent and size are logged
+                // for support, the transfer using the configured agent.
                 crate::log::info(&format!(
                     "extbus: capture {} (mime={} size={} referer={} ua={} from={})",
                     dl.url,
