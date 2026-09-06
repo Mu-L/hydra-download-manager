@@ -84,8 +84,26 @@ fn entry_path() -> Option<PathBuf> {
 }
 
 /// Sync the login item with the settings. Safe to call every save.
-#[cfg(target_os = "windows")]
+///
+/// A `--config DIR` instance leaves the login item alone. There is exactly
+/// one per user and the ordinary install owns it, while a fresh profile's
+/// settings have "launch on startup" ON — so a portable copy would seize it
+/// on its very first run, and every logon after that would start the
+/// portable copy, on the portable download list, instead of the installed
+/// one. Same reasoning as the browser registration in `nmhost`.
 pub fn apply(enabled: bool, minimized: bool) {
+    if let Some(dir) = crate::model::app_dir_override() {
+        crate::log::info(&format!(
+            "login item: --config {} — left to the default profile",
+            dir.display()
+        ));
+        return;
+    }
+    apply_platform(enabled, minimized);
+}
+
+#[cfg(target_os = "windows")]
+fn apply_platform(enabled: bool, minimized: bool) {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
 
@@ -135,9 +153,8 @@ pub fn apply(enabled: bool, minimized: bool) {
     }
 }
 
-/// Sync the login item with the settings. Safe to call every save.
 #[cfg(not(target_os = "windows"))]
-pub fn apply(enabled: bool, minimized: bool) {
+fn apply_platform(enabled: bool, minimized: bool) {
     let Some(path) = entry_path() else { return };
     if !enabled {
         // On Linux the deb/rpm packages ship /etc/xdg/autostart/hydra.desktop,
