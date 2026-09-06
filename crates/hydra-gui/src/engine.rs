@@ -43,6 +43,10 @@ pub struct StartSpec {
     pub expected_size: Option<u64>,
     /// `Cookie:` header value, verbatim.
     pub cookies: Option<String>,
+    /// `Referer:` header value, verbatim: the page the file was linked from.
+    /// A CDN with hotlink protection refuses the object without it, whatever
+    /// the cookies say.
+    pub referer: Option<String>,
     /// Aggregate cap in bytes/sec; `None` = unlimited (can be changed live).
     pub limit: Option<u64>,
     /// Start at one connection and let the in-band ramp admit more while
@@ -101,6 +105,7 @@ impl StartSpec {
             held: Vec::new(),
             expected_size: None,
             cookies: None,
+            referer: None,
             limit: None,
             adaptive: false,
             remote_time: false,
@@ -512,14 +517,14 @@ pub struct LinkMeta {
 /// Bounded: a pasted 500-link batch must not open 500 concurrent
 /// handshakes (fd limits, origin rate limiting). A small global gate keeps
 /// the fan-out polite; the shared connector reuses connections per host.
-pub async fn probe_link(url: String, user_agent: String) -> Option<LinkMeta> {
+pub async fn probe_link(url: String, user_agent: String, headers: Vec<String>) -> Option<LinkMeta> {
     static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let gate = GATE
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(6)))
         .clone();
     let _permit = gate.acquire_owned().await.ok()?;
     let connector = shared_connector().ok()?;
-    let (url, p) = resolve_link(connector.as_ref(), url, &user_agent, &[]).await?;
+    let (url, p) = resolve_link(connector.as_ref(), url, &user_agent, &headers).await?;
     if p.status >= 300 {
         return None;
     }
@@ -1070,9 +1075,14 @@ fn base64(data: &[u8]) -> String {
 }
 
 /// The request headers a download's credentials turn into: HTTP Basic for a
-/// login, `Cookie:` for a cookie string. Shared by the transfer and by the
-/// probes that must see the same object it will.
-pub fn request_headers(auth: Option<(&str, &str)>, cookies: Option<&str>) -> Vec<String> {
+/// login, `Cookie:` for a cookie string, `Referer:` for the page the file was
+/// linked from. Shared by the transfer and by the probes that must see the
+/// same object it will.
+pub fn request_headers(
+    auth: Option<(&str, &str)>,
+    cookies: Option<&str>,
+    referer: Option<&str>,
+) -> Vec<String> {
     let mut headers = Vec::new();
     if let Some((user, pass)) = auth {
         headers.push(format!(
@@ -1083,6 +1093,9 @@ pub fn request_headers(auth: Option<(&str, &str)>, cookies: Option<&str>) -> Vec
     if let Some(c) = cookies.map(str::trim).filter(|c| !c.is_empty()) {
         headers.push(format!("Cookie: {c}"));
     }
+    if let Some(r) = referer.map(str::trim).filter(|r| !r.is_empty()) {
+        headers.push(format!("Referer: {r}"));
+    }
     headers
 }
 
@@ -1090,6 +1103,7 @@ fn target_for(u: &ParsedUrl, spec: &StartSpec) -> Target {
     let headers = request_headers(
         spec.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
         spec.cookies.as_deref(),
+        spec.referer.as_deref(),
     );
     target_of(u, headers, &spec.user_agent)
 }
@@ -3046,6 +3060,7 @@ mod tests {
                 held: vec![],
                 expected_size: None,
                 cookies: None,
+                referer: None,
                 limit: None,
                 adaptive: std::env::var_os("HYDRA_AB_ADAPTIVE").is_some(),
                 remote_time: false,
@@ -3272,6 +3287,7 @@ mod tests {
             held: vec![],
             expected_size: None,
             cookies: None,
+            referer: None,
             limit: None,
             adaptive: false,
             // On, so the harness exercises the stamping path too: it is part
@@ -6335,8 +6351,28 @@ mod peek_zip_tests {
 
     #[test]
     fn credentials_become_headers() {
-        let h = request_headers(Some(("me", "pw")), Some("  sid=1  "));
+        let h = request_headers(Some(("me", "pw")), Some("  sid=1  "), None);
         assert_eq!(h, ["Authorization: Basic bWU6cHc=", "Cookie: sid=1"]);
-        assert!(request_headers(None, Some("   ")).is_empty());
+        assert!(request_headers(None, Some("   "), Some("  ")).is_empty());
+    }
+
+    /// A hotlink-protected CDN answers `403` to a request without the page
+    /// it was linked from, however good the cookies are: the captured
+    /// referer has to reach the wire, not just the log.
+    #[test]
+    fn a_captured_referer_becomes_a_header() {
+        let spec = StartSpec {
+            cookies: Some("sid=1".into()),
+            referer: Some("https://www.example.com/watch".into()),
+            user_agent: "hydra-test".into(),
+            ..StartSpec::plain()
+        };
+        let u = parse_url("https://cdn.example.com/a.mp4?e=1&s=2").unwrap();
+        let t = format!("{:?}", target_for(&u, &spec));
+        assert!(
+            t.contains("Referer: https://www.example.com/watch"),
+            "no referer on the target: {t}"
+        );
+        assert!(t.contains("Cookie: sid=1"), "no cookie on the target: {t}");
     }
 }

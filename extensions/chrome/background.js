@@ -586,6 +586,31 @@ function titleName(title) {
   );
 }
 
+/// What to call a captured media file.
+///
+/// Normally nothing: the URL's own basename is the better name, and Hydra
+/// reads it off the URL by itself — `big_buck_bunny_1080p.mp4` beats any page
+/// title, and on a page of samples every row would otherwise take the same
+/// one. But an object stored as `fc1eced1-6d50-4375-a125-ef65c887d7d5.mp4` was
+/// named by the CDN for the CDN, and lands as a row of gibberish the user then
+/// renames by hand. There the page title is the answer, which is what IDM
+/// gives them.
+function mediaName(url, title, kind) {
+  const base = decodeURIComponent(url.split(/[?#]/)[0].split("/").pop() || "");
+  const stem = base.replace(/\.[^.]+$/, "");
+  const opaque =
+    !stem ||
+    /^[0-9a-f]{8,}$/i.test(stem) ||
+    /^[0-9a-f][0-9a-f-]{15,}$/i.test(stem) ||
+    /^\d{6,}$/.test(stem);
+  if (!opaque) return null;
+  const named = titleName(title);
+  if (!named) return null;
+  // The extension the file really has, else what the server called its type.
+  const ext = (/\.([a-z0-9]{2,5})$/i.exec(base)?.[1] || kind || "").toLowerCase();
+  return ext ? `${named}.${ext}` : named;
+}
+
 /// Stable identity for one variant, so the popup can name the row's choice
 /// back to the service worker. Duplicated verbatim in popup.js — the two run
 /// in different contexts and must agree.
@@ -1162,9 +1187,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "open-hydra":
         sendResponse(await request({ type: "open" }));
         break;
-      case "download-url":
-        sendResponse(await sendToHydra(msg.url, { referer: msg.referer || null }));
+      case "download-url": {
+        // Only a file the media sniffer saw is named after the page: an
+        // ordinary link — a `.zip` on a downloads page — means its own name,
+        // not the article's.
+        const id = await whichTab();
+        const bare = msg.url.split(/[?#]/)[0];
+        const hit = (id != null ? await tabMedia(id) : []).find(
+          (m) => m.url.split(/[?#]/)[0] === bare
+        );
+        const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : null;
+        sendResponse(
+          await sendToHydra(msg.url, {
+            referer: msg.referer || null,
+            filename: hit ? mediaName(msg.url, tab?.title, hit.kind) : null,
+          })
+        );
         break;
+      }
       case "download-stream": {
         const id = await whichTab();
         const entry = (id != null ? await tabStreams(id) : []).find((s) => s.key === msg.key);

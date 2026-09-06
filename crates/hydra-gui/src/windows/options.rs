@@ -348,6 +348,14 @@ fn downloads(app: &App) -> El<'_> {
             tr("Adding a link first shows name/category/folder while the transfer already runs in the background; off = downloads start immediately."),
         ),
         hinted(
+            checkbox(s.bg_download).label(tr("Download in background while the dialog is open"))
+                .on_toggle(|b| o(OptField::BgDownload(b)))
+                .size(15.0)
+                .text_size(theme::FONT_SIZE)
+                .style(theme::check),
+            tr("Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it."),
+        ),
+        hinted(
             checkbox(s.show_speed_tab).label(tr("Show \"Speed Limiter\" tab"))
                 .on_toggle(|b| o(OptField::SpeedTab(b)))
                 .size(15.0)

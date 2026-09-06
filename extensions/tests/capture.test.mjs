@@ -59,7 +59,7 @@ function build({ hydraReply = { ok: true }, store = {} } = {}) {
     contextMenus: { removeAll: async () => {}, create: () => {}, onClicked: onMenu },
     tabs: {
       query: async () => [{ id: 7, url: "https://page.example/watch" }],
-      get: async () => ({ id: 7, url: "https://page.example/watch" }),
+      get: async () => ({ id: 7, url: "https://page.example/watch", title: "Sunset Timelapse 4K" }),
       sendMessage: async () => ({ urls: ["https://a.example/1.zip", "https://b.example/2.zip"] }),
       create: () => {}, onRemoved: ev(), onUpdated: ev(),
     },
@@ -311,6 +311,54 @@ function build({ hydraReply = { ok: true }, store = {} } = {}) {
       JSON.stringify(t.store.media_7)
     );
   }
+}
+
+// ------------------------------------- 9. naming a captured media file
+//
+// A CDN that stores its objects under a uuid hands the user a row of
+// gibberish to rename by hand; the page title is what IDM gives them and
+// what they asked for.
+{
+  const uuid = "https://cdn.example/1b364999/fc1eced1-6d50-4375-a125-ef65c887d7d5.mp4";
+  const h = build();
+  await tick(4);
+  h.respond({ url: uuid, mime: "video/mp4", size: 109_566_922 });
+  await tick(6);
+  await h.send({ type: "download-url", url: `${uuid}?e=1&s=abc`, referer: "https://page.example/watch" });
+  await tick(2);
+  const dl = h.sent.find((m) => m.type === "download");
+  check(
+    "naming: an opaque CDN name becomes the page title",
+    dl?.filename === "Sunset Timelapse 4K.mp4",
+    JSON.stringify(dl)
+  );
+  check("naming: the referer travels with it", dl?.referer === "https://page.example/watch");
+
+  // A file that names itself keeps its name: a page of samples would
+  // otherwise put the same title on every one of them.
+  const h2 = build();
+  await tick(4);
+  h2.respond({ url: "https://cdn.example/big_buck_bunny_1080p.mp4", mime: "video/mp4" });
+  await tick(6);
+  await h2.send({ type: "download-url", url: "https://cdn.example/big_buck_bunny_1080p.mp4" });
+  await tick(2);
+  check(
+    "naming: a file that names itself is left alone",
+    !h2.sent.find((m) => m.type === "download")?.filename,
+    JSON.stringify(h2.sent)
+  );
+
+  // An ordinary link is not media the page played, so the article's title
+  // has nothing to do with it.
+  const h3 = build();
+  await tick(4);
+  await h3.send({ type: "download-url", url: "https://files.example/8675309.zip" });
+  await tick(2);
+  check(
+    "naming: an unsniffed link keeps its own name",
+    !h3.sent.find((m) => m.type === "download")?.filename,
+    JSON.stringify(h3.sent)
+  );
 }
 
 console.log(fails ? `\n${fails} FAILED` : "\nall passed");
