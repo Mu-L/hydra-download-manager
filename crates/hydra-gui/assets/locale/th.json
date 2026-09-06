@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "จำนวนครั้งที่ลองใหม่สำหรับแต่ละไฟล์หากดาวน์โหลดล้มเหลว :",
   "OK": "ตกลง",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "ปิด (ค่าเริ่มต้น): ไฟล์ดาวน์โหลดจะถูกจัดเก็บในโฟลเดอร์ตามหมวดหมู่ เช่น Downloads/Video",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "ปิด = จะไม่ดาวน์โหลดสิ่งใดจนกว่าจะกด \"เริ่มดาวน์โหลด\" ดังนั้นการเปลี่ยนชื่อหรือเปลี่ยนโฟลเดอร์จะเกิดขึ้นก่อนการถ่ายโอน ไม่ใช่ระหว่างนั้น",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "เปิด: โฟลเดอร์ด้านบนจะถูกละเว้น และการดาวน์โหลดใหม่จะถูกบันทึกลงในโฟลเดอร์หมวดหมู่ทั่วไปโดยตรง ส่วนไฟล์ที่อยู่ในรายการอยู่แล้วจะยังคงอยู่ในโฟลเดอร์เดิม",
   "Once": "ครั้งเดียว",
   "One-time downloading": "การดาวน์โหลดครั้งเดียว",

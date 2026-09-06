@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Antal nya försök per fil om nedladdningen misslyckas:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Av (standard): en nedladdning sparas i sin kategorimapp, t.ex. Nedladdningar/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Av = inget hämtas förrän \"Starta nedladdning\" trycks, så byte av namn eller mapp sker före överföringen, inte under den.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "På: mapparna ovan ignoreras och nya nedladdningar sparas direkt i kategorimappen Allmänt. Nedladdningar som redan finns i listan behåller sin mapp.",
   "Once": "En gång",
   "One-time downloading": "Engångsnedladdning",

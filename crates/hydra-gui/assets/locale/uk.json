@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Кількість повторних спроб для кожного файлу в разі помилки завантаження :",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Вимкнено (типово): завантаження розміщується в папці своєї категорії, наприклад Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Вимкнено = нічого не завантажується, доки не натиснуто \"Почати завантаження\", тож перейменування чи зміна теки відбувається до передавання, а не під час нього.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Увімкнено: папки вище ігноруються, і нові завантаження зберігаються безпосередньо в папці категорії «Загальні». Завантаження, які вже є в списку, зберігають свою папку.",
   "Once": "Один раз",
   "One-time downloading": "Одноразове завантаження",
