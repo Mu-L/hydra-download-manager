@@ -65,6 +65,14 @@ pub struct DownloadItem {
     /// (filled manually or, later, by the browser extension).
     #[serde(default)]
     pub cookies: Option<String>,
+    /// `Referer:` header value for a hotlink-protected origin: the page the
+    /// browser was on when the extension captured this file. Sites that gate
+    /// their CDN on it answer `403` to a request without it, however good the
+    /// cookies are, so it travels with the item and is replayed on every
+    /// start — the same way `StreamInfo::referer` already works for a
+    /// manifest's segments.
+    #[serde(default)]
+    pub referer: Option<String>,
     /// Per-download cap, bytes/sec, when the Speed Limiter tab enables one.
     pub speed_limit: Option<u64>,
     /// Parked by the Connection tab's download limit, not by the user. The

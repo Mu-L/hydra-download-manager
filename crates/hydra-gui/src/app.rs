@@ -272,6 +272,9 @@ pub struct AddUrlState {
     /// Filename the browser had already resolved (Content-Disposition et
     /// al.) — better than what the URL path implies.
     pub capture_name: Option<String>,
+    /// Page the browser was on when it captured this file. A CDN with
+    /// hotlink protection answers `403` without it.
+    pub capture_referer: Option<String>,
     /// What the address turned out to be, when it is a manifest. A stream
     /// has to be asked which rendition BEFORE it starts — there is no
     /// changing your mind halfway through a hundred segments.
@@ -338,6 +341,7 @@ pub struct PendingAdd {
     pub auth: Option<(String, String)>,
     pub cookies: Option<String>,
     pub name: Option<String>,
+    pub referer: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1076,6 +1080,7 @@ pub enum OptField {
     ServerDate(bool),
     NoCatDirs(bool),
     ShowFileInfo(bool),
+    BgDownload(bool),
     StartMinimized(bool),
     SpeedTab(bool),
     CompletionTab(bool),
@@ -1577,12 +1582,20 @@ impl App {
     }
 
     /// Attach what the browser knew that `add_item` could not: session
-    /// cookies and the already-resolved filename. Must run before any start
-    /// so the first request carries the Cookie header; renaming re-runs
-    /// categorization because the URL-derived name may have had no
-    /// extension at all.
-    fn apply_capture_extras(&mut self, id: DlId, cookies: Option<String>, name: Option<String>) {
-        if cookies.is_none() && name.is_none() {
+    /// cookies, the page the file was linked from, and the already-resolved
+    /// filename. Must run before any start so the first request carries the
+    /// `Cookie` and `Referer` headers — a hotlink-protected CDN answers
+    /// `403` without the referer, whatever the cookies say. Renaming re-runs
+    /// categorization because the URL-derived name may have had no extension
+    /// at all.
+    fn apply_capture_extras(
+        &mut self,
+        id: DlId,
+        cookies: Option<String>,
+        name: Option<String>,
+        referer: Option<String>,
+    ) {
+        if cookies.is_none() && name.is_none() && referer.is_none() {
             return;
         }
         // Resolved before the item is borrowed mutably, and through
@@ -1596,6 +1609,9 @@ impl App {
         if let Some(d) = self.item_mut(id) {
             if let Some(c) = cookies {
                 d.cookies = Some(c);
+            }
+            if let Some(r) = referer {
+                d.referer = Some(r);
             }
             if let Some(n) = name {
                 d.file_name = n;
@@ -2118,6 +2134,7 @@ impl App {
             held: d.held.clone(),
             expected_size: d.size,
             cookies: d.cookies.clone(),
+            referer: d.referer.clone(),
             limit: None,
             adaptive,
             remote_time,
@@ -2312,6 +2329,7 @@ impl App {
             q_order,
             auth,
             cookies: None,
+            referer: None,
             speed_limit: None,
             limit_paused: false,
             held: vec![],
@@ -3995,6 +4013,11 @@ impl App {
                     .take()
                     .filter(|s| !s.is_empty());
                 let cap_name = self.add_url.capture_name.take().filter(|s| !s.is_empty());
+                let cap_referer = self
+                    .add_url
+                    .capture_referer
+                    .take()
+                    .filter(|s| !s.is_empty());
                 // A manifest that was inspected becomes a STREAM item: the
                 // chosen rendition and container decide the filename, which
                 // the URL path cannot.
@@ -4052,6 +4075,7 @@ impl App {
                         auth,
                         cookies: cap_cookies,
                         name: cap_name,
+                        referer: cap_referer,
                     });
                     self.confirm = Some(ConfirmKind::Duplicate { existing, file });
                     self.add_url = AddUrlState::default();
@@ -4059,7 +4083,7 @@ impl App {
                     return Task::batch([close, self.open_window(WinKind::Confirm)]);
                 }
                 let id = self.add_item(url, auth, None);
-                self.apply_capture_extras(id, cap_cookies, cap_name);
+                self.apply_capture_extras(id, cap_cookies, cap_name, cap_referer);
                 if let Some(si) = stream {
                     let cat = crate::model::categorize(&name, &self.cfg.categories);
                     let dir = self
@@ -4125,6 +4149,7 @@ impl App {
                         address: dl.url,
                         capture_cookies: dl.cookies,
                         capture_name: dl.filename,
+                        capture_referer: dl.referer,
                         ..AddUrlState::default()
                     };
                     self.update(Message::AddUrlOk)
@@ -4434,7 +4459,8 @@ impl App {
                 // or cookie must reach the peek before it reaches the item.
                 let auth =
                     (!fi.login.is_empty()).then_some((fi.login.as_str(), fi.password.as_str()));
-                let headers = engine::request_headers(auth, Some(&fi.cookies));
+                let referer = self.item(dl).and_then(|d| d.referer.clone());
+                let headers = engine::request_headers(auth, Some(&fi.cookies), referer.as_deref());
                 let url = fi.url.clone();
                 let ua = self.cfg.settings.user_agent.clone();
                 // The size the probe (or the transfer running behind the
@@ -5074,9 +5100,10 @@ impl App {
                                 Message::BatchMetalinkProbed(url.clone(), Box::new(r.ok()))
                             })
                         } else {
-                            Task::perform(engine::probe_link(url.clone(), ua), move |meta| {
-                                Message::BatchProbed(url.clone(), meta)
-                            })
+                            Task::perform(
+                                engine::probe_link(url.clone(), ua, vec![]),
+                                move |meta| Message::BatchProbed(url.clone(), meta),
+                            )
                         }
                     })
                     .collect();
@@ -5434,7 +5461,7 @@ impl App {
                     return close;
                 };
                 let id = self.add_item(pending.url, pending.auth, None);
-                self.apply_capture_extras(id, pending.cookies, pending.name);
+                self.apply_capture_extras(id, pending.cookies, pending.name, pending.referer);
                 // `name_1.ext`, `name_2.ext`, ... until it collides with
                 // neither the disk nor another list entry. Locked, because
                 // this copy exists precisely so the file already on disk is
@@ -5529,8 +5556,20 @@ impl App {
             return self.start_download(id, false);
         }
         let ua = self.cfg.settings.user_agent.clone();
-        let url = self.item(id).map(|d| d.url.clone()).unwrap_or_default();
-        Task::perform(engine::probe_link(url, ua), move |meta| {
+        let (url, headers) = self
+            .item(id)
+            .map(|d| {
+                (
+                    d.url.clone(),
+                    engine::request_headers(
+                        d.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
+                        d.cookies.as_deref(),
+                        d.referer.as_deref(),
+                    ),
+                )
+            })
+            .unwrap_or_default();
+        Task::perform(engine::probe_link(url, ua, headers), move |meta| {
             Message::InfoProbed(id, meta)
         })
     }
@@ -5970,6 +6009,7 @@ impl App {
             OptField::ServerDate(b) => s.server_file_date = b,
             OptField::NoCatDirs(b) => s.no_category_dirs = b,
             OptField::ShowFileInfo(b) => s.show_file_info_dialog = b,
+            OptField::BgDownload(b) => s.bg_download = b,
             OptField::StartMinimized(b) => s.start_minimized = b,
             OptField::SpeedTab(b) => s.show_speed_tab = b,
             OptField::CompletionTab(b) => s.show_completion_tab = b,
@@ -6897,6 +6937,7 @@ mod tests {
             q_order: 0,
             auth: None,
             cookies: None,
+            referer: None,
             speed_limit: None,
             limit_paused: false,
             held: vec![],
