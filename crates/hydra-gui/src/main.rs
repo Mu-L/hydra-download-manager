@@ -39,8 +39,65 @@ mod windows;
 
 use app::{App, Message, WinKind};
 use iced::{window, Subscription, Task, Theme};
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+/// The directory named by `--config DIR` (or `--config=DIR`), as written on
+/// the command line. `Err` carries the line to print before exiting: a
+/// misspelt profile path must not fall back to the default one and silently
+/// run against the wrong download list.
+fn config_dir_arg<I: IntoIterator<Item = OsString>>(args: I) -> Result<Option<PathBuf>, String> {
+    // skip(1): argv[0] is the executable, and a portable install may well
+    // have put the word "--config" in its path.
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        let value = if arg == *"--config" {
+            args.next()
+                .ok_or_else(|| "--config needs a directory".to_string())?
+        } else if let Some(rest) = arg.to_str().and_then(|a| a.strip_prefix("--config=")) {
+            OsString::from(rest)
+        } else {
+            continue;
+        };
+        if value.is_empty() {
+            return Err("--config needs a directory".into());
+        }
+        return Ok(Some(PathBuf::from(value)));
+    }
+    Ok(None)
+}
+
+/// Make `dir` usable as the application directory: absolute (the login item
+/// and the update finisher relaunch this process from an unrelated working
+/// directory, so a relative `./profile` has to be pinned down now) and
+/// present on disk.
+fn prepare_app_dir(dir: PathBuf) -> std::io::Result<PathBuf> {
+    let dir = std::path::absolute(dir)?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
 
 fn main() -> iced::Result {
+    // `--config DIR` moves config.toml, the state db, logs and locales into
+    // DIR, so a portable install keeps its profile beside itself. It is
+    // resolved before anything else: the single-instance probe below already
+    // reads ipc.json out of the application directory, and two profiles are
+    // two independent instances.
+    match config_dir_arg(std::env::args_os()) {
+        Ok(Some(dir)) => match prepare_app_dir(dir) {
+            Ok(dir) => model::set_app_dir(dir),
+            Err(e) => {
+                eprintln!("hydra-gui: --config: {e}");
+                std::process::exit(1);
+            }
+        },
+        Ok(None) => {}
+        Err(msg) => {
+            eprintln!("hydra-gui: {msg}");
+            std::process::exit(2);
+        }
+    }
+
     // Single instance: if a running instance answers on the extbus
     // socket, hand it the spotlight (it opens its main window) and leave.
     // Two instances would fight over state.redb, the tray, and ipc.json —
@@ -448,4 +505,43 @@ fn native_menu_events() -> impl iced::futures::Stream<Item = String> {
             None => iced::futures::future::pending().await,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config_dir_arg;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn parse(argv: &[&str]) -> Result<Option<PathBuf>, String> {
+        config_dir_arg(argv.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn no_flag_means_the_platform_directory() {
+        assert_eq!(parse(&["hydra-gui", "--minimized"]), Ok(None));
+    }
+
+    #[test]
+    fn both_spellings_are_accepted() {
+        let want = Ok(Some(PathBuf::from("./here")));
+        assert_eq!(parse(&["hydra-gui", "--config", "./here"]), want);
+        assert_eq!(parse(&["hydra-gui", "--config=./here"]), want);
+        assert_eq!(
+            parse(&["hydra-gui", "--minimized", "--config", "./here"]),
+            want
+        );
+    }
+
+    #[test]
+    fn a_missing_or_empty_directory_is_an_error() {
+        assert!(parse(&["hydra-gui", "--config"]).is_err());
+        assert!(parse(&["hydra-gui", "--config", ""]).is_err());
+        assert!(parse(&["hydra-gui", "--config="]).is_err());
+    }
+
+    #[test]
+    fn the_executable_path_is_never_read_as_a_flag() {
+        assert_eq!(parse(&["/opt/--config=oops/hydra-gui"]), Ok(None));
+    }
 }
