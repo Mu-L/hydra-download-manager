@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Number of retries for each file if downloading failed :",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Off (default): a download is filed in its category folder, e.g. Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.",
   "Once": "Once",
   "One-time downloading": "One-time downloading",

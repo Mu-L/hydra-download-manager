@@ -153,6 +153,13 @@ fn general(app: &App) -> El<'_> {
                 .style(theme::check),
             tr("Closing the main window leaves Hydra running in the tray, where queues and transfers carry on; open it again from the tray icon. Off: closing the window exits Hydra."),
         ),
+    ];
+    // Straight after "Close to system tray": both decide what the app looks
+    // like once its window is gone.
+    if let Some(el) = hide_taskbar {
+        col = col.push(el);
+    }
+    col.extend([
         hinted(
             checkbox(s.check_updates_on_startup).label(tr("Check for updates on startup"))
                 .on_toggle(|b| o(OptField::CheckUpdates(b)))
@@ -169,11 +176,6 @@ fn general(app: &App) -> El<'_> {
                 .style(theme::check),
             tr("Update checks also offer release candidates (-rc tags) when one is ahead of the stable release; otherwise the stable release is used. Beta builds may be less stable."),
         ),
-    ];
-    if let Some(el) = hide_taskbar {
-        col = col.push(el);
-    }
-    col.extend([
         hinted(
             checkbox(s.power_save).label(tr("Power save mode"))
                 .on_toggle(|b| o(OptField::PowerSave(b)))
@@ -348,7 +350,7 @@ fn downloads(app: &App) -> El<'_> {
             tr("Adding a link first shows name/category/folder while the transfer already runs in the background; off = downloads start immediately."),
         ),
         hinted(
-            checkbox(s.bg_download).label(tr("Download in background while the dialog is open"))
+            checkbox(s.bg_download).label(tr("Download in background while choosing options"))
                 .on_toggle(|b| o(OptField::BgDownload(b)))
                 .size(15.0)
                 .text_size(theme::FONT_SIZE)

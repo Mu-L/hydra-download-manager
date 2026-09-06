@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Numero di tentativi per ciascun file in caso di download non riuscito:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Disattivato (predefinito): un download viene archiviato nella sua cartella di categoria, ad es. Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Disattivato = non viene scaricato nulla finché non si preme \"Avvia download\", così rinominare o cambiare cartella avviene prima del trasferimento, non durante.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Attivato: le cartelle sopra vengono ignorate e i nuovi download vengono salvati direttamente nella cartella della categoria Generale. I download già nell'elenco mantengono la propria cartella.",
   "Once": "Una volta",
   "One-time downloading": "Download singolo",

@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Jumlah percobaan ulang untuk setiap berkas jika pengunduhan gagal:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Nonaktif (default): unduhan disimpan di folder kategorinya, mis. Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Mati = tidak ada yang diunduh sampai \"Mulai Unduhan\" ditekan, jadi mengganti nama atau folder terjadi sebelum transfer, bukan saat berlangsung.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Aktif: folder di atas diabaikan dan unduhan baru disimpan langsung di folder kategori General. Unduhan yang sudah ada di daftar tetap menggunakan folder masing-masing.",
   "Once": "Sekali",
   "One-time downloading": "Pengunduhan sekali",

@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Numărul de reîncercări pentru fiecare fișier dacă descărcarea eșuează:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Dezactivat (implicit): o descărcare este plasată în folderul categoriei sale, de ex. Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Dezactivat = nu se descarcă nimic până la apăsarea „Pornește descărcarea”, astfel redenumirea sau schimbarea folderului are loc înainte de transfer, nu în timpul lui.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Activat: folderele de mai sus sunt ignorate, iar descărcările noi sunt salvate direct în folderul categoriei General. Descărcările deja din listă își păstrează folderul.",
   "Once": "O dată",
   "One-time downloading": "Descărcare unică",
