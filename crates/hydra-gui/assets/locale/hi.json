@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "डाउनलोड विफल होने पर प्रत्येक फ़ाइल के लिए पुनः प्रयासों की संख्या:",
   "OK": "ठीक है",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "बंद (डिफ़ॉल्ट): डाउनलोड को उसके श्रेणी फ़ोल्डर में फ़ाइल किया जाता है, जैसे Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "बंद = \"डाउनलोड शुरू करें\" दबाने तक कुछ भी डाउनलोड नहीं होता, इसलिए नाम बदलना या फ़ोल्डर बदलना स्थानांतरण से पहले होता है, उसके दौरान नहीं।",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "चालू: ऊपर दिए गए फ़ोल्डर अनदेखे कर दिए जाते हैं और नए डाउनलोड सीधे General श्रेणी फ़ोल्डर में सहेजे जाते हैं। सूची में पहले से मौजूद डाउनलोड अपना फ़ोल्डर बनाए रखते हैं।",
   "Once": "एक बार",
   "One-time downloading": "एक बार का डाउनलोड",

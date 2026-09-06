@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "عدد محاولات الإعادة لكل ملف في حال فشل التنزيل :",
   "OK": "موافق",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "إيقاف (افتراضي): يُحفظ التنزيل في مجلد فئته، مثل Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "إيقاف = لا يتم جلب أي شيء حتى الضغط على \"بدء التنزيل\"، لذا تتم إعادة التسمية أو تغيير المجلد قبل النقل لا أثناءه.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "تفعيل: يتم تجاهل المجلدات أعلاه وتُحفظ التنزيلات الجديدة مباشرة في مجلد فئة عام. تحتفظ التنزيلات الموجودة بالفعل في القائمة بمجلدها.",
   "Once": "مرة واحدة",
   "One-time downloading": "تنزيل لمرة واحدة",

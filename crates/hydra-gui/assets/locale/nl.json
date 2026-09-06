@@ -213,6 +213,7 @@
   "Number of retries for each file if downloading failed :": "Aantal pogingen per bestand bij mislukte download:",
   "OK": "OK",
   "Off (default): a download is filed in its category folder, e.g. Downloads/Video.": "Uit (standaard): een download wordt opgeslagen in de bijbehorende categoriemap, bijv. Downloads/Video.",
+  "Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it.": "Uit = er wordt niets opgehaald totdat op \"Download starten\" is geklikt, zodat hernoemen of een andere map kiezen vóór de overdracht gebeurt, niet tijdens.",
   "On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder.": "Aan: de mappen hierboven worden genegeerd en nieuwe downloads worden direct opgeslagen in de categoriemap Algemeen. Downloads die al in de lijst staan, behouden hun map.",
   "Once": "Eenmalig",
   "One-time downloading": "Eenmalig downloaden",
