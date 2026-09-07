@@ -907,7 +907,9 @@ pub enum Message {
     /// Drives the virtual row window in `ui::table`.
     TableScrolled(f32, f32, f32),
     Mods(iced::keyboard::Modifiers),
-    RawKey(iced::keyboard::Key, iced::keyboard::Modifiers),
+    /// A key press no widget consumed, with the window it was aimed at —
+    /// `close_window` has to know which one to shut.
+    RawKey(iced::keyboard::Key, iced::keyboard::Modifiers, window::Id),
     SelectAll,
     RowEnter(DlId),
     RowExit(DlId),
@@ -1742,7 +1744,7 @@ impl App {
             WinKind::Scheduler => (950.0, 660.0),
             WinKind::Batch => (950.0, 700.0),
             WinKind::About => (460.0, 225.0),
-            WinKind::Shortcuts => (520.0, 460.0),
+            WinKind::Shortcuts => (520.0, 520.0),
             WinKind::Confirm => (500.0, 200.0),
             WinKind::Permissions => (640.0, 410.0),
             WinKind::Update => (560.0, 520.0),
@@ -3594,7 +3596,7 @@ impl App {
                 self.mods = m;
                 Task::none()
             }
-            Message::RawKey(key, mods) => {
+            Message::RawKey(key, mods, win) => {
                 // Escape backs out of an inline rename, leaving the queue
                 // under its old name — the draft is only committed on Enter.
                 if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
@@ -3603,13 +3605,17 @@ impl App {
                     self.renaming_queue = None;
                     return Task::none();
                 }
+                // Alt+F4 is the Windows quit convention, not a preference, so
+                // it is not in the editable table. Windows sends the window a
+                // close request of its own as well; quitting outright is what
+                // the shortcut means, close-to-tray or not.
+                if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::F4) && mods.alt() {
+                    return self.update(Message::Menu(MenuAction::Exit));
+                }
                 let combo = combo_string(&key, mods);
                 let Some(combo) = combo else {
                     return Task::none();
                 };
-                if combo == "cmd+a" {
-                    return self.update(Message::SelectAll);
-                }
                 let action = self
                     .cfg
                     .shortcuts
@@ -3668,6 +3674,14 @@ impl App {
                             None => Task::none(),
                         }
                     }
+                    Some("select_all") => self.update(Message::SelectAll),
+                    // Same path as the toolbar's Delete and the Downloads >
+                    // Remove menu entry: it asks before anything is dropped.
+                    Some("remove_selected") => self.update(Message::ToolbarDelete),
+                    // Exactly what the window's own close button does, which
+                    // is what Cmd+W means everywhere else.
+                    Some("close_window") => self.update(Message::WindowCloseRequested(win)),
+                    Some("quit") => self.update(Message::Menu(MenuAction::Exit)),
                     _ => Task::none(),
                 }
             }
@@ -6792,6 +6806,43 @@ pub fn combo_string(key: &iced::keyboard::Key, mods: iced::keyboard::Modifiers) 
 
 #[cfg(test)]
 mod tests {
+    /// A combo the table ships but a key press can never produce is an
+    /// action nobody can reach, and two actions on one combo means the
+    /// alphabetically later id silently never fires.
+    #[test]
+    fn default_shortcuts_are_unique_and_match_what_a_key_press_produces() {
+        use iced::keyboard::{Key, Modifiers};
+
+        let command = if cfg!(target_os = "macos") {
+            Modifiers::LOGO
+        } else {
+            Modifiers::CTRL
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for (id, combo, _) in crate::model::SHORTCUT_ACTIONS {
+            assert!(
+                seen.insert(combo),
+                "'{combo}' is bound twice, once by '{id}'"
+            );
+            let mut parts: Vec<&str> = combo.split('+').collect();
+            let base = parts.pop().expect("split always yields the base key");
+            let mut mods = Modifiers::empty();
+            for part in parts {
+                mods |= match part {
+                    "cmd" => command,
+                    "shift" => Modifiers::SHIFT,
+                    "alt" => Modifiers::ALT,
+                    other => panic!("'{id}' uses an unknown modifier '{other}'"),
+                };
+            }
+            assert_eq!(
+                super::combo_string(&Key::Character(base.into()), mods).as_deref(),
+                Some(combo),
+                "'{id}' ships a combo no key press normalizes to"
+            );
+        }
+    }
+
     #[test]
     fn save_as_splits_folder_and_name() {
         use super::split_save_as as split;
