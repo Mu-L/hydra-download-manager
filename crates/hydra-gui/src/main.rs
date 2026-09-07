@@ -403,10 +403,21 @@ fn subscription(app: &App) -> Subscription<Message> {
             }
             // Shortcuts fire only on events no widget consumed, so typing
             // Cmd+A inside a text field still selects text, not downloads.
+            // Every editable combo carries the command modifier; Escape (back
+            // out of an inline rename) and Alt+F4 (quit on Windows) are the
+            // two fixed conventions that do not, and nothing else is passed
+            // on — an unconsumed keystroke otherwise costs a full repaint.
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. })
-                if status == iced::event::Status::Ignored && modifiers.command() =>
+                if status == iced::event::Status::Ignored
+                    && (modifiers.command()
+                        || matches!(
+                            key,
+                            iced::keyboard::Key::Named(
+                                iced::keyboard::key::Named::Escape | iced::keyboard::key::Named::F4
+                            )
+                        )) =>
             {
-                Some(Message::RawKey(key, modifiers))
+                Some(Message::RawKey(key, modifiers, window))
             }
             iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
                 Some(Message::MouseUp)

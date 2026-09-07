@@ -48,6 +48,12 @@ fn item(label: &str, action: MenuAction) -> MenuItem {
     MenuItem::with_id(action.id(), tr(label), true, None)
 }
 
+/// Same, with a key equivalent shown next to the label. Used where AppKit
+/// would otherwise claim the combo for itself — see the Quit item.
+fn item_accel(label: &str, action: MenuAction, accel: &str) -> MenuItem {
+    MenuItem::with_id(action.id(), tr(label), true, accel.parse().ok())
+}
+
 fn check(label: &str, action: MenuAction, on: bool) -> CheckMenuItem {
     CheckMenuItem::with_id(action.id(), tr(label), true, on, None)
 }
@@ -77,7 +83,10 @@ pub fn reinstall(state: &MenuState, queues: &[String], languages: &[String]) {
         &PredefinedMenuItem::hide_others(None),
         &PredefinedMenuItem::show_all(None),
         &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::quit(None),
+        // Not `PredefinedMenuItem::quit`: that one calls AppKit's terminate
+        // straight away, so the download list and config never get their
+        // final flush. Our own Exit saves first, then exits.
+        &item_accel("Exit Hydra", MenuAction::Exit, "Cmd+Q"),
     ]);
     let _ = menu.append(&app_m);
 
