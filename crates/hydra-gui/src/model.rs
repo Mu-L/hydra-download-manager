@@ -820,7 +820,7 @@ pub fn app_dir() -> PathBuf {
 /// User configuration: everything the Options/Scheduler dialogs edit.
 /// Stored as `config.toml`; a missing or unparsable file yields defaults.
 /// (action id, default combo, English label) — the shortcut table.
-pub const SHORTCUT_ACTIONS: [(&str, &str, &str); 8] = [
+pub const SHORTCUT_ACTIONS: [(&str, &str, &str); 12] = [
     ("add_url", "cmd+n", "Add new download"),
     (
         "clipboard_add",
@@ -833,6 +833,14 @@ pub const SHORTCUT_ACTIONS: [(&str, &str, &str); 8] = [
     ("stop_last", "cmd+s", "Stop last active download"),
     ("start_main_queue", "cmd+shift+r", "Start main queue"),
     ("stop_main_queue", "cmd+shift+s", "Stop main queue"),
+    ("select_all", "cmd+a", "Select all downloads"),
+    (
+        "remove_selected",
+        "cmd+alt+r",
+        "Remove selected downloads from the list",
+    ),
+    ("close_window", "cmd+w", "Close window"),
+    ("quit", "cmd+q", "Exit Hydra"),
 ];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
