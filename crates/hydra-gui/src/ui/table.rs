@@ -6,6 +6,13 @@
 //! header, sortable columns and a horizontal scrollbar. Q is the
 //! icon-only queue-membership strip.
 //!
+//! The header and the ruled empty grid below the last download are drawn as
+//! layers floating over the rows (see [`view`]) rather than as content of
+//! their own: the header then stays at the top of the viewport instead of
+//! scrolling away, and the grid stops adding height the rows do not need, so
+//! the vertical scrollbar shows up only once the downloads really overflow
+//! the window.
+//!
 //! Only the rows inside the scrolled viewport are built (see [`view`]): iced
 //! rebuilds and relayouts the whole tree on every message, so a rubber-band
 //! sweep over a few hundred downloads otherwise rebuilt a few hundred rows —
@@ -42,8 +49,6 @@ const ROW_H: f32 = CELL_H + 1.0;
 /// Rows built above and below the viewport, so a scroll or a resize that
 /// lands between two frames never uncovers a gap.
 const OVERSCAN: usize = 6;
-/// Ruled empty rows kept below the data even on a short window.
-const MIN_FILLER: usize = 60;
 
 pub fn default_widths() -> Vec<f32> {
     COLS.iter().map(|c| c.1).collect()
@@ -103,7 +108,14 @@ fn header<'a>(app: &App, w: &[f32], tw: f32) -> El<'a> {
                 .on_press(Message::ColResizeStart(i)),
         );
     }
-    column![r, row_line(tw)].into()
+    // The strip is painted as a whole, not cell by cell: the header floats
+    // over the rows, and the drag grips between the cells are transparent, so
+    // an unpainted header would show the list moving through its seams.
+    column![
+        container(r).width(tw).style(theme::header_cell(false)),
+        row_line(tw)
+    ]
+    .into()
 }
 
 fn cell<'a>(content: El<'a>, w: f32) -> El<'a> {
@@ -118,28 +130,32 @@ fn cell<'a>(content: El<'a>, w: f32) -> El<'a> {
 /// The divider strip between columns: full drag-handle width, drawing one
 /// centred 1 px vertical line — a single hairline, no boxed gaps.
 fn rule_grip<'a>() -> El<'a> {
-    grip_line(CELL_H.into())
+    container(hairline())
+        .width(GRIP)
+        .height(CELL_H)
+        .padding(iced::Padding {
+            left: (GRIP - 1.0) / 2.0,
+            ..iced::Padding::ZERO
+        })
+        .into()
 }
 
-/// The hairline of [`rule_grip`], at an explicit height so the empty grid
-/// below the data can draw one line down its whole block.
-fn grip_line<'a>(h: Length) -> El<'a> {
-    container(
-        container(iced::widget::space::horizontal())
-            .width(1.0)
-            .height(Length::Fill)
-            .style(|t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::grid_line(t))),
-                ..Default::default()
-            }),
-    )
-    .width(GRIP)
-    .height(h)
-    .padding(iced::Padding {
-        left: (GRIP - 1.0) / 2.0,
-        ..iced::Padding::ZERO
-    })
-    .into()
+/// A bare 1 px vertical line, as tall as it is given.
+fn hairline<'a>() -> El<'a> {
+    container(iced::widget::space::horizontal())
+        .width(1.0)
+        .height(Length::Fill)
+        .style(|t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::grid_line(t))),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Where the hairline between column `i` and the next one sits, measured from
+/// the left edge of the list.
+fn line_x(w: &[f32], i: usize) -> f32 {
+    w[..=i].iter().sum::<f32>() + GRIP * i as f32 + (GRIP - 1.0) / 2.0
 }
 
 /// 1 px horizontal rule under a row.
@@ -169,21 +185,32 @@ fn spacer<'a>(tw: f32, h: f32) -> El<'a> {
 /// so `rows` of them cost ~17 widgets each for nothing.
 ///
 /// Layer 1 draws the horizontal rules and fixes the block's height; layer 2
-/// runs the column hairlines down it.
-fn filler_block<'a>(w: &[f32], tw: f32, rows: usize) -> El<'a> {
-    let mut lines = column![].width(tw);
+/// runs the column hairlines down it. The block is drawn beside the list
+/// rather than inside it (see [`view`]), so it takes the list's sideways
+/// scroll offset `off` and places its own hairlines; `rows` is an upper bound
+/// on what can be seen, and iced's flex layout drops whatever does not fit in
+/// the space left below the last download.
+fn filler_block<'a>(w: &[f32], tw: f32, off: f32, rows: usize) -> El<'a> {
+    let rw = (tw - off).max(0.0);
+    let mut lines = column![].width(rw);
     for _ in 0..rows {
-        lines = lines.push(spacer(tw, CELL_H));
-        lines = lines.push(row_line(tw));
+        lines = lines.push(spacer(rw, CELL_H));
+        lines = lines.push(row_line(rw));
     }
     let mut verts = row![].spacing(0);
-    for width in w {
+    let mut placed = 0.0;
+    for i in 0..w.len() {
+        let x = line_x(w, i) - off;
+        if x < placed {
+            continue;
+        }
         verts = verts.push(
             container(iced::widget::space::horizontal())
-                .width(*width)
+                .width(x - placed)
                 .height(Length::Fill),
         );
-        verts = verts.push(grip_line(Length::Fill));
+        verts = verts.push(hairline());
+        placed = x + 1.0;
     }
     mouse_area(stack![lines, verts.height(Length::Fill)])
         .interaction(iced::mouse::Interaction::Idle)
@@ -316,7 +343,8 @@ pub fn view(app: &App) -> El<'_> {
         app.main_size.height.max(1200.0)
     };
     let per_screen = (vh / ROW_H).ceil() as usize + 1;
-    // The header scrolls with the content, so it offsets the first data row.
+    // The header sits over the first row of the content, so it offsets the
+    // first data row.
     let first = ((app.table_scroll - ROW_H).max(0.0) / ROW_H).floor() as usize;
     let first = first.saturating_sub(OVERSCAN).min(n);
     let last = first.saturating_add(per_screen + 2 * OVERSCAN).min(n);
@@ -325,34 +353,54 @@ pub fn view(app: &App) -> El<'_> {
     // to children by position, so a leading child that comes and goes would
     // shift every row's `mouse_area` state by one as the window slides.
     let mut rows = column![].width(tw);
+    // The header's slot. The header itself is a layer floating over the rows,
+    // but it still owns the first row of the content: that keeps the scroll
+    // range long enough for the last download to clear it.
+    rows = rows.push(spacer(tw, ROW_H));
     rows = rows.push(spacer(tw, first as f32 * ROW_H));
     for d in &items[first..last] {
         rows = rows.push(data_row(app, d, &w, tw, sel.contains(&d.id)));
     }
     rows = rows.push(spacer(tw, (n - last) as f32 * ROW_H));
-    // Ruled empty rows below the data, enough to carry the grid to the bottom
-    // of the window; scrolling past them is fine.
-    let fillers = MIN_FILLER.max(per_screen).saturating_sub(n);
-    if fillers > 0 {
-        rows = rows.push(filler_block(&w, tw, fillers));
-    }
 
-    let body = column![header(app, &w, tw), rows].width(tw);
-    container(
-        scrollable(body)
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
-            // Feeds the virtual window above. The scrollable only reports a
-            // viewport when it actually scrolls, and it drops repeats, so an
-            // idle list produces no messages.
-            .on_scroll(|v| Message::TableScrolled(v.absolute_offset().y, v.bounds().height))
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
+    // The header, pushed back down by exactly what the list has scrolled: it
+    // stays pinned to the top of the viewport while the rows run under it.
+    // As a layer it adds no height of its own, so it cannot lengthen the list.
+    let head = column![spacer(tw, app.table_scroll), header(app, &w, tw)].width(tw);
+
+    // Rows first: `stack` takes its size from the bottom layer, so only the
+    // rows decide how far the list scrolls.
+    let list = scrollable(stack![rows, head].width(tw))
+        .direction(scrollable::Direction::Both {
+            vertical: scrollable::Scrollbar::default(),
+            horizontal: scrollable::Scrollbar::default(),
+        })
+        // Feeds the virtual window above, and the empty grid below. The
+        // scrollable only reports a viewport when it actually scrolls, and it
+        // drops repeats, so an idle list produces no messages.
+        .on_scroll(|v| {
+            let at = v.absolute_offset();
+            Message::TableScrolled(at.y, at.x, v.bounds().height)
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    // The ruled empty grid below the last download, under the list rather than
+    // in it: as content it would make the list taller than the window whatever
+    // it holds, and the vertical scrollbar would never go away. It starts where
+    // the rows end, and once they fill the window there is nothing left for it.
+    let below = (ROW_H + n as f32 * ROW_H - app.table_scroll).max(0.0);
+    let fillers = (vh.max(app.main_size.height) / ROW_H).ceil() as usize + 1;
+    let grid = column![
+        spacer(tw, below),
+        filler_block(&w, tw, app.table_scroll_x, fillers)
+    ]
     .width(Length::Fill)
-    .height(Length::Fill)
-    .style(theme::panel)
-    .into()
+    .height(Length::Fill);
+
+    container(stack![grid, list])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::panel)
+        .into()
 }

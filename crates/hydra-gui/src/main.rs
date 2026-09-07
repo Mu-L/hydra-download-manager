@@ -206,6 +206,7 @@ fn boot() -> (App, Task<Message>) {
         hover_col: None,
         drag_order: Vec::new(),
         table_scroll: 0.0,
+        table_scroll_x: 0.0,
         table_vh: 0.0,
         cursor_cell: std::sync::Arc::new(ui::probe::CursorCell::default()),
         perm_status: windows::permissions::PermStatus::default(),
