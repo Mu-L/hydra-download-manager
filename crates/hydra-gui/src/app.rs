@@ -905,7 +905,7 @@ pub enum Message {
     DragTick,
     /// The download table scrolled: (vertical offset, viewport height).
     /// Drives the virtual row window in `ui::table`.
-    TableScrolled(f32, f32),
+    TableScrolled(f32, f32, f32),
     Mods(iced::keyboard::Modifiers),
     RawKey(iced::keyboard::Key, iced::keyboard::Modifiers),
     SelectAll,
@@ -1251,6 +1251,10 @@ pub struct App {
     /// Scroll offset and viewport height last reported by the download
     /// table, so `ui::table` can build only the rows actually on screen.
     pub table_scroll: f32,
+    /// How far the list is scrolled sideways. The ruled empty grid below the
+    /// last download is drawn outside the scrollable (see `ui::table`), so it
+    /// has to shift its column hairlines by hand.
+    pub table_scroll_x: f32,
     pub table_vh: f32,
     /// Pointer position, kept without a message per motion event — see
     /// [`crate::ui::probe`]. Read through [`App::cursor_now`].
@@ -3565,8 +3569,9 @@ impl App {
                 self.ctx_at = Some(self.cursor_now());
                 Task::none()
             }
-            Message::TableScrolled(offset, viewport_h) => {
+            Message::TableScrolled(offset, offset_x, viewport_h) => {
                 self.table_scroll = offset;
+                self.table_scroll_x = offset_x;
                 self.table_vh = viewport_h;
                 Task::none()
             }
