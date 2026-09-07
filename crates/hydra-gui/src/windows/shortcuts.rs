@@ -9,7 +9,7 @@ use crate::app::{App, El, Message, WinKind};
 use crate::model::SHORTCUT_ACTIONS;
 use crate::windows::dlg_btn_primary;
 use crate::{i18n::tr, theme};
-use iced::widget::{column, container, row, text, text_input};
+use iced::widget::{column, container, row, scrollable, text, text_input};
 use iced::Length;
 
 pub fn view(app: &App) -> El<'_> {
@@ -35,20 +35,11 @@ pub fn view(app: &App) -> El<'_> {
             .align_y(iced::Alignment::Center),
         );
     }
-    list = list.push(
-        row![
-            text(tr("Select all downloads"))
-                .size(theme::FONT_SIZE)
-                .width(Length::Fill),
-            text("cmd+a").size(theme::FONT_SIZE).width(150.0),
-        ]
-        .spacing(10),
-    );
-
     container(
         column![
-            list,
-            iced::widget::space::vertical(),
+            // The table grows with every new action, and View > Font scales
+            // every row: scroll rather than push OK off the bottom.
+            scrollable(list).height(Length::Fill),
             row![
                 iced::widget::space::horizontal(),
                 dlg_btn_primary(
