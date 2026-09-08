@@ -87,8 +87,9 @@ pub fn is_active() -> bool {
 }
 
 fn install_with_menu(menu: Menu) {
-    // Left-click on the icon (Windows convention) brings the main window
-    // back; on macOS a click opens the menu instead, which has Show Hydra.
+    // Left-click on the icon brings the main window back; the menu is
+    // right-click only (see `with_menu_on_left_click` below), matching the
+    // Linux backend's `activate`.
     let tx = crate::menubus::sender();
     TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
         if let TrayIconEvent::Click {
@@ -104,6 +105,11 @@ fn install_with_menu(menu: Menu) {
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Hydra");
+    // tray-icon pops the menu on either button by default, while the Click
+    // event fires regardless — so a left-click used to raise the window
+    // *behind* an unwanted menu. Left-click activates, right-click opens the
+    // menu, as the Windows shell does and as ksni already does on Linux.
+    builder = builder.with_menu_on_left_click(false);
     // macOS: a TEMPLATE image — black + alpha that AppKit recolors itself
     // for the light/dark menu bar (and inverts while highlighted). Windows
     // has no template concept, so pick white/black from the system theme
