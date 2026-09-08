@@ -4705,7 +4705,12 @@ impl App {
                 if let Some(d) = self.item(id) {
                     let _ = open::that_detached(&d.save_dir);
                 }
-                Task::none()
+                // Same as Open: the dialog has done its job once the user
+                // has acted on the finished file, so it dismisses itself
+                // instead of staying up behind the file manager.
+                let task = self.close_window(WinKind::Complete(id));
+                self.complete_dismissed(id);
+                task
             }
 
             // ------------------------------------------------------ options
