@@ -5,6 +5,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.4.3] - 2026-09-08
+
+### Added
+
+- **Configurable Application Directory & Portable GUI Profile (`hydra-gui`, `README.md`)**:
+  - Added `--config <DIR>` (and `--config=<DIR>`) command-line flag to run the desktop application from a custom directory.
+  - Relocates `config.toml`, download state database (`state.redb`), logs (`logs/`), and localization catalogs (`locales/`) into the specified directory instead of the platform default (`~/.config/hydra` on Linux/macOS or `%APPDATA%\hydra` on Windows).
+  - Automatically resolves relative paths against the launch working directory and creates target directories if they do not exist.
+  - Enables portable installations (e.g. on external drives) and multiple isolated profiles that run concurrently alongside standard installations with separate single-instance locks (`ipc.json`).
+  - Automatically passes `--relaunch-arg --config --relaunch-arg <DIR>` to the update finisher to preserve the custom configuration directory across self-updates.
+  - Protects machine-wide user registrations by leaving startup login items (`autostart.rs`) and native messaging host manifests (`nmhost.rs`) tied to the default installation, while allowing browser extensions to communicate with running portable profiles via WebSocket.
+- **Configurable Keyboard Shortcuts (`hydra-gui`)**:
+  - Expanded the shortcut manager (`SHORTCUT_ACTIONS`) with configurable keybindings:
+    - **Select All Downloads** (`Cmd+A` / `Ctrl+A`): Selects all items in the active download list.
+    - **Remove Selected Downloads** (`Cmd+Alt+R` / `Ctrl+Alt+R`): Prompts for confirmation before removing selected downloads from the list, matching toolbar and menu delete actions.
+    - **Close Window** (`Cmd+W` / `Ctrl+W`): Closes the focused secondary dialog or active window.
+    - **Exit Hydra** (`Cmd+Q` / `Ctrl+Q`): Flushes the download list and configuration to disk before quitting.
+  - Added platform quit conventions: built-in `Alt+F4` support on Windows and custom AppKit `Cmd+Q` handling on macOS ensuring clean state persistence prior to termination.
+  - Made the *Shortcuts* configuration dialog scrollable (`scrollable`) and increased its default window dimensions (`520x520`) to comfortably accommodate the expanded action list and UI font scaling.
+
+### Fixed
+
+- **HTTP Referer Header Propagation & Hotlink CDN Protection (`hydra-gui`, `extensions/`, Chrome, Firefox, Safari)**:
+  - Fixed download failures (HTTP 403 Forbidden) on hotlink-protected CDNs that require an originating `Referer` header.
+  - Updated browser extensions (bumped to version `0.3.2`) to capture the source page URL and pass it across the extension bus.
+  - Propagated referers through the GUI and download engine: `ExtDownload` → `DownloadItem::referer` → `StartSpec::referer` → `request_headers()`.
+  - Supplied captured referer and session request headers to `probe_link`, ensuring the *Download File Info* dialog queries protected endpoints correctly and resolves exact file sizes instead of reporting unknown sizes (`?`).
+- **Sticky Download Table Header & Grid Scrolling (`hydra-gui`)**:
+  - Pinned the download table header to the top of the viewport using a layered stack layout (`stack![rows, head]`), keeping column titles visible while scrolling through long download lists.
+  - Decoupled the ruled empty grid (filler rows) from the scrollable content container, eliminating artificial scroll height and ensuring vertical scrollbars only display when the download list actually overflows the window.
+  - Synchronized horizontal scroll offsets (`table_scroll_x`) with background grid hairlines to maintain perfect vertical line alignment during horizontal panning.
+- **System Tray Icon Left-Click Activation (`hydra-gui`)**:
+  - Fixed an issue on Windows and macOS where left-clicking the tray icon opened the context menu over the main window.
+  - Disabled `with_menu_on_left_click(false)` in `muda` / `tray-icon` so that left-clicking restores and focuses the main window, while right-clicking reveals the tray context menu, matching platform conventions and Linux behavior.
+- **Auto-Dismiss Complete Dialog on "Open Folder" (`hydra-gui`)**:
+  - Fixed the download completion dialog remaining open in the background after clicking "Open Folder".
+  - Dismisses the dialog automatically upon opening the destination folder (`WinKind::Complete(id)`), matching the behavior of the "Open" file action.
+- **Options Layout & Background Download Toggle (`hydra-gui`)**:
+  - Surfaced the *"Download in background while choosing options"* toggle in *Options → Downloads* with contextual tooltips, allowing users to choose whether downloads start immediately upon link addition or wait for dialog confirmation.
+  - Reordered General settings in the Options dialog to place the Dock/taskbar visibility setting directly alongside *"Close to system tray"*.
+  - Localized the background download setting across all 30 languages.
+
+---
+
 ## [0.4.2] - 2026-09-05
 
 ### Added
