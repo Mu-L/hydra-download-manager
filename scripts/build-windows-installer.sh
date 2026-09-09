@@ -68,6 +68,30 @@ command -v makensis >/dev/null || {
 echo "packing browser extensions..."
 ./scripts/build-extensions.sh --quiet
 
+# The extension carries its own version (extensions/*/manifest.json) and bumps
+# on its own cadence, so it is usually BEHIND the product VERSION above. The
+# .nsi needs it to spell the packed filenames in INSTALL.txt; read it back off
+# the archive build-extensions.sh just produced rather than re-deriving it from
+# the manifest, so the names in the text are the ones actually packed.
+EXT_ZIP=""
+for f in target/extensions/hydra-chrome-*.zip; do
+  # --store also emits hydra-chrome-<v>-webstore.zip; not built here, but the
+  # .nsi packs by the same glob and would be just as ambiguous, so skip it.
+  case "$f" in *-webstore.zip) continue ;; esac
+  [ -f "$f" ] || continue
+  [ -z "$EXT_ZIP" ] || {
+    echo "ambiguous: more than one target/extensions/hydra-chrome-*.zip" >&2
+    exit 1
+  }
+  EXT_ZIP=$f
+done
+[ -n "$EXT_ZIP" ] || {
+  echo "missing target/extensions/hydra-chrome-*.zip (extension build failed?)" >&2
+  exit 1
+}
+EXT_VERSION=${EXT_ZIP##*/hydra-chrome-}
+EXT_VERSION=${EXT_VERSION%.zip}
+
 # makensis resolves File paths against the cwd, and the .nsi is written
 # relative to its own directory.
 cd scripts/windows
@@ -76,5 +100,6 @@ cd scripts/windows
 # often have no LC_ALL set.
 LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 \
   makensis -DARCH="$ARCH" -DVERSION="$VERSION" \
-    -DNUM_VERSION="${VERSION%%-*}" hydra-installer.nsi
+    -DNUM_VERSION="${VERSION%%-*}" -DEXT_VERSION="$EXT_VERSION" \
+    hydra-installer.nsi
 echo "Built: target/hydra-$VERSION-windows-$ARCH-setup.exe"
