@@ -73,6 +73,20 @@ SetCompressor /SOLID lzma
   !define /file VERSION "${VERSIONFILE}"
   !delfile "${VERSIONFILE}"
 !endif
+; The browser extension carries its own version (extensions/*/manifest.json)
+; and bumps only when the extension changes, so it is normally BEHIND VERSION.
+; It names the packed .zip/.xpi/.crx that build-extensions.sh produces, and
+; INSTALL.txt below has to spell those names -- using VERSION there points the
+; reader at files that do not exist. build-windows-installer.sh passes the
+; version of the archive it actually packed; the fallback reads the Chromium
+; manifest the same way, for a bare makensis run.
+!ifndef EXT_VERSION
+  !tempfile EXTVERSIONFILE
+  !system `grep -m1 '"version"' "../../extensions/chrome/manifest.json" | cut -d'"' -f4 > "${EXTVERSIONFILE}"`
+  !define /file EXT_VERSION "${EXTVERSIONFILE}"
+  !delfile "${EXTVERSIONFILE}"
+!endif
+
 ; VIProductVersion accepts only x.x.x.x numerics, so a pre-release VERSION
 ; (0.3.0-rc1) passes its numeric part separately; display strings keep the
 ; full version.
@@ -289,11 +303,11 @@ Section "Browser Extensions" SEC_EXT
   FileWrite $0 '(or a temporary install) to accept them. The extension itself is$\r$\n'
   FileWrite $0 'identical to the store build.$\r$\n$\r$\n'
   FileWrite $0 'In this directory:$\r$\n$\r$\n'
-  FileWrite $0 '  hydra-chrome-${VERSION}.zip   packed build for the Chromium family$\r$\n'
+  FileWrite $0 '  hydra-chrome-${EXT_VERSION}.zip   packed build for the Chromium family$\r$\n'
 !ifdef HAVE_CRX
-  FileWrite $0 '  hydra-chrome-${VERSION}.crx   the same build, signed, for policy deployment$\r$\n'
+  FileWrite $0 '  hydra-chrome-${EXT_VERSION}.crx   the same build, signed, for policy deployment$\r$\n'
 !endif
-  FileWrite $0 '  hydra-firefox-${VERSION}.xpi  packed build for Firefox$\r$\n'
+  FileWrite $0 '  hydra-firefox-${EXT_VERSION}.xpi  packed build for Firefox$\r$\n'
   FileWrite $0 '  chrome\           the same Chromium build, already unpacked$\r$\n'
   FileWrite $0 '  firefox\          the same Firefox build, already unpacked$\r$\n'
   FileWrite $0 '  INSTALL.txt       this file$\r$\n$\r$\n'
@@ -314,7 +328,7 @@ Section "Browser Extensions" SEC_EXT
   FileWrite $0 '  4. Leave that folder where it is. The browser re-reads it from disk at$\r$\n'
   FileWrite $0 '     every start, and moving or deleting it uninstalls the extension.$\r$\n$\r$\n'
 !ifdef HAVE_CRX
-  FileWrite $0 'The signed hydra-chrome-${VERSION}.crx is for deploying by enterprise$\r$\n'
+  FileWrite $0 'The signed hydra-chrome-${EXT_VERSION}.crx is for deploying by enterprise$\r$\n'
   FileWrite $0 'policy (ExtensionSettings or ExtensionInstallForcelist, pointing at an$\r$\n'
   FileWrite $0 'update manifest you host). Dragging it onto the extensions page will not$\r$\n'
   FileWrite $0 'work: Chromium refuses any .crx that did not come from the Web Store.$\r$\n$\r$\n'
@@ -327,7 +341,7 @@ Section "Browser Extensions" SEC_EXT
   FileWrite $0 'Temporary - works in every Firefox, removed at the next restart:$\r$\n$\r$\n'
   FileWrite $0 '  1. Open about:debugging#/runtime/this-firefox$\r$\n'
   FileWrite $0 '  2. Click "Load Temporary Add-on..." and select:$\r$\n'
-  FileWrite $0 '         $INSTDIR\extensions\hydra-firefox-${VERSION}.xpi$\r$\n'
+  FileWrite $0 '         $INSTDIR\extensions\hydra-firefox-${EXT_VERSION}.xpi$\r$\n'
   FileWrite $0 '     (or $INSTDIR\extensions\firefox\manifest.json)$\r$\n$\r$\n'
   FileWrite $0 'Permanent - Developer Edition, Nightly and ESR only:$\r$\n$\r$\n'
   FileWrite $0 '  1. Open about:config and set$\r$\n'
