@@ -56,15 +56,45 @@ fn connect_once() -> Option<(TcpStream, String)> {
     Some((stream, token))
 }
 
-/// Detached spawn of a GUI binary; true when the process started.
-fn spawn_direct(program: std::ffi::OsString) -> bool {
-    std::process::Command::new(program)
-        .arg("--minimized")
+/// A minimized GUI launch, stdio detached from ours.
+fn gui_command(program: &std::ffi::OsStr) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg("--minimized")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Detached spawn of a GUI binary; true when the process started.
+///
+/// Windows: the browser runs a native-messaging host inside a JOB OBJECT and
+/// kills the job when the host exits — which, for the one-shot
+/// `sendNativeMessage` the extension calls us through, is the moment we
+/// answer. Every process we started goes with us, so the GUI launched for
+/// this very capture died seconds after starting, before any window of it
+/// appeared. `CREATE_BREAKAWAY_FROM_JOB` is what Mozilla and Chrome
+/// prescribe for children that must outlive the host; `DETACHED_PROCESS`
+/// keeps the GUI off the console the browser gave us.
+fn spawn_direct(program: std::ffi::OsString) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        if gui_command(&program)
+            .creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS)
+            .spawn()
+            .is_ok()
+        {
+            return true;
+        }
+        // A job created without JOB_OBJECT_LIMIT_BREAKAWAY_OK refuses the
+        // flag outright (ERROR_ACCESS_DENIED) rather than ignoring it. Fall
+        // back to an ordinary spawn — the pre-existing behaviour, and still
+        // the right answer on any browser that runs us outside a job.
+    }
+    gui_command(&program).spawn().is_ok()
 }
 
 /// Launch hydra-gui minimized: the capture dialog is the only surface that
