@@ -1272,6 +1272,10 @@ pub struct App {
     /// over the application rather than the monitor.
     pub main_pos: Option<Point>,
     pub main_size: iced::Size,
+    /// Progress boxes opened by *starting* a download while "Start download
+    /// progress dialog minimized" is on. They can only be minimized once
+    /// they exist, so [`Message::WindowOpened`] does it and clears the id.
+    pub minimize_on_open: std::collections::HashSet<window::Id>,
     /// A "when done" power action waiting out its countdown, if any. Set by
     /// [`App::arm_power_action`] and cleared when the countdown fires or is
     /// cancelled; its presence is what puts the 1 s [`Message::PowerTick`]
@@ -1755,6 +1759,22 @@ impl App {
         (w * s, h * s)
     }
 
+    /// Open a download's progress box as part of *starting* it — the only
+    /// case "Start download progress dialog minimized" covers. Explicitly
+    /// asking to see a transfer (double-click, File Properties) still opens
+    /// the box in front.
+    fn open_progress_window(&mut self, dl: DlId) -> Task<Message> {
+        let kind = WinKind::Progress(dl);
+        let existed = self.win_of(kind).is_some();
+        let task = self.open_window(kind);
+        if !existed && self.cfg.settings.start_minimized {
+            if let Some(win) = self.win_of(kind) {
+                self.minimize_on_open.insert(win);
+            }
+        }
+        task
+    }
+
     pub fn open_window(&mut self, kind: WinKind) -> Task<Message> {
         if let Some(id) = self.win_of(kind) {
             return window::gain_focus(id);
@@ -1836,9 +1856,9 @@ impl App {
         }
         self.windows.insert(id, kind);
         let opened = task.map(Message::WindowOpened);
-        if matches!(kind, WinKind::Progress(_)) && self.cfg.settings.start_minimized {
-            return Task::batch([dismissed, opened, window::minimize(id, true)]);
-        }
+        // "Start progress dialog minimized" is honoured in `WindowOpened`,
+        // not here: the window does not exist yet at this point, so a
+        // minimize queued now is dropped by the runtime.
         Task::batch([dismissed, opened])
     }
 
@@ -2101,7 +2121,7 @@ impl App {
             return if open_progress {
                 let seed = self.item(id).and_then(|d| d.speed_limit);
                 self.prog.entry(id).or_insert_with(|| prog_state_seed(seed));
-                self.open_window(WinKind::Progress(id))
+                self.open_progress_window(id)
             } else {
                 Task::none()
             };
@@ -2170,7 +2190,7 @@ impl App {
         if open_progress {
             let seed = self.item(id).and_then(|d| d.speed_limit);
             self.prog.entry(id).or_insert_with(|| prog_state_seed(seed));
-            self.open_window(WinKind::Progress(id))
+            self.open_progress_window(id)
         } else {
             Task::none()
         }
@@ -3219,7 +3239,15 @@ impl App {
                         window::gain_focus(id),
                     ]);
                 }
-                Task::batch([pin_surface, skip_taskbar, parent, window::gain_focus(id)])
+                // A progress box asked to start minimized goes down instead
+                // of being focused — focusing it would restore it, which is
+                // what made a manually started download pop up in front.
+                let reveal = if self.minimize_on_open.remove(&id) {
+                    window::minimize(id, true)
+                } else {
+                    window::gain_focus(id)
+                };
+                Task::batch([pin_surface, skip_taskbar, parent, reveal])
             }
             Message::WindowClosed(id) => {
                 let kind = self.windows.remove(&id);
@@ -4418,7 +4446,7 @@ impl App {
                         self.prog
                             .entry(fi.dl)
                             .or_insert_with(|| prog_state_seed(seed));
-                        Task::batch([close, self.open_window(WinKind::Progress(fi.dl))])
+                        Task::batch([close, self.open_progress_window(fi.dl)])
                     }
                     (true, _) => Task::batch([close, self.start_download(fi.dl, true)]),
                     // Download Later: park the background transfer, keep the
