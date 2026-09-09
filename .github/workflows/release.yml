@@ -893,7 +893,7 @@ jobs:
             # package, for which a Debian revision is invalid ("native package
             # version may not have a revision"), so the series suffix goes into the
             # upstream version instead.
-            for entry in "noble:24.04" "jammy:22.04"; do
+            for entry in "stonking:26.10" "resolute:26.04" "oracular:24.10" "noble:24.04" "jammy:22.04"; do
               DISTRO="${entry%%:*}"; SERIES="${entry##*:}"
               DEB_VERSION="${VERSION}ppa1~ubuntu${SERIES}.1"
 
