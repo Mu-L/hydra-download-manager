@@ -87,6 +87,29 @@ pub fn error(line: &str) {
     write(Level::Error, "ERROR", line);
 }
 
+/// Route panics into this log.
+///
+/// A release build is `windows_subsystem = "windows"` and is launched by the
+/// browser's native-messaging host with its stdio on the null device, so a
+/// panic message has nowhere to go: the app simply vanishes, and the bug
+/// report reads "it crashed" with an empty log box. The default hook still
+/// runs afterwards for the cases where a console does exist.
+pub fn catch_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let where_ = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown location".into());
+        error(&format!(
+            "panic at {where_}: {}\n{}",
+            info.payload_as_str().unwrap_or("<non-string payload>"),
+            std::backtrace::Backtrace::force_capture()
+        ));
+        previous(info);
+    }));
+}
+
 /// Back-compat alias for the original single-level call sites.
 pub fn log(line: &str) {
     info(line);
