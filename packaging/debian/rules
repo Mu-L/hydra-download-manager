@@ -1,11 +1,10 @@
 #!/usr/bin/make -f
 export DH_VERBOSE = 1
 
-# Ubuntu jammy and noble both default rustc/cargo to 1.75, which cannot even
-# parse a version-4 Cargo.lock ("lock file version 4 requires
-# -Znext-lockfile-bump") and sits far below this dependency tree's MSRV.
-# Build against the versioned toolchain packages instead; rustc-1.91 and
-# cargo-1.91 are in universe for both series, which Launchpad builders enable.
+# Ubuntu jammy and noble default rustc/cargo to 1.75, which cannot parse a
+# version-4 Cargo.lock and sits below this dependency tree's MSRV.
+# Build against versioned rust-1.91 packages if present in universe, or
+# fallback to default cargo/rustc in PATH on newer Ubuntu series (oracular, resolute, stonking).
 export PATH := /usr/lib/rust-1.91/bin:$(PATH)
 # Launchpad builders run with HOME=/sbuild-nonexistent, so cargo needs a
 # writable home inside the build tree.

@@ -3,8 +3,8 @@ Section: net
 Priority: optional
 Maintainer: Javad Rajabzadeh <ja7ad@live.com>
 Build-Depends: debhelper-compat (= 13),
-               cargo-1.91,
-               rustc-1.91,
+               cargo-1.91 | cargo,
+               rustc-1.91 | rustc,
                pkg-config,
                libasound2-dev,
                libx11-dev,
@@ -18,7 +18,7 @@ Homepage: https://github.com/ja7ad/hydra
 
 Package: hydra
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libgtk-3-0
+Depends: ${shlibs:Depends}, ${misc:Depends}, libgtk-3-0 | libgtk-3-0t64
 Conflicts: thc-hydra, hydra-gtk
 Recommends: gnome-shell-extension-appindicator
 Description: Multi-connection download manager (GUI, CLI, browser integration)
