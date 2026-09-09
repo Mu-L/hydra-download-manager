@@ -373,9 +373,10 @@ function captureEligible(item, state) {
 }
 
 // Freeze the download the moment it exists (downloads.pause in onCreated).
-// Pausing is reversible where cancelling is not: small files
+// On CHROMIUM pausing is reversible where cancelling is not: small files
 // cannot slip through by finishing early, and signed one-shot URLs keep
-// working because we never have to re-request them.
+// working because we never have to re-request them. Gecko does not park at
+// all — see the listener registration below for why.
 async function parkDownload(item) {
   const state = await getState();
   if (!captureEligible(item, state)) return;
@@ -386,11 +387,16 @@ async function parkDownload(item) {
   }
 }
 
-async function decideCapture(item) {
+// `parked` says whether the browser's own download is being held for us, and
+// therefore whether there is anything to hand back. Resuming one that was
+// never parked is not harmless: on Gecko it throws, and the throw used to be
+// swallowed next to a download that had already been cancelled.
+async function decideCapture(item, parked) {
   const state = await getState();
   const url = item.finalUrl || item.url;
 
   const giveBack = async () => {
+    if (!parked) return;
     try {
       await chrome.downloads.resume(item.id);
     } catch {}
@@ -410,11 +416,12 @@ async function decideCapture(item) {
   });
 
   if (reply && reply.ok) {
-    // Hydra owns it now; drop the browser's paused copy.
+    // Hydra owns it now; drop the browser's copy. Erasing only after the
+    // cancel really took: a download that finished before the answer came
+    // back is already a file on disk, and erasing its record would leave
+    // that file with nothing pointing at it.
     try {
       await chrome.downloads.cancel(item.id);
-    } catch {}
-    try {
       await chrome.downloads.erase({ id: item.id });
     } catch {}
   } else {
@@ -435,17 +442,22 @@ if (onDeterminingFilename) {
   chrome.downloads.onCreated.addListener((item) => parkDownload(item));
   onDeterminingFilename.addListener((item, suggest) => {
     suggest();
-    decideCapture(item);
+    decideCapture(item, true);
   });
 } else if (chrome.downloads?.onCreated) {
-  // Firefox: no onDeterminingFilename, but `filename` is already resolved on
-  // the create event. Park and decide in ONE sequential listener — two
-  // listeners on the same event run concurrently, and the decision would
-  // race the pause it depends on.
-  chrome.downloads.onCreated.addListener(async (item) => {
-    await parkDownload(item);
-    await decideCapture(item);
-  });
+  // Gecko: NOTHING is parked. `downloads.pause()` there is
+  // `download.cancel()`, and `downloads.resume()` is gated on `canResume`,
+  // which needs `hasPartialData` — false for a download still at byte 0.
+  // Parking on creation is therefore a one-way trip: every download we
+  // then handed back (the wrong file type, a skipped site, Hydra saying
+  // no) stayed "Canceled" forever, and the failed resume was swallowed.
+  //
+  // So the browser keeps its own transfer running while we decide. It is
+  // only cancelled once Hydra has actually taken the file, and a refusal
+  // costs nothing but the seconds of bytes the browser had already
+  // fetched. `filename` is resolved on the create event here, so the whole
+  // decision can be made from it.
+  chrome.downloads.onCreated.addListener((item) => decideCapture(item, false));
 }
 // Safari has no downloads API at all; there the extension is menus +
 // selection pill + sniffing only.

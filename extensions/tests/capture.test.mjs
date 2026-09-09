@@ -18,7 +18,7 @@ const check = (label, cond, extra = "") => {
 };
 const tick = (n = 3) => new Promise((r) => { let i = 0; const f = () => (++i >= n ? r() : setImmediate(f)); setImmediate(f); });
 
-function build({ hydraReply = { ok: true }, store = {} } = {}) {
+function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
   const sent = [];          // messages that reached "Hydra"
   const calls = [];         // downloads API calls
   const listeners = {};
@@ -50,7 +50,11 @@ function build({ hydraReply = { ok: true }, store = {} } = {}) {
       setBadgeBackgroundColor: async () => {}, setBadgeText: async () => {}, setTitle: async () => {},
     },
     downloads: {
-      onCreated, onDeterminingFilename: onDetermining,
+      onCreated,
+      // Gecko has no onDeterminingFilename at all — the capture path keys
+      // off its absence, so a mock that always offers it can only ever test
+      // the Chromium half.
+      ...(gecko ? {} : { onDeterminingFilename: onDetermining }),
       pause: async (id) => calls.push(["pause", id]),
       resume: async (id) => calls.push(["resume", id]),
       cancel: async (id) => calls.push(["cancel", id]),
@@ -178,6 +182,39 @@ function build({ hydraReply = { ok: true }, store = {} } = {}) {
   h.onDetermining.fire(item, () => {}); await tick(8);
   check("fallback: a refused hand-off resumes the browser download", h.calls.some(([c]) => c === "resume"));
   check("fallback: the paused copy is not cancelled", !h.calls.some(([c]) => c === "cancel"));
+}
+
+// ------------------------------------------------ 5b. the Gecko capture path
+//
+// `downloads.pause()` on Gecko is `download.cancel()`, and `resume()` needs
+// partial data a download at byte 0 has none of. So nothing there may be
+// parked speculatively: a download the extension touches and hands back is
+// stuck "Canceled" for good.
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  const item = { id: 51, url: "https://cdn.example/photo.png", filename: "photo.png", mime: "image/png" };
+  h.onCreated.fire(item); await tick(8);
+  check("gecko: an unlisted type is never touched",
+    h.calls.length === 0 && !h.sent.some((m) => m.type === "download"), JSON.stringify(h.calls));
+}
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  const item = { id: 52, url: "https://cdn.example/pack.zip", filename: "pack.zip", mime: "application/zip", totalBytes: 5e6 };
+  h.onCreated.fire(item); await tick(10);
+  check("gecko: a matching type reaches Hydra without being paused",
+    h.sent.some((m) => m.type === "download") && !h.calls.some(([c]) => c === "pause"), JSON.stringify(h.calls));
+  check("gecko: the browser's copy is cancelled once Hydra has it",
+    h.calls.some(([c]) => c === "cancel") && h.calls.some(([c]) => c === "erase"));
+}
+{
+  const h = build({ gecko: true, hydraReply: { ok: false, error: "nope" } });
+  await tick(12);
+  const item = { id: 53, url: "https://cdn.example/pack.zip", filename: "pack.zip", mime: "application/zip" };
+  h.onCreated.fire(item); await tick(10);
+  check("gecko: a refused hand-off leaves the browser download running",
+    !h.calls.some(([c]) => c === "cancel") && !h.calls.some(([c]) => c === "resume"), JSON.stringify(h.calls));
 }
 
 // ------------------------------------------- 6. right-click a link / media
