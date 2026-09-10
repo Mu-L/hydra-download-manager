@@ -1272,6 +1272,10 @@ pub struct App {
     /// over the application rather than the monitor.
     pub main_pos: Option<Point>,
     pub main_size: iced::Size,
+    /// The primary display in OS points ([`display_points`]), or
+    /// [`iced::Size::ZERO`] when the platform would not say. Dialogs are
+    /// held inside it so none opens with its buttons off the screen.
+    pub display: iced::Size,
     /// Progress boxes opened by *starting* a download while "Start download
     /// progress dialog minimized" is on. They can only be minimized once
     /// they exist, so [`Message::WindowOpened`] does it and clears the id.
@@ -1661,29 +1665,22 @@ impl App {
         crate::theme::ui_scale(self.cfg.settings.font_size)
     }
 
-    /// The size a window opens at, in OS points.
+    /// The size a window opens at, in interface units — the units
+    /// `window::open` and `window::resize` speak.
     ///
     /// Dialogs are laid out against `theme::FONT_SIZE`, and View > Font
-    /// scales the interface by the ratio to it (`scale_of` in main.rs), so
-    /// the window has to grow by the same ratio or a larger font just loses
-    /// the bottom row of the dialog. The main window is the exception: it is
-    /// resizable and reopens at whatever size it was left at.
+    /// scales the interface by the ratio to it (`scale_of` in main.rs). iced
+    /// applies that ratio to the size handed to `window::open` itself, so
+    /// the constants below are written once, at the ratio the layout was
+    /// drawn at, and must *not* be scaled again here: doing so squares the
+    /// ratio and opens a Large-font dialog a third bigger than the screen
+    /// space its content asks for. The main window is the exception: it is
+    /// resizable and reopens at whatever size it was left at, and that is
+    /// remembered in OS points, so it converts back.
     fn window_size(&self, kind: WinKind) -> (f32, f32) {
+        let scale = self.ui_scale();
         if kind == WinKind::Main {
-            // Restore the last size when it is still sane for a screen;
-            // first run (or nonsense values) derives from the display. The
-            // floor only rejects nonsense: `min_size` below holds the window
-            // to a full toolbar row whatever the saved size says, and that
-            // floor moves with the font ratio while this range does not.
-            let saved = self
-                .cfg
-                .settings
-                .window_size
-                .filter(|(w, h)| (400.0..=4000.0).contains(w) && (300.0..=2500.0).contains(h));
-            let s = saved
-                .map(|(w, h)| iced::Size::new(w, h))
-                .unwrap_or_else(main_window_size);
-            return (s.width, s.height);
+            return main_open_size(self.cfg.settings.window_size, scale);
         }
         let (w, h) = match kind {
             WinKind::Main => unreachable!("handled above"),
@@ -1755,8 +1752,7 @@ impl App {
             WinKind::Power => (500.0, 200.0),
             WinKind::ZipPreview(_) => (640.0, 420.0),
         };
-        let s = self.ui_scale();
-        (w * s, h * s)
+        fit_to_display((w, h), self.display, scale)
     }
 
     /// Open a download's progress box as part of *starting* it — the only
@@ -1802,11 +1798,16 @@ impl App {
         let resizable = matches!(kind, WinKind::Main | WinKind::Progress(_));
         let minimizable = resizable;
         // Centre sub-windows over the main window when its bounds are known.
+        // The main window's bounds are tracked in OS points (see WinMoved),
+        // and so is the position handed to winit, so the dialog's size
+        // crosses into OS points for the arithmetic.
+        let scale = self.ui_scale();
+        let (os_w, os_h) = (size.0 * scale, size.1 * scale);
         let position = match (kind, self.main_pos) {
             (WinKind::Main, _) | (_, None) => window::Position::Centered,
             (_, Some(origin)) => window::Position::Specific(Point::new(
-                origin.x + (self.main_size.width - size.0) / 2.0,
-                origin.y + (self.main_size.height - size.1) / 2.0,
+                origin.x + (self.main_size.width - os_w) / 2.0,
+                origin.y + (self.main_size.height - os_h) / 2.0,
             )),
         };
         // "Hide from taskbar" on Windows is a per-window creation flag, so
@@ -1836,11 +1837,11 @@ impl App {
         let (id, task) = window::open(window::Settings {
             size: iced::Size::new(size.0, size.1),
             // Floor: just enough for the full toolbar row; the default
-            // stays proportional to the display.
-            min_size: (kind == WinKind::Main).then(|| {
-                let s = self.ui_scale();
-                iced::Size::new(900.0 * s, 600.0 * s)
-            }),
+            // stays proportional to the display. Unlike `size`, iced passes
+            // a minimum straight to winit, so this one is in OS points and
+            // does carry the font ratio.
+            min_size: (kind == WinKind::Main)
+                .then(|| iced::Size::new(900.0 * scale, 600.0 * scale)),
             resizable,
             minimizable,
             position,
@@ -3331,9 +3332,10 @@ impl App {
             }
             // Window geometry reaches us divided by the View > Font scale
             // factor, because that is the space the interface is laid out
-            // in; `window::open` and `window::resize` speak OS points. Undo
-            // the ratio here so everything stored is in OS points and the
-            // two agree at any font size.
+            // in. Undo the ratio here so what is stored is in OS points:
+            // that is the unit winit measures a window position in, and it
+            // is what the remembered main-window size has to be for the
+            // window to come back the same size at another font.
             Message::WinMoved(id, p) => {
                 if self.main_id == Some(id) {
                     let s = self.ui_scale();
@@ -3345,10 +3347,22 @@ impl App {
                 if self.main_id == Some(id) {
                     let s = self.ui_scale();
                     self.main_size = iced::Size::new(size.width * s, size.height * s);
-                    // Remember it (written with the next config save).
-                    if size.width >= 900.0 && size.height >= 600.0 {
-                        self.cfg.settings.window_size =
-                            Some((self.main_size.width, self.main_size.height));
+                    // Remember it. Marking the config dirty rather than
+                    // writing costs nothing per event — a drag delivers
+                    // hundreds — and `flush_saves` puts it on disk within
+                    // the second, so a session that ends without passing
+                    // an exit path (a machine shutting down under a
+                    // tray-resident app) still comes back the same size.
+                    // The floor is `min_size`, in the same units the event
+                    // arrives in: below it the size is not one the user
+                    // could have dragged to.
+                    let resized = Some((self.main_size.width, self.main_size.height));
+                    if size.width >= 900.0
+                        && size.height >= 600.0
+                        && self.cfg.settings.window_size != resized
+                    {
+                        self.cfg.settings.window_size = resized;
+                        self.save_config();
                     }
                 }
                 Task::none()
@@ -4552,18 +4566,11 @@ impl App {
             Message::ProgToggleDetails(id) => {
                 let p = self.prog.entry(id).or_default();
                 p.details = !p.details;
-                let details = p.details;
                 // Collapse the dialog itself: no dead space below the
-                // buttons when the details are hidden.
-                if let Some(win) = self.win_of(WinKind::Progress(id)) {
-                    // In OS points, so the collapsed box tracks View > Font
-                    // the same way the dialog it opened at does.
-                    let scale = self.ui_scale();
-                    let h = if details { 582.0 } else { 352.0 };
-                    window::resize(win, iced::Size::new(680.0 * scale, h * scale))
-                } else {
-                    Task::none()
-                }
+                // buttons when the details are hidden. `window_size` sizes
+                // this box from the flag just flipped, so re-fitting the
+                // window is the whole of the collapse.
+                self.resize_open(WinKind::Progress(id))
             }
             Message::ProgPauseResume(id) => {
                 let active = self.item(id).map(|d| d.state.is_active()).unwrap_or(false);
@@ -6272,23 +6279,86 @@ fn run_power_action(action: PowerAction) {
     }
 }
 
-pub fn main_window_size() -> iced::Size {
-    let fallback = iced::Size::new(1009.0, 606.0);
-    let Ok(displays) = display_info::DisplayInfo::all() else {
-        return fallback;
-    };
-    let Some(d) = displays.iter().find(|d| d.is_primary).or(displays.first()) else {
-        return fallback;
-    };
-    let (mut w, mut h) = (d.width as f32, d.height as f32);
-    // Some backends report physical pixels; normalize to logical points.
-    if d.scale_factor > 1.0 && w / d.scale_factor >= 1000.0 {
-        w /= d.scale_factor;
-        h /= d.scale_factor;
+/// The primary display in OS points, or `None` when the platform will not
+/// say. Read once at startup: enumerating displays is a system call, and
+/// the two things that consult it — the first-run main window size and the
+/// dialog cap — only need it to be roughly right.
+pub fn display_points() -> Option<iced::Size> {
+    let displays = display_info::DisplayInfo::all().ok()?;
+    let d = displays
+        .iter()
+        .find(|d| d.is_primary)
+        .or(displays.first())?;
+    Some(display_normalized(
+        d.width as f32,
+        d.height as f32,
+        d.scale_factor,
+    ))
+}
+
+/// One display's reported size in OS points. Some backends answer in
+/// physical pixels and some already in points, and nothing in the reply
+/// says which: a reported width that is still a desktop's worth of points
+/// after dividing is the physical one, and a screen under 1000 points wide
+/// either way is left alone rather than halved into a phone.
+fn display_normalized(w: f32, h: f32, scale: f32) -> iced::Size {
+    if scale > 1.0 && w / scale >= 1000.0 {
+        iced::Size::new(w / scale, h / scale)
+    } else {
+        iced::Size::new(w, h)
     }
+}
+
+pub fn main_window_size() -> iced::Size {
+    // Proportions of the 1512x982 desktop the layout was drawn on, so the
+    // first run fills the same share of a bigger or smaller screen.
+    let d = display_points().unwrap_or(iced::Size::new(1512.0, 982.0));
     iced::Size::new(
-        (w * (1009.0 / 1512.0)).max(900.0),
-        (h * (606.0 / 982.0)).max(600.0),
+        (d.width * (1009.0 / 1512.0)).max(900.0),
+        (d.height * (606.0 / 982.0)).max(600.0),
+    )
+}
+
+/// The size the main window opens at, in interface units, from the size a
+/// resize remembered in OS points.
+///
+/// A saved size that no longer describes a screen — a monitor that is gone,
+/// a hand-edited config — derives from the display instead. The range only
+/// rejects nonsense: `min_size` holds the window to a full toolbar row
+/// whatever the saved size says, and that floor moves with the font ratio
+/// while this range does not.
+fn main_open_size(saved: Option<(f32, f32)>, scale: f32) -> (f32, f32) {
+    let os = saved
+        .filter(|(w, h)| (400.0..=4000.0).contains(w) && (300.0..=2500.0).contains(h))
+        .map(|(w, h)| iced::Size::new(w, h))
+        .unwrap_or_else(main_window_size);
+    (os.width / scale, os.height / scale)
+}
+
+/// Hold a dialog inside the screen. `size` and the answer are in interface
+/// units, `display` is the whole screen in OS points, and `scale` is the
+/// View > Font ratio between the two.
+///
+/// A dialog is fixed-size and cannot be maximized, so anything that opens
+/// past the bottom edge of the display — the OK/Cancel row lives there —
+/// cannot be brought back at all. Capping costs nothing where it bites:
+/// every dialog tall enough to reach the cap (Configuration, Scheduler,
+/// Batch, the progress box) puts its body in a scrollable under a pinned
+/// button row, so a shortened window still reaches every control. The short
+/// ones — About, Confirm, File Info — are nowhere near it on any screen a
+/// desktop has.
+fn fit_to_display(size: (f32, f32), display: iced::Size, scale: f32) -> (f32, f32) {
+    // What is left of the display once the system bar (taskbar, dock, menu
+    // bar) and the window's own title bar have taken their share. Neither is
+    // reported by `display-info`, so this is an allowance, not a measurement.
+    const USABLE_W: f32 = 0.95;
+    const USABLE_H: f32 = 0.85;
+    if display.width <= 0.0 || display.height <= 0.0 || scale <= 0.0 {
+        return size;
+    }
+    (
+        size.0.min(display.width * USABLE_W / scale),
+        size.1.min(display.height * USABLE_H / scale),
     )
 }
 
@@ -7077,6 +7147,89 @@ mod tests {
             metalink: None,
             name_locked: false,
         }
+    }
+
+    #[test]
+    fn the_main_window_comes_back_the_size_it_was_left_at_whatever_the_font() {
+        use super::main_open_size;
+
+        // What a resize stores (`WinResized`) is the window in OS points.
+        // Reopening divides by the font ratio because iced multiplies the
+        // size handed to `window::open` by it again — get that wrong and
+        // the window grows by the ratio on every launch, until it is bigger
+        // than the sanity range above and snaps back to the default size.
+        let left_at = (1400.0, 900.0);
+        for size in crate::theme::FONT_CHOICES.map(|(_, s)| s) {
+            let scale = crate::theme::ui_scale(size);
+            let (w, h) = main_open_size(Some(left_at), scale);
+            assert!(
+                (w * scale - left_at.0).abs() < 0.5 && (h * scale - left_at.1).abs() < 0.5,
+                "font {size} reopens a {left_at:?} window at {}x{} points",
+                w * scale,
+                h * scale
+            );
+        }
+
+        // A saved size no screen could have produced is not restored — it
+        // derives from the display instead, which is never this small.
+        let (w, _) = main_open_size(Some((80.0, 40.0)), 1.0);
+        assert!(w >= 900.0, "nonsense is replaced, not restored: {w}");
+    }
+
+    #[test]
+    fn a_display_is_measured_in_points_whichever_unit_it_reports() {
+        use super::display_normalized;
+
+        // A 1080p laptop at 125%, reported in physical pixels: 1536x864.
+        let scaled = display_normalized(1920.0, 1080.0, 1.25);
+        assert_eq!((scaled.width, scaled.height), (1536.0, 864.0));
+
+        // The same display reported in points already stays as it is: a
+        // second division would leave 1229x691 and shrink every dialog.
+        let points = display_normalized(1536.0, 864.0, 1.0);
+        assert_eq!((points.width, points.height), (1536.0, 864.0));
+
+        // A small screen at 2x is a genuinely small screen, not a 2560 one
+        // reported in pixels.
+        let small = display_normalized(1280.0, 800.0, 2.0);
+        assert_eq!((small.width, small.height), (1280.0, 800.0));
+    }
+
+    #[test]
+    fn a_dialog_never_opens_taller_than_the_screen_it_opens_on() {
+        use super::fit_to_display;
+
+        // The screen the cut-off OK button was reported on: 1920x1080 at
+        // 125% display scaling is 1536x864 OS points.
+        let laptop = iced::Size::new(1536.0, 864.0);
+        // What the Configuration window asks for, at every font ratio the
+        // View menu offers. The window reaches the screen multiplied by the
+        // ratio, so that is what has to fit — with room to spare for the
+        // taskbar and the title bar.
+        for size in crate::theme::FONT_CHOICES.map(|(_, s)| s) {
+            let scale = crate::theme::ui_scale(size);
+            let (w, h) = fit_to_display((760.0, 700.0), laptop, scale);
+            assert!(
+                h * scale < laptop.height && w * scale < laptop.width,
+                "font {size} opens a {w}x{h} dialog as {}x{} points on a \
+                 {}x{} screen",
+                w * scale,
+                h * scale,
+                laptop.width,
+                laptop.height
+            );
+        }
+
+        // A dialog that already fits is not shrunk: the cap is a ceiling,
+        // not a layout.
+        let desk = iced::Size::new(2560.0, 1440.0);
+        assert_eq!(fit_to_display((760.0, 700.0), desk, 1.0), (760.0, 700.0));
+
+        // Neither is one whose screen the platform would not report.
+        assert_eq!(
+            fit_to_display((760.0, 700.0), iced::Size::ZERO, 1.0),
+            (760.0, 700.0)
+        );
     }
 
     #[test]
