@@ -4117,6 +4117,17 @@ impl App {
                     cap_name.is_some() || stream.is_some() || engine::url_file_name(&url).is_some();
                 let file = collision_file(&dir, &name, named);
                 if existing.is_some() || file.is_some() {
+                    // Logged: the dialog names a path, and the report that
+                    // it names one that "does not exist" cannot be told
+                    // apart from a real leftover without knowing what Hydra
+                    // saw at this instant.
+                    crate::log::info(&format!(
+                        "duplicate: list={} disk={}",
+                        existing
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        file.as_deref().unwrap_or("-")
+                    ));
                     self.pending_add = Some(PendingAdd {
                         url,
                         auth,
@@ -6503,12 +6514,29 @@ fn adopt_dialog_edits(
 /// and a capture named after one of them — the extension sends the page
 /// title, which carries no extension — matched a directory and offered to
 /// open it as though it were the file.
+///
+/// An EMPTY file is not one either, and that exclusion is what makes browser
+/// capture usable at all. Gecko cannot park a download while Hydra decides
+/// (`downloads.pause` there is a one-way cancel — see the extension's
+/// background.js), so Firefox's own transfer is still running when the
+/// capture arrives. Firefox reserves its target name the instant a download
+/// starts by creating a zero-byte file under the FINAL name, and writes the
+/// bytes into a `name.<random>.ext.part` sibling. That placeholder is the
+/// file this check used to find: every captured download reported "a file
+/// with this name already exists", and by the time the person read the
+/// dialog Hydra had acknowledged the capture, the extension had cancelled
+/// the browser's copy, and Firefox had deleted the placeholder again —
+/// leaving them to look at an empty folder and a dialog naming a file that
+/// was not there. Nothing is lost by ignoring it: an empty file gives the
+/// "Open existing file" answer nothing to open, and a download that lands
+/// on top of one replaces no bytes.
 fn collision_file(dir: &str, name: &str, named: bool) -> Option<String> {
     if !named {
         return None;
     }
     let path = std::path::Path::new(dir).join(name);
-    path.is_file().then(|| path.to_string_lossy().into_owned())
+    let meta = std::fs::metadata(&path).ok()?;
+    (meta.is_file() && meta.len() > 0).then(|| path.to_string_lossy().into_owned())
 }
 
 /// `name.ext` -> first of `name.ext`, `name_1.ext`, `name_2.ext`, ... that
@@ -7402,6 +7430,76 @@ mod tests {
         // apart.
         std::fs::create_dir_all(dir.join("Programs")).unwrap();
         assert_eq!(collision_file(&dir_s, "Programs", true), None);
+
+        // An EMPTY file is not one either: there is nothing in it to open,
+        // and the download that replaces it replaces no bytes.
+        std::fs::write(dir.join("empty.bin"), b"").unwrap();
+        assert_eq!(collision_file(&dir_s, "empty.bin", false), None);
+        assert_eq!(collision_file(&dir_s, "empty.bin", true), None);
+        // One byte is a file someone can open, and warning is right again.
+        std::fs::write(dir.join("empty.bin"), b"x").unwrap();
+        assert!(collision_file(&dir_s, "empty.bin", true).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reported bug: every browser capture warned about a file the
+    /// person could not find, because the warning was about the browser's
+    /// own placeholder rather than about anything they had downloaded.
+    ///
+    /// Gecko cannot park a download while Hydra decides, so Firefox's
+    /// transfer is still running at capture time — and Firefox reserves its
+    /// target name by creating a zero-byte file under the FINAL name while
+    /// the bytes go to a `name.<random>.ext.part` sibling. Both files are
+    /// deleted the moment the extension cancels the browser's copy, which is
+    /// why the folder was empty by the time the dialog was read. Verified
+    /// against Firefox 155 on macOS before this test was written.
+    #[test]
+    fn a_browsers_name_reservation_is_not_a_download_to_open() {
+        let dir = std::env::temp_dir().join(format!("hydra-gecko-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().into_owned();
+
+        // Exactly what Firefox leaves in the download folder a second after
+        // the click, for `libhydra-0.3.0-android.zip`.
+        std::fs::write(dir.join("libhydra-0.3.0-android.zip"), b"").unwrap();
+        std::fs::write(
+            dir.join("libhydra-0.3.0-android.S7v5x6tB.zip.part"),
+            vec![0xAB; 9_928_704],
+        )
+        .unwrap();
+
+        assert_eq!(
+            collision_file(&dir_s, "libhydra-0.3.0-android.zip", true),
+            None,
+            "the browser's own name reservation must not be reported as an existing download"
+        );
+
+        // Once the transfer really finishes, the placeholder has become the
+        // file: the very next capture of the same asset must warn.
+        std::fs::write(
+            dir.join("libhydra-0.3.0-android.zip"),
+            vec![0xCD; 9_928_704],
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(dir.join("libhydra-0.3.0-android.S7v5x6tB.zip.part"));
+        assert_eq!(
+            collision_file(&dir_s, "libhydra-0.3.0-android.zip", true).as_deref(),
+            Some(
+                dir.join("libhydra-0.3.0-android.zip")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+
+        // ...and once the person deletes that file, the warning is gone for
+        // good — the case the issue was filed about.
+        std::fs::remove_file(dir.join("libhydra-0.3.0-android.zip")).unwrap();
+        assert_eq!(
+            collision_file(&dir_s, "libhydra-0.3.0-android.zip", true),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
