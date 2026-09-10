@@ -29,6 +29,7 @@ mod macos_surface;
 mod menubus;
 mod model;
 mod nmhost;
+mod proxy;
 mod scan;
 mod sounds;
 mod theme;
@@ -153,6 +154,7 @@ fn boot() -> (App, Task<Message>) {
     // its event receiver.
     engine::ensure_started();
     engine::set_power_save(cfg.settings.power_save);
+    proxy::apply(&cfg.settings);
 
     // Browser-extension bridge: publish capture settings, then listen for
     // the native-messaging host on a loopback socket (port in ipc.json).
