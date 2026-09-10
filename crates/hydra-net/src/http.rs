@@ -110,6 +110,16 @@ pub struct Probe {
 /// wrong; "server answered 400" tells them to look it up.
 pub fn describe_status(status: u16) -> String {
     let phrase = match status {
+        // The success codes are here because `Probe::refusal` names them: most
+        // of 2xx is an answer rather than a file, and "server answered 202"
+        // leaves the reader to look up the one word that explains why.
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
+        204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         402 => "Payment Required",
@@ -150,10 +160,112 @@ pub fn describe_status(status: u16) -> String {
     format!("{status} {phrase}")
 }
 
+/// The text between two markers, if both are present in order.
+///
+/// A scan rather than [`crate::xml`]: an error body is read off the front of the
+/// same buffer as the headers and is routinely truncated mid-document, which a
+/// conforming parser rejects outright. The one element wanted is still there.
+fn between<'a>(hay: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = hay.find(open)? + open.len();
+    let rest = &hay[start..];
+    let end = rest.find(close)?;
+    Some(rest[..end].trim())
+}
+
+/// Shorten to `max` CHARACTERS, never bytes: slicing a UTF-8 string at a byte
+/// offset panics mid-codepoint, and server messages are not all ASCII.
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
+}
+
 impl Probe {
     /// This probe described a redirect rather than the object.
     pub fn is_redirect(&self) -> bool {
         matches!(self.status, 301 | 302 | 303 | 307 | 308) && self.location.is_some()
+    }
+
+    /// Why this response cannot be planned against, or `None` when it can.
+    ///
+    /// Every caller that plans a transfer has to make this test, and each one
+    /// that improvised it shipped a different half of it. `status >= 400` alone
+    /// misses that most of `2xx` is an ANSWER rather than a representation:
+    /// AWS WAF turns a bot challenge away with `202` and `Content-Length: 0`,
+    /// which read as metadata describe a zero-byte object, so the download
+    /// "succeeded" with an empty file on disk — the worst failure available,
+    /// because nothing looks wrong. Only `200`, `203` and `206` carry bytes.
+    ///
+    /// The phrase names no host: every caller frames it with its own, and a
+    /// message carrying two of them reads as a bug.
+    pub fn refusal(&self) -> Option<String> {
+        if self.status >= 400 {
+            let mut msg = format!("server answered {}", describe_status(self.status));
+            // Quoted, because callers append their own context: unquoted, the
+            // server's sentence runs into the host and reads as one clause —
+            // "403 Forbidden: Request has expired for s3q.ait.dtu.dk".
+            if let Some(detail) = self.error_detail() {
+                msg.push_str(&format!(" ({detail:?})"));
+            }
+            return Some(msg);
+        }
+        // A redirect is somebody else's job — `is_redirect` and the follower
+        // above it — so it is deliberately not refused here.
+        if (200..300).contains(&self.status) && !matches!(self.status, 200 | 203 | 206) {
+            let mut msg = format!(
+                "server answered {}, which carries no file",
+                describe_status(self.status)
+            );
+            if self.bot_challenge() {
+                msg.push_str(" (a bot challenge: this link opens only in a browser)");
+            }
+            return Some(msg);
+        }
+        None
+    }
+
+    /// The server's own explanation, lifted from an error response body.
+    ///
+    /// The body is already in hand: [`probe_via_get`] reads until the header
+    /// block is complete, and a short error body arrives in the same packet, so
+    /// this costs nothing but the parse. It is what turns "403 Forbidden" —
+    /// which sends the user hunting for a proxy or a credential — into "Request
+    /// has expired", which names the actual problem.
+    ///
+    /// Only consulted for error statuses: on a success the same trailing bytes
+    /// are the first bytes of the object, and quoting those into a message
+    /// would print binary at the user.
+    fn error_detail(&self) -> Option<String> {
+        if self.status < 400 {
+            return None;
+        }
+        let body = self.raw_head.split_once("\r\n\r\n").map(|(_, b)| b)?.trim();
+        // S3 and every dialect of it answer in this XML, and the message is the
+        // one sentence a person needs.
+        let text = match between(body, "<Message>", "</Message>") {
+            Some(m) => m,
+            // Anything else: a short body is a plausible sentence, a long one is
+            // an error PAGE whose markup would bury the message it contains.
+            None if !body.is_empty() && body.len() <= 300 && !body.starts_with('<') => body,
+            _ => return None,
+        };
+        let clean: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!clean.is_empty()).then(|| truncate_chars(&clean, 200))
+    }
+
+    /// The response is an anti-bot interstitial rather than the object.
+    ///
+    /// Read off AWS WAF's own header rather than guessed at from the body: the
+    /// header states the verdict, and a downloader that inferred it from page
+    /// text would misread every article that mentions the word.
+    fn bot_challenge(&self) -> bool {
+        header_value(&self.raw_head, "x-amzn-waf-action")
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("challenge"))
     }
 
     /// Mirrors this response advertised via `Link: <...>; rel=duplicate`
@@ -1187,6 +1299,34 @@ fn dechunk(body: &[u8]) -> Vec<u8> {
 /// A `bytes=0-0` GET is the robust alternative: it costs one byte of body, it proves
 /// range support rather than trusting an `Accept-Ranges` advertisement, and its
 /// `Content-Range` carries the total size, effectively probing without needing a separate HEAD request.
+/// Append whatever an error response has left to say onto `head`.
+///
+/// Bounded twice over, because this runs against a server that is already
+/// misbehaving: by size, so an error PAGE cannot be pulled into memory to
+/// produce one sentence, and by time, so a peer that sends headers and then
+/// neither body nor close cannot stall the probe. Failing to read the body is
+/// not an error — the status alone is still a usable answer.
+async fn read_error_body<S: tokio::io::AsyncRead + Unpin>(s: &mut S, head: &mut Vec<u8>) {
+    const CAP: usize = 8 * 1024;
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+    let already = find_crlf2(head).map(|i| head.len().saturating_sub(i + 4));
+    // A body that already arrived whole needs nothing; `error_detail` caps the
+    // message far below this.
+    if already.is_some_and(|n| n >= 512) {
+        return;
+    }
+    let mut buf = vec![0u8; 2048];
+    let _ = tokio::time::timeout(PATIENCE, async {
+        while head.len() < CAP {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => head.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await;
+}
+
 pub async fn probe_via_get<C: Connector>(c: &C, t: &Target) -> io::Result<Probe> {
     let mut s = c.connect(t).await?;
     let req = build_request_head("GET", t, Some((0, 0)));
@@ -1213,12 +1353,21 @@ pub async fn probe_via_get<C: Connector>(c: &C, t: &Target) -> io::Result<Probe>
             break;
         }
     }
-    let h = String::from_utf8_lossy(&head);
-    let status: u16 = h
+    let status: u16 = String::from_utf8_lossy(&head)
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
+    // The reason an error gives is in its body, and the body is not reliably in
+    // the same read as the headers — Qumulo puts them in separate segments, so
+    // the S3 `<Message>Request has expired</Message>` that explains a 403
+    // arrived one packet after the loop above had already stopped. Only on an
+    // error: on a success these bytes are the object, and pulling them here
+    // would read part of the file and throw it away.
+    if status >= 400 {
+        read_error_body(&mut s, &mut head).await;
+    }
+    let h = String::from_utf8_lossy(&head);
     let cr = header_value(&h, "content-range");
     let ranges = status == 206 && cr.is_some();
     let size = match cr.as_deref().and_then(parse_content_range_total) {
@@ -1261,6 +1410,39 @@ pub async fn probe_via_get<C: Connector>(c: &C, t: &Target) -> io::Result<Probe>
 /// zero, and the ranged GET is asked instead. A redirect IS an answer and is returned as
 /// it stands: the object is elsewhere, and this host has nothing to say about its bytes.
 pub async fn probe_resilient<C: Connector>(c: &C, t: &Target) -> io::Result<Probe> {
+    // A bot challenge is not a verdict, and one sample cannot tell the two
+    // cases apart. AWS WAF re-challenges INTERMITTENTLY: the same client, with
+    // the same accepted cookie, is waved through on one request and challenged
+    // on the next — the browser's own script re-solves it so quietly that it
+    // looks constant from outside. Failing on the first `202` therefore
+    // reported "this link opens only in a browser" about a link that had just
+    // delivered 122 MB, and made Resume unusable against such an origin.
+    //
+    // So ask again, a bounded number of times. A client that genuinely cannot
+    // get in is challenged every time and still gets the clear refusal, about
+    // a second later; one that hit a passing challenge gets its download.
+    const TRIES: u32 = 3;
+    let mut answer = probe_resilient_once(c, t).await;
+    for attempt in 1..TRIES {
+        match &answer {
+            Ok(p) if p.bot_challenge() => {}
+            _ => return answer,
+        }
+        // Jittered, because every connection of a stalled transfer re-probes at
+        // once and a fixed wait would march them back into the WAF in step.
+        let d = crate::polite::backoff_with_jitter(
+            attempt,
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_secs(2),
+            (t.port as u64).wrapping_mul(2_654_435_761) ^ attempt as u64,
+        );
+        tokio::time::sleep(d).await;
+        answer = probe_resilient_once(c, t).await;
+    }
+    answer
+}
+
+async fn probe_resilient_once<C: Connector>(c: &C, t: &Target) -> io::Result<Probe> {
     // A HEAD that STATED a length has answered, even when the length is zero.
     //
     // `Probe::size` cannot tell "no Content-Length" from "Content-Length: 0" —
@@ -1534,6 +1716,83 @@ where
     }
 }
 
+/// Fetch one range, following a redirect itself instead of reporting it.
+///
+/// [`fetch_range`] reports a redirect to its caller, and for the static-split
+/// path that is right: the caller owns the hop budget. The SCHEDULER path had
+/// no such caller — a redirect mid-transfer was a hard failure — and that is
+/// what made a short-lived signed URL undownloadable in parallel.
+///
+/// The distinction that matters: an origin handing out a presigned URL is not
+/// telling us the object moved, it is minting a credential, and it mints a
+/// FRESH one for every request. `data.dtu.dk` signs for ten seconds. So the
+/// durable address is the one the user gave, the redirect is how each request
+/// is authorised, and the hop has to be followed per request rather than
+/// written back over the target — writing it back caches a credential that is
+/// dead before the next range is asked for, which is the bug this fixes.
+///
+/// Re-issuing the same range is safe: a redirect is decided from the status
+/// line, before any body byte is read, so a hop delivers nothing to the sink
+/// and reports no arrival. Nothing is double-counted and no range moves.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fetch_range_following<C: Connector>(
+    c: Arc<C>,
+    conn: usize,
+    t: Target,
+    lo: u64,
+    bound: crate::Watermark,
+    sink: Arc<SparseSink>,
+    tx: mpsc::UnboundedSender<Arrival>,
+    t0: Instant,
+    pace: Pace,
+    pool: Option<crate::pool::SharedPool<C::Stream>>,
+) -> io::Result<()> {
+    let mut t = t;
+    for hop in 0..crate::polite::MAX_REDIRECTS {
+        let out = fetch_range(
+            c.clone(),
+            conn,
+            t.clone(),
+            lo,
+            bound.clone(),
+            sink.clone(),
+            tx.clone(),
+            t0,
+            pace.clone(),
+            pool.clone(),
+        )
+        .await;
+        let e = match out {
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => e,
+            other => return other,
+        };
+        let msg = e.to_string();
+        let loc = msg
+            .strip_prefix("redirect:")
+            .unwrap_or_default()
+            .to_string();
+        match retarget(&t, &loc) {
+            Some(next) => t = next,
+            // An unusable Location is a broken origin, not a hop worth
+            // spending: report it as the protocol error it is.
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unusable redirect target: {loc}"),
+                ))
+            }
+        }
+        let _ = hop;
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "redirect budget exhausted after {} hops",
+            crate::polite::MAX_REDIRECTS
+        ),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_range<C: Connector>(
     c: Arc<C>,
@@ -1707,6 +1966,21 @@ pub(crate) async fn fetch_range<C: Connector>(
                     "{status} throttled, retry after {}s",
                     ra.as_secs_f64().round()
                 ),
+            ));
+        }
+        // A bot challenge is the origin declining THIS request — not a verdict
+        // on the object. AWS WAF answers `202` with no body and its own header,
+        // and the very next request with the same cookie is let through: a
+        // transfer that has already delivered bytes has proved it can get in.
+        //
+        // So it is retryable, like a 429. Treating it as a protocol error threw
+        // away a completed 64 MiB transfer because one late request happened to
+        // be challenged. A client that can NEVER get in is caught earlier and
+        // more clearly, by `Probe::refusal` on the first request.
+        202 if header_value(&head_str, "x-amzn-waf-action").is_some() => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "202 bot challenge, retry after 1s",
             ));
         }
         // Redirects are followed by the caller, which owns the hop budget: a
@@ -2290,26 +2564,68 @@ fn parse_secs_from(msg: &str) -> Option<f64> {
 /// Only plaintext HTTP is followed. An `https://` target is refused rather than
 /// silently downgraded: TLS is not implemented in this transport, and pretending
 /// otherwise would corrupt a transfer.
-fn retarget(prev: &Target, location: &str) -> Option<Target> {
-    let loc = location.trim();
-    if loc.starts_with("https://") {
+/// Split an authority into host and port, defaulting the port for the scheme.
+///
+/// Bracket-aware, because `rsplit_once(':')` is actively wrong on an IPv6
+/// literal: `[2001:db8::1]` has no port and would be cut at its last colon.
+fn split_authority(auth: &str, default_port: u16) -> Option<(String, u16)> {
+    if auth.is_empty() {
         return None;
     }
-    if let Some(rest) = loc.strip_prefix("http://") {
+    if let Some(rest) = auth.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None => default_port,
+        };
+        return Some((host.to_string(), port));
+    }
+    match auth.rsplit_once(':') {
+        Some((h, p)) => Some((h.to_string(), p.parse().ok()?)),
+        None => Some((auth.to_string(), default_port)),
+    }
+}
+
+/// The target a `Location` names, relative to the one that produced it.
+///
+/// `https` is followed, not refused. It used to be: an absolute TLS `Location`
+/// returned `None`, which reads as "this path cannot do TLS" and was true only
+/// of the connector the helper was first written for. Every connector that
+/// carries a real transfer honours `Target::tls`, and refusing meant an origin
+/// that redirects to a signed URL on another host — the ordinary shape of every
+/// object store — reported `unusable redirect target` and stopped, naming a URL
+/// that was perfectly good.
+///
+/// Headers and the agent deliberately do NOT travel to an absolute location:
+/// the hop is usually cross-origin, and replaying a `Cookie:` at whatever host
+/// a redirect names is how a session token leaks to a third party. A relative
+/// hop stays on the same origin and keeps them.
+fn retarget(prev: &Target, location: &str) -> Option<Target> {
+    let loc = location.trim();
+    let absolute = |tls: bool, rest: &str| {
         let (auth, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
-        return Some(match &prev.origin {
-            Some(_) => Target::via_proxy(&prev.host, prev.port, auth, path),
+        match &prev.origin {
+            // Through a forward proxy the request stays in absolute form and the
+            // proxy does the reaching, so the authority travels as text.
+            Some(_) => Some(Target::via_proxy(&prev.host, prev.port, auth, path)),
             None => {
-                let (h, p) = match auth.rsplit_once(':') {
-                    Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
-                    None => (auth.to_string(), 80),
-                };
-                Target::direct(&h, p, path)
+                let (h, p) = split_authority(auth, if tls { 443 } else { 80 })?;
+                Some(if tls {
+                    Target::direct_tls(&h, p, path)
+                } else {
+                    Target::direct(&h, p, path)
+                })
             }
-        });
+        }
+    };
+    if let Some(rest) = loc.strip_prefix("https://") {
+        return absolute(true, rest);
+    }
+    if let Some(rest) = loc.strip_prefix("http://") {
+        return absolute(false, rest);
     }
     if loc.starts_with('/') {
         let mut next = prev.clone();
@@ -3194,5 +3510,369 @@ mod tests {
             named("attachment; filename=\"보고서\"").suggested_filename(),
             Some("보고서".into())
         );
+    }
+}
+
+#[cfg(test)]
+mod retarget_tests {
+    use super::*;
+
+    /// The `Location` from the bug report, verbatim.
+    const S3: &str = "https://s3q.ait.dtu.dk:9000/figshare/26003087/TEP_Mode1.h5\
+?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+&X-Amz-Credential=00000005001330512eb1/20260910/oha/s3/aws4_request\
+&X-Amz-Date=20260910T120757Z&X-Amz-Expires=10&X-Amz-SignedHeaders=host\
+&X-Amz-Signature=92429b6cd0794b68e3a79044dbc0f93d9ac32dba01650e246577cde1bab";
+
+    /// Refusing this is what made the transfer stop with `unusable redirect
+    /// target` while naming a URL that was perfectly good.
+    #[test]
+    fn an_absolute_https_location_is_followed() {
+        let prev = Target::direct_tls("data.dtu.dk", 443, "/ndownloader/files/26003087");
+        let next = retarget(&prev, S3).expect("a signed https location is usable");
+        assert_eq!(next.host, "s3q.ait.dtu.dk");
+        assert_eq!(next.port, 9000, "the signed authority includes its port");
+        assert!(next.tls, "https must not be fetched in the clear");
+        // The query must survive byte for byte: the credential contains literal
+        // `/` characters, and re-encoding any of them breaks the signature.
+        assert!(next.path.contains("aws4_request"), "{}", next.path);
+        assert!(
+            next.path.starts_with("/figshare/26003087/TEP_Mode1.h5?"),
+            "{}",
+            next.path
+        );
+        // What the Host header will say — the half that SigV4 signs.
+        let head = build_request_head("GET", &next, Some((0, 9)));
+        assert!(head.contains("\r\nHost: s3q.ait.dtu.dk:9000\r\n"), "{head}");
+    }
+
+    #[test]
+    fn default_ports_are_supplied_per_scheme() {
+        let prev = Target::direct("h", 80, "/a");
+        let s = retarget(&prev, "https://example.com/o").expect("https");
+        assert_eq!((s.port, s.tls), (443, true));
+        let p = retarget(&prev, "http://example.com/o").expect("http");
+        assert_eq!((p.port, p.tls), (80, false));
+        // No path at all still names the root.
+        assert_eq!(retarget(&prev, "https://example.com").unwrap().path, "/");
+    }
+
+    /// `rsplit_once(':')` cuts an IPv6 literal at its last colon, which invents
+    /// a port out of part of the address.
+    #[test]
+    fn an_ipv6_literal_is_not_cut_at_its_last_colon() {
+        let prev = Target::direct("h", 80, "/a");
+        let n = retarget(&prev, "http://[2001:db8::1]/o").expect("bare v6");
+        assert_eq!((n.host.as_str(), n.port), ("2001:db8::1", 80));
+        let n = retarget(&prev, "https://[2001:db8::1]:8443/o").expect("v6 with port");
+        assert_eq!((n.host.as_str(), n.port), ("2001:db8::1", 8443));
+        assert!(n.tls);
+    }
+
+    #[test]
+    fn a_relative_location_keeps_the_origin_and_its_headers() {
+        let mut prev = Target::direct_tls("h", 9000, "/a");
+        prev.headers = vec!["Cookie: s=1".into()];
+        let n = retarget(&prev, "/b?x=1").expect("relative");
+        assert_eq!((n.host.as_str(), n.port, n.tls), ("h", 9000, true));
+        assert_eq!(n.path, "/b?x=1");
+        assert_eq!(n.headers, prev.headers, "same origin keeps its headers");
+    }
+
+    /// A cross-origin hop must not replay the previous origin's headers: that
+    /// is how a session cookie reaches whatever host a redirect names.
+    #[test]
+    fn an_absolute_location_does_not_carry_headers_to_another_host() {
+        let mut prev = Target::direct_tls("data.dtu.dk", 443, "/f");
+        prev.headers = vec!["Cookie: aws-waf-token=secret".into()];
+        let n = retarget(&prev, S3).expect("usable");
+        assert!(n.headers.is_empty(), "{:?}", n.headers);
+    }
+
+    #[test]
+    fn a_location_that_names_nothing_usable_is_refused() {
+        let prev = Target::direct("h", 80, "/a");
+        for bad in ["", "   ", "ftp://h/o", "javascript:alert(1)", "https://"] {
+            assert!(retarget(&prev, bad).is_none(), "{bad:?} must be refused");
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_header_tests {
+    use super::*;
+
+    /// The reported defect, reduced to the header that caused it.
+    ///
+    /// `s3q.ait.dtu.dk:9000` hands out SigV4 presigned URLs, and SigV4 signs
+    /// `host`. Sending `Host: s3q.ait.dtu.dk` for a signature minted over
+    /// `s3q.ait.dtu.dk:9000` is a different canonical request, so the store
+    /// answered `SignatureDoesNotMatch` — on a URL curl fetched from the same
+    /// machine a second later. Every object store on a non-default port was
+    /// unreachable, and the error blamed the signature rather than the client.
+    #[test]
+    fn a_non_default_port_is_carried_in_the_host_header() {
+        let t = Target::direct_tls("s3q.ait.dtu.dk", 9000, "/figshare/o?X-Amz-Signature=ab");
+        let head = build_request_head("GET", &t, None);
+        assert!(
+            head.contains("\r\nHost: s3q.ait.dtu.dk:9000\r\n"),
+            "the port is part of the signed authority:\n{head}"
+        );
+    }
+
+    /// ...and the default port is still omitted. Adding `:443` everywhere would
+    /// be the same class of bug pointed the other way: it changes the canonical
+    /// host for every ordinary signed URL, which is nearly all of them.
+    #[test]
+    fn a_default_port_is_left_out() {
+        for (tls, port) in [(true, 443u16), (false, 80)] {
+            let t = if tls {
+                Target::direct_tls("example.com", port, "/o")
+            } else {
+                Target::direct("example.com", port, "/o")
+            };
+            let head = build_request_head("GET", &t, None);
+            assert!(
+                head.contains("\r\nHost: example.com\r\n"),
+                "tls={tls} port={port}:\n{head}"
+            );
+        }
+        // A plain-HTTP origin on a non-default port still needs it.
+        let t = Target::direct("example.com", 8080, "/o");
+        assert!(build_request_head("GET", &t, None).contains("\r\nHost: example.com:8080\r\n"));
+        // ...as does an HTTPS origin on 80, which is not ITS default.
+        let t = Target::direct_tls("example.com", 80, "/o");
+        assert!(build_request_head("GET", &t, None).contains("\r\nHost: example.com:80\r\n"));
+    }
+
+    /// A proxied request is sent in absolute form and carries the authority the
+    /// proxy was given, port included; the fix must not disturb that path.
+    #[test]
+    fn a_proxied_request_still_names_the_origin_authority() {
+        let mut t = Target::direct_tls("s3q.ait.dtu.dk", 9000, "/o");
+        t.origin = Some("s3q.ait.dtu.dk:9000".into());
+        let head = build_request_head("GET", &t, None);
+        assert!(
+            head.starts_with("GET http://s3q.ait.dtu.dk:9000/o HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("\r\nHost: s3q.ait.dtu.dk:9000\r\n"), "{head}");
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    /// A probe as it comes off the wire: the raw block holds the headers and,
+    /// for a short error, the body that arrived in the same read.
+    fn answered(status: u16, head_and_body: &str) -> Probe {
+        Probe {
+            status,
+            raw_head: head_and_body.replace('\n', "\r\n"),
+            ..Probe::default()
+        }
+    }
+
+    /// The reported defect. `data.dtu.dk` sits behind AWS WAF, which turns a
+    /// non-browser away with `202` and `Content-Length: 0`. Read as metadata
+    /// that describes a zero-byte object, so hydra wrote an empty `.h5` and
+    /// exited 0 — a download that "succeeded" with no file in it.
+    #[test]
+    fn a_waf_challenge_is_refused_rather_than_read_as_an_empty_object() {
+        let p = answered(
+            202,
+            "HTTP/1.1 202 Accepted\ncontent-length: 0\nx-amzn-waf-action: challenge\n\n",
+        );
+        let why = p.refusal().expect("202 carries no object");
+        assert!(why.contains("202"), "{why}");
+        assert!(why.contains("carries no file"), "{why}");
+        assert!(why.contains("browser"), "{why}");
+        // The trap that made this silent: the length is stated, and stated zero.
+        assert_eq!(p.stated_length(), Some(0));
+    }
+
+    /// The other half of the report: a presigned URL whose ten-second window
+    /// had closed. "403 Forbidden" sends a user hunting for a proxy or a
+    /// password; the server had already said which it was.
+    #[test]
+    fn the_servers_own_explanation_is_lifted_out_of_an_s3_error_body() {
+        let p = answered(
+            403,
+            "HTTP/1.1 403 Forbidden\nContent-Type: application/xml\n\n\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>AccessDenied</Code>\
+<Message>Request has expired</Message></Error>",
+        );
+        assert_eq!(
+            p.refusal().as_deref(),
+            Some(r#"server answered 403 Forbidden ("Request has expired")"#)
+        );
+    }
+
+    #[test]
+    fn a_status_that_carries_bytes_is_not_refused() {
+        for s in [200, 203, 206] {
+            let p = answered(s, "HTTP/1.1 200 OK\ncontent-length: 10\n\n");
+            assert_eq!(p.refusal(), None, "{s} carries the object");
+        }
+        // Status 0 is "the peer said nothing", which `probe_resilient` answers
+        // with a ranged GET. Refusing it here would break that fallback.
+        assert_eq!(answered(0, "").refusal(), None);
+    }
+
+    #[test]
+    fn the_rest_of_2xx_is_an_answer_rather_than_a_representation() {
+        for s in [201, 202, 204, 205] {
+            let p = answered(s, "HTTP/1.1 x\ncontent-length: 0\n\n");
+            assert!(p.refusal().is_some(), "{s} is not the object");
+            // No WAF header, so no browser advice to give.
+            assert!(!p.refusal().unwrap().contains("browser"), "{s}");
+        }
+    }
+
+    #[test]
+    fn an_error_page_is_not_quoted_and_a_short_sentence_is() {
+        // HTML: the message is buried in markup, so say nothing extra.
+        let page = answered(
+            404,
+            "HTTP/1.1 404 Not Found\n\n<html><body><h1>Not Found</h1></body></html>",
+        );
+        assert_eq!(
+            page.refusal().as_deref(),
+            Some("server answered 404 Not Found")
+        );
+        // A plain-text body is the server's own sentence.
+        let text = answered(410, "HTTP/1.1 410 Gone\n\nthis link was revoked");
+        assert_eq!(
+            text.refusal().as_deref(),
+            Some(r#"server answered 410 Gone ("this link was revoked")"#)
+        );
+        // A body with no headers/body split at all cannot be mined.
+        assert_eq!(
+            answered(500, "HTTP/1.1 500 x").refusal().as_deref(),
+            Some("server answered 500 Internal Server Error")
+        );
+    }
+
+    /// A success's trailing bytes are the START OF THE FILE, not a message.
+    /// Quoting them would print binary at the user.
+    #[test]
+    fn a_body_is_never_mined_for_an_explanation_on_a_success() {
+        let p = answered(200, "HTTP/1.1 200 OK\n\n<Message>not a message</Message>");
+        assert_eq!(p.refusal(), None);
+        assert_eq!(p.error_detail(), None);
+    }
+
+    #[test]
+    fn a_long_or_multiline_message_is_flattened_and_capped() {
+        let long = "x".repeat(500);
+        let p = answered(
+            403,
+            &format!("HTTP/1.1 403 Forbidden\n\n<Message>{long}</Message>"),
+        );
+        let why = p.refusal().unwrap();
+        assert!(why.contains('…'), "{why}");
+        assert!(why.chars().count() < 260, "{}", why.chars().count());
+        // Newlines and control bytes collapse to single spaces.
+        let messy = answered(
+            403,
+            "HTTP/1.1 403 Forbidden\n\n<Message>a\n\n  b\tc</Message>",
+        );
+        assert_eq!(
+            messy.refusal().as_deref(),
+            Some(r#"server answered 403 Forbidden ("a b c")"#)
+        );
+    }
+
+    /// Truncation is the normal case, not an edge one: the read stops once the
+    /// header block is complete, so a longer body arrives cut off mid-document.
+    #[test]
+    fn a_truncated_error_body_still_yields_its_message() {
+        let p = answered(
+            403,
+            "HTTP/1.1 403 Forbidden\n\n<Error><Message>Request has expired</Message><Resource>/fig",
+        );
+        assert_eq!(
+            p.refusal().as_deref(),
+            Some(r#"server answered 403 Forbidden ("Request has expired")"#)
+        );
+    }
+
+    /// The defect this test exists for was invisible in unit tests and obvious
+    /// against the real origin: `s3q.ait.dtu.dk` writes the header block and
+    /// the XML body as SEPARATE segments, so the probe's read loop — which
+    /// stops the moment the headers are complete — never saw the sentence that
+    /// explained the 403. Hydra reported a bare "403 Forbidden" about a URL
+    /// whose signature had simply run out.
+    #[tokio::test]
+    async fn an_error_body_in_its_own_segment_is_still_read() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let Ok(peek) = sock.try_clone() else { continue };
+                let mut r = BufReader::new(peek);
+                let mut line = String::new();
+                let _ = r.read_line(&mut line);
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                }
+                let body = b"<?xml version=\"1.0\"?><Error><Code>AccessDenied</Code>\
+<Message>Request has expired</Message></Error>";
+                let head = format!(
+                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\n\
+Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                // The headers alone, flushed, and only THEN the body: this is
+                // the segmentation that hid the message.
+                if sock.write_all(head.as_bytes()).is_err() || sock.flush().is_err() {
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let _ = sock.write_all(body);
+            }
+        });
+
+        let t = Target::direct("127.0.0.1", port, "/o?X-Amz-Expires=10");
+        let p = probe_via_get(&crate::TcpConnector, &t)
+            .await
+            .expect("probe");
+        assert_eq!(p.status, 403);
+        assert_eq!(
+            p.refusal().as_deref(),
+            Some(r#"server answered 403 Forbidden ("Request has expired")"#)
+        );
+    }
+
+    /// A body that already arrived whole must not cost another read: the peer
+    /// may hold the socket open, and the two-second patience would then be
+    /// spent on every error against it.
+    #[tokio::test]
+    async fn a_body_already_in_hand_is_not_waited_on() {
+        let body = "x".repeat(600);
+        let mut head = format!("HTTP/1.1 403 Forbidden\r\n\r\n{body}").into_bytes();
+        let before = head.len();
+        // A reader that would block forever if it were consulted at all.
+        let mut never = tokio::io::empty();
+        let t0 = std::time::Instant::now();
+        read_error_body(&mut never, &mut head).await;
+        assert_eq!(head.len(), before, "nothing more was read");
+        assert!(t0.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[test]
+    fn truncate_never_splits_a_codepoint() {
+        // Four-byte codepoints: a byte-offset slice would panic here.
+        let s = "𝄞".repeat(10);
+        assert_eq!(truncate_chars(&s, 3), format!("{}…", "𝄞".repeat(3)));
+        assert_eq!(truncate_chars(&s, 100), s);
     }
 }
