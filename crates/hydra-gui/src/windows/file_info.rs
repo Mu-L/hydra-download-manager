@@ -4,14 +4,16 @@
 //! Two dialogs sharing one state, laid out "Download File Info":
 //! a narrow label column, one Save As box holding the whole path with a
 //! "..." save dialog beside it, the folder the tick would remember shown
-//! greyed under the checkbox, the file-type icon and size in a side column,
-//! and the buttons left-aligned under the fields.
+//! greyed under the checkbox, the file-type icon and size in a side column
+//! centred beside the fields, and the buttons on a bar across the foot.
 //!
 //! * New download — "Download File Info": category/save-as/description while
 //!   the transfer already runs in the background.
-//! * Existing download — "File Properties": status/size, editable Address
-//!   (switch mirrors and CONTINUE the same bytes), login/password, cookies,
-//!   last try and result.
+//! * Existing download — "File Properties": what the entry already is
+//!   (status, size, last try and the error of the last attempt) as a block
+//!   at the top, then the editable rows — Address (switch mirrors and
+//!   CONTINUE the same bytes), category, path, description, login/password
+//!   and cookies.
 
 use crate::app::{App, El, Message};
 use crate::model::DlState;
@@ -24,9 +26,16 @@ use iced::Length;
 const LABEL_W: f32 = 84.0;
 const GAP: f32 = 8.0;
 
+/// Half these labels reach the catalogue with a trailing colon and half
+/// without — the bare ones are keys other windows share, and a translation
+/// may punctuate either way — so the column decides, not the string.
+fn punctuated(label: &str) -> String {
+    format!("{}:", label.trim_end().trim_end_matches(':').trim_end())
+}
+
 fn labeled<'a>(label: String, content: El<'a>) -> El<'a> {
     row![
-        text(label)
+        text(punctuated(&label))
             .size(theme::FONT_SIZE)
             .wrapping(iced::widget::text::Wrapping::None)
             .width(LABEL_W),
@@ -75,6 +84,9 @@ pub fn view(app: &App) -> El<'_> {
 
     let mut form = column![].spacing(GAP).width(Length::Fill);
 
+    // What the entry already is, in one block: nothing here is editable,
+    // and reading the outcome of the last attempt next to the status beats
+    // hunting for it under the fields that change it.
     if !st.is_new {
         form = form.push(labeled(
             tr("Status:"),
@@ -91,6 +103,25 @@ pub fn view(app: &App) -> El<'_> {
             .size(theme::FONT_SIZE)
             .into(),
         ));
+        form = form.push(labeled(
+            tr("Last try date:"),
+            text(
+                item.and_then(|d| d.last_try)
+                    .map(fmt::date)
+                    .unwrap_or_default(),
+            )
+            .size(theme::FONT_SIZE)
+            .into(),
+        ));
+        if let Some(err) = item.and_then(|d| d.error.clone()) {
+            form = form.push(labeled(
+                tr("Result:"),
+                text(err)
+                    .size(theme::FONT_SIZE)
+                    .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B))
+                    .into(),
+            ));
+        }
     }
 
     // Address: read-only while the fresh probe is running, editable on an
@@ -212,32 +243,15 @@ pub fn view(app: &App) -> El<'_> {
                 .width(Length::Fill)
                 .into(),
         ));
-        let last_try = item
-            .and_then(|d| d.last_try)
-            .map(fmt::date)
-            .unwrap_or_default();
-        form = form.push(labeled(
-            tr("Last try date:"),
-            text(last_try).size(theme::FONT_SIZE).into(),
-        ));
-        if let Some(err) = item.and_then(|d| d.error.clone()) {
-            form = form.push(labeled(
-                tr("Result:"),
-                text(err)
-                    .size(theme::FONT_SIZE)
-                    .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B))
-                    .into(),
-            ));
-        }
     }
 
-    // Side column: file-type icon with the size under it, level with the
-    // Category/Save As rows, and Preview button beneath — live for an
-    // archive whose index can be read off its tail (see `engine::peek_zip`),
-    // greyed for everything else so the column keeps one shape.
+    // Side column: file-type icon with the size under it and the Preview
+    // button beneath, centred on the fields it belongs to rather than
+    // hanging off the top or bottom of them. Preview is live for an archive
+    // whose index can be read off its tail (see `engine::peek_zip`), greyed
+    // for everything else so the column keeps one shape.
     let previewable = hya_net::zipdir::is_zip_name(&st.file_name);
     let side = column![
-        iced::widget::space::vertical().height(if st.is_new { 30.0 } else { 86.0 }),
         svg(crate::ui::categories::cat_icon(&st.category))
             .width(48.0)
             .height(48.0),
@@ -252,6 +266,9 @@ pub fn view(app: &App) -> El<'_> {
     .spacing(6)
     .align_x(iced::Alignment::Center)
     .width(96.0);
+    let side = container(side)
+        .height(Length::Fill)
+        .align_y(iced::Alignment::Center);
 
     let buttons: El<'_> = if st.is_new {
         row![
@@ -271,25 +288,42 @@ pub fn view(app: &App) -> El<'_> {
         .into()
     };
 
-    // Buttons centred under the fields, inside the form so the side column
-    // does not pull them off-centre.
-    form = form.push(
+    // No in-window heading: the OS title bar already names the dialog.
+    //
+    // The buttons get a bar of their own across the foot rather than a row
+    // inside the form: the fields keep the full width beside the icon
+    // column, the buttons stay centred on the dialog instead of on whatever
+    // the icon column leaves, and any height the window has over the form
+    // opens above them — never as a dead strip under the last button.
+    container(
         column![
-            iced::widget::space::vertical().height(4.0),
+            row![form, side].spacing(GAP).height(Length::Fill),
             row![
-                iced::widget::space::horizontal().width(LABEL_W + GAP),
                 iced::widget::space::horizontal(),
                 buttons,
                 iced::widget::space::horizontal(),
             ],
         ]
-        .width(Length::Fill),
-    );
+        .spacing(GAP)
+        .padding(14),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(theme::window)
+    .into()
+}
 
-    // No in-window heading: the OS title bar already names the dialog.
-    container(row![form, side].spacing(GAP).padding(14))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(theme::window)
-        .into()
+#[cfg(test)]
+mod tests {
+    use super::punctuated;
+
+    #[test]
+    fn every_label_ends_in_exactly_one_colon() {
+        // "Address:" and "Category" are both catalogue keys as they stand,
+        // so the column meets both spellings; a locale that spaces its
+        // colon off the word must not come out doubled either.
+        assert_eq!(punctuated("Category"), "Category:");
+        assert_eq!(punctuated("Address:"), "Address:");
+        assert_eq!(punctuated("Last try date :"), "Last try date:");
+    }
 }

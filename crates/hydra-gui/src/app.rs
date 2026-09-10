@@ -1724,14 +1724,18 @@ impl App {
                 );
                 (760.0, h)
             }
-            // New-download layout is short; Properties adds status/size/
-            // login/cookies/history rows. Size the window to the mode so
-            // neither shows dead space.
-            WinKind::FileInfo(_) => {
+            // New-download layout is short; Properties adds the status,
+            // size and last-try lines and the login/cookies rows, plus a
+            // Result line when the last attempt left an error to show.
+            // Size the window to the rows it actually draws: the dialog
+            // does not scroll, so too little clips the buttons and too
+            // much leaves a dead strip under them.
+            WinKind::FileInfo(dl) => {
                 if self.file_info.is_new {
-                    (680.0, 300.0)
+                    (680.0, 276.0)
                 } else {
-                    (680.0, 410.0)
+                    let failed = self.item(dl).is_some_and(|d| d.error.is_some());
+                    (680.0, if failed { 368.0 } else { 336.0 })
                 }
             }
             // Matches ProgToggleDetails: a box whose details are hidden
