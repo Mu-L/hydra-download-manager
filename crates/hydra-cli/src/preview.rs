@@ -17,11 +17,8 @@ pub async fn run(url: &str, args: &crate::cli::Cli) -> Result<(), String> {
     let conn = hya_net::TlsCapableConnector::with_insecure(args.insecure)
         .map_err(|e| format!("tls setup failed: {e}"))?;
     let (probe, url) = crate::download::probe_public(&conn, &u, args).await?;
-    if probe.status >= 400 {
-        return Err(format!(
-            "the server answered {} for {url}",
-            hya_net::describe_status(probe.status)
-        ));
+    if let Some(why) = probe.refusal() {
+        return Err(format!("the {why} for {url}"));
     }
     let total = probe.size;
     if total == 0 {

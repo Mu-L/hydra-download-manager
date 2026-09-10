@@ -5,7 +5,7 @@
 //! how the CLI renders per-connection state without this crate depending on a
 //! UI.
 
-use crate::http::fetch_range;
+use crate::http::fetch_range_following;
 use crate::polite::Pace;
 use crate::sink::SparseSink;
 use crate::{Arrival, Connector, Target};
@@ -1331,9 +1331,23 @@ pub async fn run_transfer_with_reserves<C: Connector>(
                     gen_of.insert(conn, g);
                     let dtx = done_tx.clone();
                     let h = tokio::spawn(async move {
-                        let r =
-                            fetch_range(cc, conn, t, range.lo, bound, sk, txc, t0, pc, Some(pl))
-                                .await;
+                        // Following, not reporting: see `fetch_range_following`.
+                        // An origin that signs each request separately answers
+                        // every one of these with a fresh redirect, and the
+                        // target must stay the address that can still do that.
+                        let r = fetch_range_following(
+                            cc,
+                            conn,
+                            t,
+                            range.lo,
+                            bound,
+                            sk,
+                            txc,
+                            t0,
+                            pc,
+                            Some(pl),
+                        )
+                        .await;
                         let _ = dtx.send((conn, g, r));
                     });
                     inflight.insert(conn, h);
