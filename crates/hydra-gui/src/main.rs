@@ -217,6 +217,7 @@ fn boot() -> (App, Task<Message>) {
         perm_status: windows::permissions::PermStatus::default(),
         main_pos: None,
         main_size: iced::Size::new(0.0, 0.0),
+        display: app::display_points().unwrap_or(iced::Size::ZERO),
         minimize_on_open: std::collections::HashSet::new(),
         power: None,
         system_dark: theme::system_is_dark(),
