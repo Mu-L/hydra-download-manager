@@ -4186,7 +4186,7 @@ impl App {
 
             // ------------------------------------------- browser extension
             Message::Ext(ev) => match ev {
-                crate::extbus::ExtEvent::Download(dl) => {
+                crate::extbus::ExtEvent::Download(dl, ack) => {
                     // Same flow as a manual Add URL, so duplicate detection,
                     // categorization, and the File Info dialog all behave
                     // consistently for browser capture.
@@ -4199,7 +4199,12 @@ impl App {
                         capture_referer: dl.referer,
                         ..AddUrlState::default()
                     };
-                    self.update(Message::AddUrlOk)
+                    let task = self.update(Message::AddUrlOk);
+                    // The item is listed (or a duplicate dialog is up over
+                    // it): hydra owns this download, so the browser may drop
+                    // its own paused copy. Until this, it must not.
+                    ack.confirm();
+                    task
                 }
                 crate::extbus::ExtEvent::Stream(s) => {
                     // Not the capture dialog: a manifest cannot be probed
