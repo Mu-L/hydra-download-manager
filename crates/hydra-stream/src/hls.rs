@@ -2183,17 +2183,18 @@ v2/index.m3u8\n";
     const CONC: usize = 6;
 
     /// A fresh AES-128 key for one test run. Seeded from the process's
-    /// `RandomState`, so the bytes exist only while the test does.
+    /// `RandomState`, so the bytes exist only while the test does. The bytes
+    /// are assembled from the hasher's output rather than written into a
+    /// zeroed array, which static analysis reads as a hard-coded key.
     fn test_key() -> [u8; 16] {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
-        let mut key = [0u8; 16];
-        for (i, half) in key.chunks_mut(8).enumerate() {
+        let word = |i: usize| {
             let mut h = RandomState::new().build_hasher();
             h.write_usize(i);
-            half.copy_from_slice(&h.finish().to_ne_bytes());
-        }
-        key
+            u128::from(h.finish())
+        };
+        ((word(0) << 64) | word(1)).to_ne_bytes()
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
