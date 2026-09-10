@@ -396,6 +396,19 @@ pub fn folder_video() -> svg::Handle {
     .clone()
 }
 
+/// Model weights and dataset containers: a small feed-forward net.
+///
+/// Purple on purpose — every other category glyph is already claimed (yellow
+/// folder, blue programs, navy video, white documents), and at 16px the tree
+/// is read by colour before shape.
+pub fn folder_ai() -> svg::Handle {
+    static C: OnceLock<svg::Handle> = OnceLock::new();
+    C.get_or_init(|| flat_icon(
+        r##"<path d="M4 4.6 L8 8 M4 11.4 L8 8 M8 8 L12 4.6 M8 8 L12 11.4" fill="none" stroke="#7A5AF8" stroke-width="1" stroke-linecap="round"/><circle cx="4" cy="4.6" r="1.9" fill="#C7B8FF" stroke="#7A5AF8" stroke-width="0.8"/><circle cx="4" cy="11.4" r="1.9" fill="#C7B8FF" stroke="#7A5AF8" stroke-width="0.8"/><circle cx="12" cy="4.6" r="1.9" fill="#C7B8FF" stroke="#7A5AF8" stroke-width="0.8"/><circle cx="12" cy="11.4" r="1.9" fill="#C7B8FF" stroke="#7A5AF8" stroke-width="0.8"/><circle cx="8" cy="8" r="2.2" fill="#7A5AF8" stroke="#5B3FD0" stroke-width="0.8"/>"##,
+    ))
+    .clone()
+}
+
 pub fn folder_unfinished() -> svg::Handle {
     static C: OnceLock<svg::Handle> = OnceLock::new();
     C.get_or_init(|| flat_icon(

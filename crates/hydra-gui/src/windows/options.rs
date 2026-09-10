@@ -6,7 +6,7 @@
 //! tab strip.
 
 use crate::app::{App, El, Message, OptField, OptTab, WinKind};
-use crate::model::ProxyMode;
+use crate::model::{ProxyMode, ProxyType};
 use crate::windows::{dlg_btn, dlg_btn_auto, dlg_btn_auto_primary, dlg_btn_primary};
 use crate::{i18n::tr, theme};
 use iced::widget::{
@@ -557,14 +557,21 @@ fn proxy(app: &App) -> El<'_> {
         ))
         .size(15.0)
         .text_size(theme::FONT_SIZE),
-        radio(
-            tr("Use system settings"),
-            ProxyMode::System,
-            Some(mode),
-            |m| { o(OptField::ProxyMode(m)) }
-        )
-        .size(15.0)
-        .text_size(theme::FONT_SIZE),
+        hinted(
+            radio(
+                tr("Use system settings"),
+                ProxyMode::System,
+                Some(mode),
+                |m| { o(OptField::ProxyMode(m)) }
+            )
+            .size(15.0)
+            .text_size(theme::FONT_SIZE),
+            tr(
+                "Takes the proxy from the environment (all_proxy, https_proxy, http_proxy) \
+                 and then from the system settings. A SOCKS proxy is preferred where the \
+                 system offers both."
+            ),
+        ),
         radio(
             tr("Use automatic configuration script"),
             ProxyMode::Script,
@@ -582,6 +589,15 @@ fn proxy(app: &App) -> El<'_> {
                 .width(Length::Fill),
         ]
         .spacing(8),
+        // Said here rather than only in the log: a radio that quietly does
+        // nothing is how a download ends up leaving through the real address
+        // while the user believes it is tunnelled.
+        text(tr(
+            "Configuration scripts (PAC) are not evaluated yet — choose manual \
+             configuration or system settings."
+        ))
+        .size(theme::FONT_SIZE - 1.0)
+        .color(theme::dim_text(&iced::Theme::Light)),
         radio(
             tr("Manual proxy/socks configuration"),
             ProxyMode::Manual,
@@ -592,11 +608,26 @@ fn proxy(app: &App) -> El<'_> {
         .text_size(theme::FONT_SIZE),
         row![
             column![
+                text(tr("Type")).size(theme::FONT_SIZE),
+                pick_list(&ProxyType::ALL[..], Some(s.proxy_type), |t| o(
+                    OptField::ProxyType(t)
+                ))
+                .text_size(theme::FONT_SIZE)
+                .style(theme::picker)
+                .width(Length::Fill),
+            ]
+            .spacing(4)
+            .width(110.0),
+            column![
                 text(tr("Proxy server address")).size(theme::FONT_SIZE),
-                text_input("", &s.proxy_host)
-                    .on_input(|v| o(OptField::ProxyHost(v)))
-                    .size(theme::FONT_SIZE)
-                    .style(theme::input),
+                hinted(
+                    text_input("", &s.proxy_host)
+                        .on_input(|v| o(OptField::ProxyHost(v)))
+                        .size(theme::FONT_SIZE)
+                        .style(theme::input),
+                    tr("A host name or address, or a full specification such as \
+                         socks5://127.0.0.1:10808 — a scheme spelled here wins over Type."),
+                ),
             ]
             .spacing(4)
             .width(Length::Fill),
@@ -630,28 +661,11 @@ fn proxy(app: &App) -> El<'_> {
             .width(140.0),
         ]
         .spacing(10),
-        text(tr("Use this proxy for the following protocols:")).size(theme::FONT_SIZE),
-        row![
-            checkbox(s.proxy_http)
-                .label("http")
-                .on_toggle(|b| o(OptField::ProxyHttp(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
-            checkbox(s.proxy_https)
-                .label("https")
-                .on_toggle(|b| o(OptField::ProxyHttps(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
-            checkbox(s.proxy_ftp)
-                .label("ftp")
-                .on_toggle(|b| o(OptField::ProxyFtp(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
-        ]
-        .spacing(20),
+        text(tr(
+            "The proxy carries every download: HTTP, HTTPS and — over SOCKS — FTP."
+        ))
+        .size(theme::FONT_SIZE - 1.0)
+        .color(theme::dim_text(&iced::Theme::Light)),
         checkbox(s.ftp_pasv)
             .label(tr("Use FTP in PASV mode"))
             .on_toggle(|b| o(OptField::FtpPasv(b)))
