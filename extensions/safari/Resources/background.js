@@ -352,6 +352,57 @@ async function cookieHeader(url) {
 
 // ----------------------------------------------------------------- capture
 
+// A signed URL good for longer than this is in no danger from a redirect or a
+// retry, so it is handed over as-is. Mirrors `expiring_soon` in the GUI.
+const EXPIRY_HORIZON = 3600;
+
+// The deadline a signed URL carries, in unix seconds, or null for none.
+// Mirrors `hya_net::signed`: SigV4 (S3 and every dialect of it) states an
+// issue time and a window, CloudFront and GCS sign a bare `Expires` epoch.
+function signedDeadline(url) {
+  let params;
+  try {
+    params = new URL(url).searchParams;
+  } catch {
+    return null;
+  }
+  const get = (name) => {
+    for (const [k, v] of params) if (k.toLowerCase() === name) return v;
+    return null;
+  };
+  const issued = get("x-amz-date");
+  const window = Number(get("x-amz-expires"));
+  if (issued && Number.isFinite(window)) {
+    const t = Date.parse(
+      issued.replace(
+        /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/,
+        "$1-$2-$3T$4:$5:$6Z",
+      ),
+    );
+    if (!Number.isNaN(t)) return Math.floor(t / 1000) + window;
+  }
+  const expires = Number(get("expires"));
+  // `Expires=0` is how a cache header spells "stale", not a 1970 deadline.
+  return Number.isFinite(expires) && expires > 1e9 ? expires : null;
+}
+
+// Which of a download's two URLs to hand Hydra.
+//
+// Normally the resolved one: it is where the bytes are, and reaching them
+// costs Hydra no redirect. But a resolved URL that is a SHORT-LIVED SIGNATURE
+// is the wrong thing to hand over — figshare's store signs for ten seconds —
+// because our copy of it is already dead by the first retry, and a paused
+// download can never be resumed from it. The original link does not have that
+// problem: replayed with the cookies we send beside it, it mints a fresh
+// signature on every attempt.
+function captureUrl(item) {
+  const resolved = item.finalUrl || item.url;
+  if (!item.url || item.url === resolved) return resolved;
+  const deadline = signedDeadline(resolved);
+  if (deadline === null) return resolved;
+  return deadline <= Date.now() / 1000 + EXPIRY_HORIZON ? item.url : resolved;
+}
+
 async function sendToHydra(url, extras = {}) {
   return request({
     type: "download",
@@ -363,7 +414,7 @@ async function sendToHydra(url, extras = {}) {
 }
 
 function captureEligible(item, state) {
-  const url = item.finalUrl || item.url;
+  const url = captureUrl(item);
   return (
     state.enabled &&
     state.guiCapture &&
@@ -393,19 +444,36 @@ async function parkDownload(item) {
 // swallowed next to a download that had already been cancelled.
 async function decideCapture(item, parked) {
   const state = await getState();
-  const url = item.finalUrl || item.url;
+  const url = captureUrl(item);
 
-  const giveBack = async () => {
+  // Declining used to be silent, and a download Hydra never sees is then
+  // indistinguishable from a broken install: the browser just downloads it,
+  // exactly as it would with no extension at all. Say which gate turned it
+  // away — chrome://extensions -> the service worker's console is where a
+  // report of "the extension does nothing" gets answered in one line.
+  const giveBack = async (why) => {
+    console.debug(`hydra: left to the browser (${why}) — ${url}`);
     if (!parked) return;
     try {
       await chrome.downloads.resume(item.id);
     } catch {}
   };
 
-  if (!captureEligible(item, state)) return giveBack();
-  if (siteSkipped(state.skipSites, url)) return giveBack();
-  if (await altBypassed()) return giveBack();
-  if (!typeMatches(state.autoTypes, item.filename, url, item.mime)) return giveBack();
+  if (!captureEligible(item, state)) {
+    return giveBack(
+      !state.enabled || !state.guiCapture
+        ? "capture is switched off"
+        : "not an http(s)/ftp download",
+    );
+  }
+  if (siteSkipped(state.skipSites, url)) return giveBack("site is on the skip list");
+  if (await altBypassed()) return giveBack("Alt was held down");
+  if (!typeMatches(state.autoTypes, item.filename, url, item.mime)) {
+    return giveBack(
+      `"${extOf(item.filename) || extOf(url) || "no extension"}" is not in the ` +
+        `capture list (Options > Downloaded file types)`,
+    );
+  }
 
   const size = item.totalBytes > 0 ? item.totalBytes : item.fileSize > 0 ? item.fileSize : null;
   const reply = await sendToHydra(url, {
@@ -426,7 +494,7 @@ async function decideCapture(item, parked) {
     } catch {}
   } else {
     // Hydra unreachable: the browser download continues untouched.
-    await giveBack();
+    await giveBack("Hydra did not take it");
   }
 }
 

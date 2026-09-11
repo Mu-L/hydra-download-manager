@@ -197,15 +197,22 @@ pub fn parse_http_date(s: &str) -> Option<u64> {
         hms[1].parse().ok()?,
         hms[2].parse().ok()?,
     );
-    // days since epoch, civil-from-days (Howard Hinnant's algorithm)
+    Some(days_from_civil(year, month, day) * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
+///
+/// Shared with [`crate::signed`], which parses the same instant out of SigV4's
+/// `YYYYMMDDTHHMMSSZ`. Two copies of leap-year arithmetic is one copy too many:
+/// the second would only be found wrong on a date nobody tests.
+pub(crate) fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = y / 400;
     let yoe = y - era * 400;
     let mp = (month + 9) % 12;
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + h * 3600 + mi * 60 + sec)
+    era * 146_097 + doe - 719_468
 }
 
 /// Exponential backoff with full jitter, capped.

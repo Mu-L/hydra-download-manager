@@ -1281,12 +1281,10 @@ async fn checksum_report(
         match crate::download::probe_public(conn.as_ref(), &parsed, args).await {
             // An error status describes the URL, not the object: a `400` with a
             // 24-byte JSON body is not a 24-byte file with no digest.
-            Ok((pr, final_url)) if pr.status >= 400 => {
-                eprintln!(
-                    "hydra: server answered {} for {}",
-                    hya_net::describe_status(pr.status),
-                    final_url.host
-                );
+            Ok((pr, final_url)) if pr.refusal().is_some() => {
+                if let Some(why) = pr.refusal() {
+                    eprintln!("hydra: {why} for {}", final_url.host);
+                }
                 all_ok = false;
             }
             Ok((pr, _final_url)) => {

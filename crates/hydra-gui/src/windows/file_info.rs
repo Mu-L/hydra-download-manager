@@ -15,8 +15,8 @@
 //!   CONTINUE the same bytes), category, path, description, login/password
 //!   and cookies.
 
-use crate::app::{App, El, Message};
-use crate::model::DlState;
+use crate::app::{App, El, FileInfoState, Message};
+use crate::model::{DlState, ProxyPick};
 use crate::windows::{dlg_btn, dlg_btn_primary};
 use crate::{fmt, i18n::tr, theme};
 use iced::widget::{button, checkbox, column, container, pick_list, row, svg, text, text_input};
@@ -73,6 +73,47 @@ fn small_btn<'a>(label: &'a str, msg: Message) -> El<'a> {
     .style(theme::btn)
     .on_press(msg)
     .into()
+}
+
+/// The proxy this one download takes: the app-wide setting, none, or its own
+/// address. The address box is offered only for the third, and keeps its text
+/// when the picker moves off it so switching back does not mean retyping.
+fn proxy_row(st: &FileInfoState) -> El<'_> {
+    let mut r = row![pick_list(
+        &ProxyPick::ALL[..],
+        Some(st.proxy_pick),
+        Message::FiProxyPick
+    )
+    .text_size(theme::FONT_SIZE)
+    .style(theme::picker)
+    .width(170.0)]
+    .spacing(GAP)
+    .align_y(iced::Alignment::Center);
+    if st.proxy_pick == ProxyPick::Custom {
+        r = r.push(
+            text_input("socks5://127.0.0.1:10808", &st.proxy_spec)
+                .on_input(Message::FiProxySpec)
+                .size(theme::FONT_SIZE)
+                .style(theme::input)
+                .width(Length::Fill),
+        );
+    }
+    r.into()
+}
+
+/// Why the typed address is not a proxy, while it is being typed. Saying it
+/// here is the difference between a corrected typo and a download that fails
+/// minutes later with the same sentence.
+///
+/// `pub(crate)` because the window is sized to the rows it draws and this one
+/// is conditional: see `App::window_size`.
+pub(crate) fn proxy_problem(st: &FileInfoState) -> Option<String> {
+    if st.proxy_pick == ProxyPick::Custom && st.proxy_spec.trim().is_empty() {
+        return st
+            .proxy_needs_address
+            .then(|| tr("Enter the proxy address, for example socks5://127.0.0.1:10808"));
+    }
+    crate::proxy::typed_spec_error(st.proxy_pick, &st.proxy_spec)
 }
 
 pub fn view(app: &App) -> El<'_> {
@@ -244,6 +285,15 @@ pub fn view(app: &App) -> El<'_> {
                 .into(),
         ));
     }
+    form = form.push(labeled(tr("Proxy"), proxy_row(st)));
+    if let Some(why) = proxy_problem(st) {
+        form = form.push(indented(
+            text(why)
+                .size(theme::FONT_SIZE - 1.0)
+                .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B))
+                .into(),
+        ));
+    }
 
     // Side column: file-type icon with the size under it and the Preview
     // button beneath, centred on the fields it belongs to rather than
@@ -315,7 +365,7 @@ pub fn view(app: &App) -> El<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::punctuated;
+    use super::*;
 
     #[test]
     fn every_label_ends_in_exactly_one_colon() {
@@ -325,5 +375,62 @@ mod tests {
         assert_eq!(punctuated("Category"), "Category:");
         assert_eq!(punctuated("Address:"), "Address:");
         assert_eq!(punctuated("Last try date :"), "Last try date:");
+    }
+
+    /// Both shapes of the proxy row build — the picker alone, and the picker
+    /// with the address box — and a widget tree that does not survive being
+    /// built takes the whole dialog down with it.
+    #[test]
+    fn both_shapes_of_the_proxy_row_lay_out() {
+        let plain = FileInfoState::default();
+        let _default: El<'_> = proxy_row(&plain);
+        let own = FileInfoState {
+            proxy_pick: ProxyPick::Custom,
+            proxy_spec: "socks5://127.0.0.1:10808".into(),
+            ..FileInfoState::default()
+        };
+        let _custom: El<'_> = proxy_row(&own);
+    }
+
+    /// An unusable address is reported only while one is being asked for:
+    /// text left in the box under "Default" is not an error to shout about.
+    #[test]
+    fn a_bad_address_is_reported_only_while_it_is_being_asked_for() {
+        let bad = FileInfoState {
+            proxy_pick: ProxyPick::Custom,
+            proxy_spec: "gopher://p".into(),
+            ..FileInfoState::default()
+        };
+        assert!(proxy_problem(&bad).is_some());
+        assert_eq!(
+            proxy_problem(&FileInfoState {
+                proxy_pick: ProxyPick::Default,
+                ..bad.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            proxy_problem(&FileInfoState {
+                proxy_spec: "socks5://127.0.0.1:10808".into(),
+                ..bad.clone()
+            }),
+            None
+        );
+        // An address not yet typed is not a mistake to point at — until OK
+        // or Start Download is pressed with the box still empty.
+        let blank = FileInfoState {
+            proxy_spec: String::new(),
+            ..bad
+        };
+        assert_eq!(proxy_problem(&blank), None);
+        let asked = FileInfoState {
+            proxy_needs_address: true,
+            ..blank
+        };
+        let why = proxy_problem(&asked).expect("a refused commit says what is missing");
+        assert!(
+            why.contains("socks5://"),
+            "the message has to show what an address looks like: {why}"
+        );
     }
 }
