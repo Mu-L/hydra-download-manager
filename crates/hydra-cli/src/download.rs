@@ -1148,13 +1148,10 @@ where
         // requests failed a second later with an internal message. The FFI driver
         // and the stream inspector already check here; this is the one path that
         // did not.
-        if pr.status >= 400 {
-            // No host in the message: both callers name it themselves, and a
-            // message that repeats it prints the host twice on one line.
-            return Err(format!(
-                "server answered {}",
-                hya_net::describe_status(pr.status)
-            ));
+        // No host in the message: both callers name it themselves, and a
+        // message that repeats it prints the host twice on one line.
+        if let Some(why) = pr.refusal() {
+            return Err(why);
         }
         return Ok(Resolved {
             probe: pr,
@@ -1434,7 +1431,25 @@ async fn probe_all(
                 let (pr, resolved) = (r.probe, r.target);
                 // A redirect may have moved the object to a different host; the
                 // transfer must use the resolved target, not the one we started from.
-                resolved_targets.push((i, resolved));
+                //
+                // Unless the resolved URL is a CREDENTIAL rather than an address.
+                // An object store signs one for seconds — `data.dtu.dk` allows ten
+                // — so holding it for the life of a transfer means every range
+                // asked for after that is refused. There the durable address is
+                // the one we started from, and each request re-derives its own
+                // credential by following the redirect again.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // `pairs[i].1` is that address already built — proxy route,
+                // headers and agent included — so the durable target costs a
+                // clone rather than a second construction that could drift.
+                let target = match hya_net::signed::perishable(&r.url.to_string(), now) {
+                    true => pairs.get(i).map(|(_, t)| t.clone()).unwrap_or(resolved),
+                    false => resolved,
+                };
+                resolved_targets.push((i, target));
                 if i == 0 && r.via_html {
                     // Content-Disposition first: a redirector's destination is
                     // as entitled to name its own file as any other object.

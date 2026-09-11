@@ -17,6 +17,7 @@
 //! received spans are re-`mark_done`d on resume — including across app restarts.
 
 use crate::model::{ConnRow, DlId};
+use crate::proxy::Route;
 use hya_core::{Capability, Scheduler, Source};
 use hya_net::polite::RateLimiter;
 use hya_net::{probe_resilient, Probe, SparseSink, Target, TlsCapableConnector};
@@ -78,6 +79,8 @@ pub struct StartSpec {
     pub attested_digest: Option<String>,
     /// The document's `<pieces>` chunk manifest, in its on-disk JSON form.
     pub pieces: Option<String>,
+    /// Which proxy this transfer takes: the app default, none, or its own.
+    pub proxy: crate::model::ProxyChoice,
 }
 
 impl StartSpec {
@@ -113,6 +116,7 @@ impl StartSpec {
             attested_size: None,
             attested_digest: None,
             pieces: None,
+            proxy: crate::model::ProxyChoice::default(),
         }
     }
 }
@@ -159,6 +163,8 @@ pub struct StreamSpec {
     /// the transfer starts has to apply from the first segment, not only
     /// once someone opens the Speed Limiter tab and triggers `SetLimit`.
     pub limit: Option<u64>,
+    /// Which proxy every manifest and segment request takes.
+    pub proxy: crate::model::ProxyChoice,
 }
 
 /// What a manifest offers, read before anything is downloaded.
@@ -473,20 +479,51 @@ fn spawn_engine() -> UnboundedSender<Cmd> {
     cmd_tx
 }
 
-/// The one connector for the whole process. Its connection pool, TLS
-/// session cache (`Resumption::in_memory_sessions`) and parsed root store
-/// are designed to outlive a single transfer — `tls.rs` documents 1.6–2.0 s
-/// of setup reused when the probe's handshake feeds the transfer. Building
-/// a connector per transfer (as this file used to) discarded all three.
-fn shared_connector() -> Result<Arc<TlsCapableConnector>, String> {
-    static CONNECTOR: OnceLock<Result<Arc<TlsCapableConnector>, String>> = OnceLock::new();
-    CONNECTOR
-        .get_or_init(|| {
-            TlsCapableConnector::new()
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
-        })
-        .clone()
+/// A connector that dials `proxy`, or the one it was given when there is none.
+fn with_socks(c: TlsCapableConnector, proxy: Option<hya_net::Proxy>) -> TlsCapableConnector {
+    match proxy {
+        Some(px) => {
+            crate::log::info(&format!(
+                "routing through {} proxy {}:{}",
+                px.kind.as_str(),
+                px.host,
+                px.port
+            ));
+            c.with_socks(px)
+        }
+        None => c,
+    }
+}
+
+/// The connector for one route — one per proxy the app has been asked to use,
+/// shared by every transfer taking that route.
+///
+/// Its connection pool, TLS session cache (`Resumption::in_memory_sessions`)
+/// and parsed root store are designed to outlive a single transfer — `tls.rs`
+/// documents 1.6–2.0 s of setup reused when the probe's handshake feeds the
+/// transfer. Building a connector per transfer (as this file used to)
+/// discarded all three.
+///
+/// A SOCKS proxy is a property of the CONNECTION, not of the request, so it
+/// cannot ride on a target the way an HTTP proxy does: it has to be built into
+/// the connector. The cache is keyed by the proxy the connector was built
+/// with, which is what that connector permanently IS — so a changed setting
+/// (or a download with a proxy of its own) adds an entry rather than
+/// invalidating one, and coming back to a proxy used earlier in the session
+/// finds its pool still warm.
+fn connector_for(want: Option<hya_net::Proxy>) -> Result<Arc<TlsCapableConnector>, String> {
+    static CONNECTORS: Mutex<Vec<(Option<hya_net::Proxy>, Arc<TlsCapableConnector>)>> =
+        Mutex::new(Vec::new());
+    // Poisoning carries no broken invariant here: the vector is a cache, and a
+    // panic in a caller holding it cannot have left it half-written.
+    let mut cache = CONNECTORS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, c)) = cache.iter().find(|(px, _)| *px == want) {
+        return Ok(c.clone());
+    }
+    let built = TlsCapableConnector::new().map_err(|e| e.to_string())?;
+    let c = Arc::new(with_socks(built, want.clone()));
+    cache.push((want, c.clone()));
+    Ok(c)
 }
 
 /// What a link turns out to be, once its redirects have been resolved.
@@ -523,9 +560,15 @@ pub async fn probe_link(url: String, user_agent: String, headers: Vec<String>) -
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(6)))
         .clone();
     let _permit = gate.acquire_owned().await.ok()?;
-    let connector = shared_connector().ok()?;
-    let (url, p) = resolve_link(connector.as_ref(), url, &user_agent, &headers).await?;
-    if p.status >= 300 {
+    // A pasted link has no item yet: the app-wide route is the only one there
+    // is to take.
+    let route = crate::proxy::active();
+    let connector = connector_for(route.socks()).ok()?;
+    let (url, p) = resolve_link(connector.as_ref(), url, &user_agent, &headers, &route).await?;
+    // Nothing to describe: a redirect that could not be followed, an error, or
+    // a 2xx that is an answer rather than a file. Reporting a size of zero for
+    // any of them fills the dialog in as though the object were empty.
+    if p.status >= 300 || p.refusal().is_some() {
         return None;
     }
     Some(LinkMeta {
@@ -546,10 +589,11 @@ async fn resolve_link(
     mut url: String,
     user_agent: &str,
     headers: &[String],
+    route: &Route,
 ) -> Option<(String, Probe)> {
     for _ in 0..10 {
         let u = parse_url(&url).ok()?;
-        let t = target_of(&u, headers.to_vec(), user_agent);
+        let t = target_via(route.http(), &u, headers.to_vec(), user_agent);
         let p = probe_resilient(connector, &t).await.ok()?;
         if p.is_redirect() {
             url = join_url(&u, p.location.as_deref().unwrap_or(""))?;
@@ -569,12 +613,32 @@ async fn resolve_link(
     None
 }
 
-/// A direct target for `u` carrying the request headers and user agent.
-fn target_of(u: &ParsedUrl, headers: Vec<String>, user_agent: &str) -> Target {
-    let base = if u.tls {
-        Target::direct_tls(&u.host, u.port, &u.path)
-    } else {
-        Target::direct(&u.host, u.port, &u.path)
+/// A target for `u` carrying the request headers and user agent, addressed
+/// the way `route` says.
+///
+/// Only an HTTP proxy is visible here, because only an HTTP proxy is part of
+/// the REQUEST: it reads the request line, so the origin travels in absolute
+/// form (and, for TLS, behind a `CONNECT` tunnel the transport opens). A SOCKS
+/// proxy leaves the target direct and is dialled by the connector instead —
+/// see [`connector_for`].
+fn target_via(
+    http_proxy: Option<(&str, u16)>,
+    u: &ParsedUrl,
+    headers: Vec<String>,
+    user_agent: &str,
+) -> Target {
+    let base = match http_proxy {
+        // The proxy authority always spells the port out: a `Host` header
+        // omits the default one, but a `CONNECT` request line without a port
+        // is refused.
+        Some((host, port)) => {
+            let origin = format!("{}:{}", u.host, u.port);
+            let mut t = Target::via_proxy(host, port, &origin, &u.path);
+            t.tls = u.tls;
+            t
+        }
+        None if u.tls => Target::direct_tls(&u.host, u.port, &u.path),
+        None => Target::direct(&u.host, u.port, &u.path),
     };
     base.with_headers(headers, Some(user_agent.to_string()))
 }
@@ -601,20 +665,28 @@ pub async fn peek_zip(
     user_agent: String,
     headers: Vec<String>,
     known_size: Option<u64>,
+    proxy: crate::model::ProxyChoice,
 ) -> Result<Vec<hya_net::zipdir::Entry>, String> {
     use crate::i18n::tr;
     use hya_net::zipdir;
 
-    let connector = shared_connector()?;
+    // The download's own route: a peek is a request for the same object the
+    // transfer will make, and it must not be the one request that leaves by
+    // a different door.
+    let route = crate::proxy::for_choice(&proxy)?;
+    let connector = connector_for(route.socks())?;
     let c = connector.as_ref();
     let (mut url, total) = match known_size {
         Some(n) if n > 0 => (url, n),
         _ => {
-            let (url, p) = resolve_link(c, url, &user_agent, &headers)
+            let (url, p) = resolve_link(c, url, &user_agent, &headers, &route)
                 .await
                 .ok_or_else(|| tr("The server did not answer."))?;
             if p.status >= 300 {
                 return Err(hya_net::describe_status(p.status));
+            }
+            if let Some(why) = p.refusal() {
+                return Err(why);
             }
             if p.size == 0 {
                 return Err(tr("The server did not state the file's size."));
@@ -627,7 +699,7 @@ pub async fn peek_zip(
     // is the ranged GET, so a redirect surfaces there: follow it and retry.
     for _ in 0..10 {
         let u = parse_url(&url)?;
-        let t = target_of(&u, headers.clone(), &user_agent);
+        let t = target_via(route.http(), &u, headers.clone(), &user_agent);
         return match zipdir::fetch_listing(c, &t, total).await {
             Ok(entries) => Ok(entries),
             Err(zipdir::PeekError::Net(e)) => match hya_net::Redirect::of(&e) {
@@ -725,8 +797,10 @@ pub fn metalink_address(addr: &str) -> bool {
 /// the Windows spellings a POSIX-only check misses), and an entry with no mirror
 /// this build has a transport for.
 pub async fn probe_metalink(source: String, user_agent: String) -> Result<MetalinkProbe, String> {
+    // No item exists yet, so there is no per-download choice to honour: the
+    // document is fetched the way the app is configured to reach anything.
     let doc = if source.contains("://") {
-        fetch_metalink(&source, &user_agent).await?
+        fetch_metalink(&source, &user_agent, &crate::proxy::active()).await?
     } else {
         let text = std::fs::read_to_string(&source)
             .map_err(|e| format!("{}: {e}", crate::i18n::tr("Cannot read the mirror list")))?;
@@ -913,17 +987,16 @@ fn adopt_metalink(
 /// anything about it is known, and an unbounded read of a body chosen by
 /// whoever answers is a memory-exhaustion primitive no care in the parser can
 /// undo.
-async fn fetch_metalink(url: &str, user_agent: &str) -> Result<hya_net::Metalink, String> {
-    let connector = shared_connector()?;
+async fn fetch_metalink(
+    url: &str,
+    user_agent: &str,
+    route: &Route,
+) -> Result<hya_net::Metalink, String> {
+    let connector = connector_for(route.socks())?;
     let mut url = url.to_string();
     for _ in 0..10 {
         let u = parse_url(&url)?;
-        let base = if u.tls {
-            Target::direct_tls(&u.host, u.port, &u.path)
-        } else {
-            Target::direct(&u.host, u.port, &u.path)
-        };
-        let t = base.with_headers(vec![], Some(user_agent.to_string()));
+        let t = target_via(route.http(), &u, vec![], user_agent);
         if let Ok(p) = probe_resilient(connector.as_ref(), &t).await {
             if p.is_redirect() {
                 match join_url(&u, p.location.as_deref().unwrap_or("")) {
@@ -1099,13 +1172,13 @@ pub fn request_headers(
     headers
 }
 
-fn target_for(u: &ParsedUrl, spec: &StartSpec) -> Target {
+fn target_for(u: &ParsedUrl, spec: &StartSpec, route: &Route) -> Target {
     let headers = request_headers(
         spec.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
         spec.cookies.as_deref(),
         spec.referer.as_deref(),
     );
-    target_of(u, headers, &spec.user_agent)
+    target_via(route.http(), u, headers, &spec.user_agent)
 }
 
 /// Probe the mirror list and decide who fetches, who waits, and with how many
@@ -1139,6 +1212,7 @@ async fn plan_sources(
     delta: f64,
     budget: usize,
     connector: &Arc<TlsCapableConnector>,
+    route: &Route,
     id: DlId,
 ) -> (Vec<Target>, Vec<usize>, hya_net::Bench, Vec<Source>) {
     let caps_for = |pr: &Probe| {
@@ -1225,10 +1299,11 @@ async fn plan_sources(
         let spec = spec.clone();
         let gate = gate.clone();
         let primary_validator = primary_validator.clone();
+        let route = route.clone();
         set.spawn(async move {
             let _permit = gate.acquire_owned().await.ok()?;
             let u = parse_url(&m.url).ok()?;
-            let t = target_for(&u, &spec);
+            let t = target_for(&u, &spec, &route);
             let hop = std::time::Instant::now();
             let pr = probe_resilient(conn.as_ref(), &t).await.ok()?;
             if pr.is_redirect() || pr.status >= 300 || !pr.ranges {
@@ -1623,16 +1698,34 @@ async fn run_download(
         let _ = tx.send(e);
     };
 
+    // Resolved once, here: every probe, mirror and connection this transfer
+    // opens has to take the SAME route, and a route resolved per connection
+    // could change under a running download when Options is edited.
+    let route = match crate::proxy::for_choice(&spec.proxy) {
+        Ok(r) => r,
+        Err(e) => {
+            ev(Event::Failed {
+                id,
+                error: e,
+                done: 0,
+                held: spec.held.clone(),
+                permission_denied: false,
+            });
+            return;
+        }
+    };
+    crate::log::debug(&format!("#{id} route: {}", route.describe()));
+
     // HYDRA_AB_FRESH=1: measurement escape hatch — build a throwaway
     // connector per transfer (the pre-pooling behaviour) to bisect
     // throughput differences. Not for production use.
     let fresh = std::env::var_os("HYDRA_AB_FRESH").is_some();
     let connector = match if fresh {
         TlsCapableConnector::new()
-            .map(Arc::new)
+            .map(|c| Arc::new(with_socks(c, route.socks())))
             .map_err(|e| e.to_string())
     } else {
-        shared_connector()
+        connector_for(route.socks())
     } {
         Ok(c) => c,
         Err(e) => {
@@ -1654,7 +1747,7 @@ async fn run_download(
     // object streams sequentially from one source.
     if let Ok(u) = parse_url(&spec.url) {
         if u.ftp {
-            run_ftp_download(&spec, &u, &cancel, &limiter, &tx).await;
+            run_ftp_download(&spec, &u, &cancel, &limiter, &connector, &route, &tx).await;
             return;
         }
     }
@@ -1712,7 +1805,7 @@ async fn run_download(
                 return;
             }
         };
-        let t = target_for(&u, &spec);
+        let t = target_for(&u, &spec, &route);
         let t_hop = std::time::Instant::now();
         match probe_resilient(connector.as_ref(), &t).await {
             Ok(p) if p.is_redirect() => {
@@ -1852,7 +1945,7 @@ async fn run_download(
     // list, then costs one wasted fetch rather than an unbounded chain.
     if spec.mirrors.is_empty() && p.serves_metalink() {
         crate::log::info(&format!("#{id} {} serves a Metalink document", u.host));
-        match fetch_metalink(&url, &spec.user_agent).await {
+        match fetch_metalink(&url, &spec.user_agent, &route).await {
             Ok(doc) => match adopt_metalink(&doc, &mut spec, id) {
                 Ok((name, size)) => {
                     // The destination the finisher renames to is held behind a
@@ -1906,6 +1999,24 @@ async fn run_download(
         }
     }
 
+    // An answer is not a file. `status < 300` lets through the whole of 2xx,
+    // and most of 2xx carries no object: AWS WAF turns a non-browser away with
+    // `202` and `Content-Length: 0`, which reaches here as "an object of
+    // unknown size", takes the single-stream path, reads nothing, and reports
+    // Complete — 0 B. The row said the download had finished and the file on
+    // disk was empty, which is the one failure a user cannot see.
+    if let Some(why) = p.refusal() {
+        crate::log::warn(&format!("#{id} {why} for {}", u.host));
+        ev(Event::Failed {
+            id,
+            error: why,
+            done: 0,
+            held: spec.held.clone(),
+            permission_denied: false,
+        });
+        return;
+    }
+
     let file_name = p.suggested_filename().or_else(|| {
         let n = file_name_from_url(&url);
         (!n.is_empty()).then_some(n)
@@ -1918,7 +2029,32 @@ async fn run_download(
         file_name,
     });
 
-    let target = target_for(&u, &spec);
+    // A signed URL is a CREDENTIAL, not an address. `data.dtu.dk` mints one
+    // good for ten seconds, so the URL this probe resolved to is dead long
+    // before a 22 GB transfer has finished asking for ranges — every request
+    // after the first few came back 403 and the download stopped.
+    //
+    // So fetch from the address the user gave and let each request re-resolve:
+    // `fetch_range_following` follows the hop per request, which is what keeps
+    // every one of them authorised. The probe's findings describe the OBJECT
+    // and stand either way, and the file name still comes from the resolved
+    // URL, which is the half that carries it.
+    let u = match crate::app::expiring_soon(&url) {
+        true if url != spec.url => match parse_url(&spec.url) {
+            Ok(orig) => {
+                crate::log::info(&format!(
+                    "#{id} signed link expires almost at once; \
+                     fetching from {} so each request is re-signed",
+                    crate::log::redact(&spec.url)
+                ));
+                orig
+            }
+            Err(_) => u,
+        },
+        _ => u,
+    };
+
+    let target = target_for(&u, &spec, &route);
     let temp = spec.temp_path.clone();
     if let Some(dir) = std::path::Path::new(&temp).parent() {
         ensure_writable_dir(dir);
@@ -2026,8 +2162,10 @@ async fn run_download(
     // A mirror list turns this into a multi-source transfer. Everything below
     // degenerates to exactly the previous single-source behaviour when
     // `spec.mirrors` is empty, which is what every non-Metalink caller passes.
-    let (targets, per, bench, sources) =
-        plan_sources(&spec, &u, &target, &p, size, delta, n, &connector, id).await;
+    let (targets, per, bench, sources) = plan_sources(
+        &spec, &u, &target, &p, size, delta, n, &connector, &route, id,
+    )
+    .await;
     let mut sched =
         Scheduler::new(size, sources, &per).with_stall_timeout((12.0 * delta).clamp(4.0, 45.0));
     // Adaptive: open the budget but start ONE connection active; the ramp
@@ -2295,11 +2433,29 @@ async fn run_download(
 /// Single-connection FTP transfer: probe SIZE, resume via REST from the
 /// contiguous prefix already on disk, drive progress off the sink's byte
 /// counter (there is no scheduler to observe).
+/// Why an `ftp://` transfer cannot start under the configured proxy, or
+/// `None` when it can.
+///
+/// An HTTP proxy reaches an origin by reading its requests, and FTP's control
+/// channel is not HTTP. Refusing says so; connecting anyway would send the
+/// transfer out through the very address the proxy was configured to keep it
+/// off, which is worse than not downloading the file. A SOCKS proxy has no
+/// such problem — it forwards the stream, control and data alike.
+fn ftp_proxy_refusal(http_proxy: Option<(&str, u16)>) -> Option<String> {
+    http_proxy?;
+    Some(crate::i18n::tr(
+        "An FTP download cannot go through an HTTP proxy. Configure a SOCKS proxy in \
+         Options > Proxy/Socks, or turn the proxy off.",
+    ))
+}
+
 async fn run_ftp_download(
     spec: &StartSpec,
     u: &ParsedUrl,
     cancel: &Arc<AtomicBool>,
     limiter: &Arc<RateLimiter>,
+    connector: &Arc<TlsCapableConnector>,
+    route: &Route,
     tx: &UnboundedSender<Event>,
 ) {
     use hya_net::scheme::Fetcher;
@@ -2307,6 +2463,19 @@ async fn run_ftp_download(
     let ev = |e: Event| {
         let _ = tx.send(e);
     };
+    if let Some(why) = ftp_proxy_refusal(route.http()) {
+        crate::log::warn(&format!(
+            "#{id} ftp refused: the configured proxy speaks HTTP"
+        ));
+        ev(Event::Failed {
+            id,
+            error: why,
+            done: 0,
+            held: spec.held.clone(),
+            permission_denied: false,
+        });
+        return;
+    }
     ev(Event::Status {
         id,
         line: crate::i18n::tr("Connecting..."),
@@ -2316,9 +2485,12 @@ async fn run_ftp_download(
         spec.auth.as_ref().map(|(l, _)| l.as_str()),
         spec.auth.as_ref().map(|(_, p)| p.as_str()),
     );
-    // The same limiter the HTTP path answers to, so Speed Limiter means the
-    // same thing on an ftp:// download — including switched on mid-transfer.
-    let fetcher = hya_net::ftp::FtpFetcher::new(Arc::new(hya_net::TcpConnector))
+    // The shared connector rather than a bare TCP one: it carries the SOCKS
+    // proxy, and both the control channel and every PASV data connection have
+    // to take it. The same limiter the HTTP path answers to, so Speed Limiter
+    // means the same thing on an ftp:// download — including switched on
+    // mid-transfer.
+    let fetcher = hya_net::ftp::FtpFetcher::new(connector.clone())
         .with_pace(hya_net::polite::Pace::shared(limiter.clone()));
 
     let probe = match fetcher.probe(&ep).await {
@@ -2924,6 +3096,79 @@ mod tests {
         );
     }
 
+    /// A forward proxy is a property of the REQUEST: the socket goes to the
+    /// proxy, the request line carries the origin in absolute form, and the
+    /// certificate still has to belong to the origin.
+    #[test]
+    fn an_http_proxy_moves_the_socket_without_moving_the_certificate() {
+        let u = parse_url("https://example.org/a/b.zip").unwrap();
+        let t = target_via(Some(("127.0.0.1", 10809)), &u, vec![], "hydra-test");
+        assert_eq!((t.host.as_str(), t.port), ("127.0.0.1", 10809));
+        assert!(t.tls, "an https object stays TLS through a proxy");
+        assert_eq!(
+            t.proxy_authority(),
+            "example.org:443",
+            "CONNECT must name the origin, with its port spelled out"
+        );
+        assert_eq!(t.tls_server_name(), "example.org");
+    }
+
+    /// The other half of the same rule: a SOCKS route leaves the request
+    /// alone, because the proxy never reads it. A target rewritten for SOCKS
+    /// would send an absolute-form GET to a SOCKS port.
+    #[test]
+    fn a_socks_route_leaves_the_target_direct() {
+        let u = parse_url("https://example.org/a/b.zip").unwrap();
+        let t = target_via(None, &u, vec![], "hydra-test");
+        assert_eq!((t.host.as_str(), t.port), ("example.org", 443));
+        assert_eq!(t.origin, None);
+    }
+
+    /// Plaintext through a proxy is absolute-form, and the non-default port
+    /// travels with it.
+    #[test]
+    fn a_proxied_plaintext_request_carries_the_origin_port() {
+        let u = parse_url("http://example.org:8080/f").unwrap();
+        let t = target_via(Some(("proxy.local", 3128)), &u, vec![], "hydra-test");
+        assert!(!t.tls);
+        assert_eq!(t.proxy_authority(), "example.org:8080");
+    }
+
+    /// FTP over a proxy it cannot speak to must fail loudly. The message has
+    /// to name the way out, because the user's next move is a settings change
+    /// and nothing else can tell them which one.
+    #[test]
+    fn ftp_through_an_http_proxy_is_refused_with_the_remedy() {
+        assert_eq!(ftp_proxy_refusal(None), None);
+        let why = ftp_proxy_refusal(Some(("127.0.0.1", 10809))).expect("a refusal");
+        assert!(why.contains("SOCKS"), "the way out is unnamed: {why}");
+    }
+
+    /// The connection pool and TLS session cache only pay for themselves by
+    /// outliving a transfer, so the same route must hand back the same
+    /// connector — and a different proxy must never hand back one dialling
+    /// somewhere else.
+    #[test]
+    fn a_connector_is_cached_per_proxy_and_never_shared_across_them() {
+        let socks = hya_net::Proxy::parse("socks5://127.0.0.1:10808").unwrap();
+        let other = hya_net::Proxy::parse("socks5://127.0.0.1:9050").unwrap();
+        let direct = connector_for(None).expect("connector");
+        assert!(Arc::ptr_eq(
+            &direct,
+            &connector_for(None).expect("connector")
+        ));
+        let a = connector_for(Some(socks.clone())).expect("connector");
+        assert!(!Arc::ptr_eq(&direct, &a));
+        assert!(Arc::ptr_eq(
+            &a,
+            &connector_for(Some(socks)).expect("connector")
+        ));
+        assert!(!Arc::ptr_eq(
+            &a,
+            &connector_for(Some(other)).expect("connector")
+        ));
+    }
+
     /// The stamp must survive an ETag. A server sending BOTH headers — GitHub,
     /// S3, most CDNs — is the common case, and reading the collapsed
     /// `validator` field would discard the date for every one of them, which is
@@ -3335,13 +3580,9 @@ fn stream_target(
     cookies: Option<&str>,
     referer: Option<&str>,
     agent: &str,
+    route: &Route,
 ) -> Result<Target, String> {
     let u = parse_url(&seg.url)?;
-    let base = if u.tls {
-        Target::direct_tls(&u.host, u.port, &u.path)
-    } else {
-        Target::direct(&u.host, u.port, &u.path)
-    };
     let mut headers = Vec::new();
     if let Some(c) = cookies.filter(|c| !c.is_empty()) {
         headers.push(format!("Cookie: {c}"));
@@ -3354,7 +3595,7 @@ fn stream_target(
     if let Some(range) = seg.range_header() {
         headers.push(format!("Range: {range}"));
     }
-    Ok(base.with_headers(headers, Some(agent.to_string())))
+    Ok(target_via(route.http(), &u, headers, agent))
 }
 
 /// Fetch one bounded body with the stream's session headers.
@@ -3382,18 +3623,26 @@ const MAX_REDIRECTS: usize = 5;
 /// from — every relative URI inside resolves against THAT, so parsing
 /// against the address originally asked for would aim every segment at the
 /// wrong host.
+#[allow(clippy::too_many_arguments)]
 async fn stream_get_at(
     connector: &Arc<TlsCapableConnector>,
     url: &str,
     cookies: Option<&str>,
     referer: Option<&str>,
     agent: &str,
+    route: &Route,
     cap: usize,
 ) -> std::io::Result<(Vec<u8>, String)> {
     let mut at = url.to_string();
     for _ in 0..MAX_REDIRECTS {
-        let t = stream_target(&hya_stream::Segment::new(&at), cookies, referer, agent)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let t = stream_target(
+            &hya_stream::Segment::new(&at),
+            cookies,
+            referer,
+            agent,
+            route,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         match hya_net::fetch_small(connector.as_ref(), &t, cap).await {
             Ok(body) => return Ok((body, at)),
             Err(e) => {
@@ -3412,15 +3661,17 @@ async fn stream_get_at(
     Err(std::io::Error::other("too many redirects"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_get(
     connector: &Arc<TlsCapableConnector>,
     url: &str,
     cookies: Option<&str>,
     referer: Option<&str>,
     agent: &str,
+    route: &Route,
     cap: usize,
 ) -> std::io::Result<Vec<u8>> {
-    stream_get_at(connector, url, cookies, referer, agent, cap)
+    stream_get_at(connector, url, cookies, referer, agent, route, cap)
         .await
         .map(|(body, _)| body)
 }
@@ -3606,29 +3857,32 @@ fn segment_fetcher(
     connector: &Arc<TlsCapableConnector>,
     limiter: &Arc<RateLimiter>,
     cancel: &Arc<AtomicBool>,
+    route: &Route,
 ) -> impl hya_stream::Fetcher {
-    let (connector, ck, rf, ua, limiter, cancel) = (
+    let (connector, ck, rf, ua, limiter, cancel, route) = (
         connector.clone(),
         spec.cookies.clone(),
         spec.referer.clone(),
         spec.user_agent.clone(),
         limiter.clone(),
         cancel.clone(),
+        route.clone(),
     );
     move |seg: hya_stream::Segment, dest: String, counter: Arc<AtomicU64>| -> hya_stream::FetchSeg {
-        let (connector, ck, rf, ua, limiter, cancel) = (
+        let (connector, ck, rf, ua, limiter, cancel, route) = (
             connector.clone(),
             ck.clone(),
             rf.clone(),
             ua.clone(),
             limiter.clone(),
             cancel.clone(),
+            route.clone(),
         );
         Box::pin(async move {
             // A CDN may bounce a segment to a regional edge; follow it.
             let mut seg = seg;
             for hop in 0..=MAX_REDIRECTS {
-                let t = stream_target(&seg, ck.as_deref(), rf.as_deref(), &ua)
+                let t = stream_target(&seg, ck.as_deref(), rf.as_deref(), &ua, &route)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 // Streamed to a staging file rather than buffered: memory stays
                 // flat whatever the segment size, and `counter` can be read while
@@ -3707,6 +3961,7 @@ async fn live_windows(
     source: &LiveSource,
     connector: &Arc<TlsCapableConnector>,
     spec: &StreamSpec,
+    route: &Route,
 ) -> Result<(Vec<Window>, bool, std::time::Duration), String> {
     let (ck, rf, ua) = (
         spec.cookies.as_deref(),
@@ -3716,7 +3971,7 @@ async fn live_windows(
     let cap = hya_stream::hls::playlist_cap();
     match source {
         LiveSource::Hls { url } => {
-            let body = stream_get(connector, url, ck, rf, ua, cap)
+            let body = stream_get(connector, url, ck, rf, ua, route, cap)
                 .await
                 .map_err(|e| format!("could not re-read the playlist: {e}"))?;
             let pl = hya_stream::hls::parse(&String::from_utf8_lossy(&body), url);
@@ -3742,7 +3997,7 @@ async fn live_windows(
             video_id,
             audio_id,
         } => {
-            let body = stream_get(connector, url, ck, rf, ua, cap)
+            let body = stream_get(connector, url, ck, rf, ua, route, cap)
                 .await
                 .map_err(|e| format!("could not re-read the manifest: {e}"))?;
             let mf = hya_stream::dash::parse(&String::from_utf8_lossy(&body), url);
@@ -3796,6 +4051,7 @@ async fn record_live(
     limiter: &Arc<RateLimiter>,
     cancel: &Arc<AtomicBool>,
     final_path: &Arc<Mutex<String>>,
+    route: &Route,
     tx: &UnboundedSender<Event>,
 ) {
     let id = spec.id;
@@ -3838,7 +4094,7 @@ async fn record_live(
     // from an atomic rather than behind a lock.
     let media_ms = Arc::new(AtomicU64::new(0));
     let ticker = spawn_ticker(id, &meter, tx, cancel, None, 0, Some(media_ms.clone()));
-    let fetch = segment_fetcher(spec, connector, limiter, cancel);
+    let fetch = segment_fetcher(spec, connector, limiter, cancel, route);
     let t0 = std::time::Instant::now();
 
     // Seconds of media PLANNED per track. Kept per track because video and
@@ -3890,7 +4146,7 @@ async fn record_live(
     'recording: loop {
         let refreshed = match primed.take() {
             Some(w) => Ok(w),
-            None => live_windows(&source, connector, spec).await,
+            None => live_windows(&source, connector, spec, route).await,
         };
         let (windows, ended, refresh) = match refreshed {
             Ok(w) => w,
@@ -4340,7 +4596,14 @@ async fn run_stream(
         });
     };
 
-    let connector = match shared_connector() {
+    // One route for the whole recording, resolved before the first request:
+    // the manifest, every variant playlist and every segment must leave by
+    // the same door.
+    let route = match crate::proxy::for_choice(&spec.proxy) {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let connector = match connector_for(route.socks()) {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
@@ -4359,10 +4622,11 @@ async fn run_stream(
     let cap = hya_stream::hls::playlist_cap();
     // `base` is where the manifest ACTUALLY came from after redirects; every
     // relative URI inside resolves against it.
-    let (body, base) = match stream_get_at(&connector, &spec.manifest, ck, rf, ua, cap).await {
-        Ok(b) => b,
-        Err(e) => return fail(format!("could not read the manifest: {e}")),
-    };
+    let (body, base) =
+        match stream_get_at(&connector, &spec.manifest, ck, rf, ua, &route, cap).await {
+            Ok(b) => b,
+            Err(e) => return fail(format!("could not read the manifest: {e}")),
+        };
     let text = String::from_utf8_lossy(&body).into_owned();
     if base != spec.manifest {
         crate::log::info(&format!(
@@ -4441,6 +4705,7 @@ async fn run_stream(
                 &limiter,
                 &cancel,
                 &final_path,
+                &route,
                 &tx,
             )
             .await;
@@ -4508,7 +4773,7 @@ async fn run_stream(
                 chosen.bandwidth.unwrap_or(0) / 1000,
                 chosen.url
             ));
-            let body = match stream_get(&connector, &chosen.url, ck, rf, ua, cap).await {
+            let body = match stream_get(&connector, &chosen.url, ck, rf, ua, &route, cap).await {
                 Ok(b) => b,
                 Err(e) => return fail(format!("could not read the variant playlist: {e}")),
             };
@@ -4548,6 +4813,7 @@ async fn run_stream(
                 &limiter,
                 &cancel,
                 &final_path,
+                &route,
                 &tx,
             )
             .await;
@@ -4654,7 +4920,17 @@ async fn run_stream(
                 "#{id} fetching AES-128 key {}",
                 crate::log::redact(&uri)
             ));
-            match stream_get(&connector, &uri, ck, rf, ua, hya_stream::hls::KEY_FETCH_CAP).await {
+            match stream_get(
+                &connector,
+                &uri,
+                ck,
+                rf,
+                ua,
+                &route,
+                hya_stream::hls::KEY_FETCH_CAP,
+            )
+            .await
+            {
                 Ok(bytes) if bytes.len() == 16 => {
                     let mut k = [0u8; 16];
                     k.copy_from_slice(&bytes);
@@ -4697,7 +4973,7 @@ async fn run_stream(
         None,
     );
 
-    let fetch = segment_fetcher(&spec, &connector, &limiter, &cancel);
+    let fetch = segment_fetcher(&spec, &connector, &limiter, &cancel, &route);
 
     let mut parts: Vec<String> = Vec::new();
     let mut outcome = Ok(());
@@ -5067,6 +5343,7 @@ mod stream_tests {
             user_agent: "hydra-test/1".into(),
             temp_path: dir.join("out.part").to_string_lossy().into_owned(),
             final_path: final_path.to_string_lossy().into_owned(),
+            proxy: crate::model::ProxyChoice::default(),
         };
         let (tx, mut rx) = unbounded_channel();
         run_stream(
@@ -5146,6 +5423,7 @@ mod stream_tests {
             user_agent: "hydra-test/1".into(),
             temp_path: dir.join("out.part").to_string_lossy().into_owned(),
             final_path: final_path.to_string_lossy().into_owned(),
+            proxy: crate::model::ProxyChoice::default(),
         };
         let (tx, mut rx) = unbounded_channel();
         run_stream(
@@ -5196,6 +5474,7 @@ mod stream_tests {
             user_agent: "hydra-test/1".into(),
             temp_path: dir.join("out.part").to_string_lossy().into_owned(),
             final_path: final_path.to_string_lossy().into_owned(),
+            proxy: crate::model::ProxyChoice::default(),
         };
         let (tx, mut rx) = unbounded_channel();
         run_stream(
@@ -5270,6 +5549,7 @@ mod stream_tests {
                 .to_string_lossy()
                 .into_owned(),
             final_path: dir.join(name).to_string_lossy().into_owned(),
+            proxy: crate::model::ProxyChoice::default(),
         }
     }
 
@@ -5995,6 +6275,7 @@ mod stream_tests {
             user_agent: "hydra-test/1".into(),
             temp_path: dir.join("out.part").to_string_lossy().into_owned(),
             final_path: final_path.to_string_lossy().into_owned(),
+            proxy: crate::model::ProxyChoice::default(),
         };
         let (tx, mut rx) = unbounded_channel();
         run_stream(
@@ -6035,11 +6316,21 @@ pub async fn probe_stream(
     user_agent: String,
     cookies: Option<String>,
 ) -> Result<StreamProbe, String> {
-    let connector = shared_connector()?;
+    // No item exists yet, so there is no per-download choice to honour.
+    let route = crate::proxy::active();
+    let connector = connector_for(route.socks())?;
     let cap = hya_stream::hls::playlist_cap();
-    let body = stream_get(&connector, &url, cookies.as_deref(), None, &user_agent, cap)
-        .await
-        .map_err(|e| format!("could not read the manifest: {e}"))?;
+    let body = stream_get(
+        &connector,
+        &url,
+        cookies.as_deref(),
+        None,
+        &user_agent,
+        &route,
+        cap,
+    )
+    .await
+    .map_err(|e| format!("could not read the manifest: {e}"))?;
     let text = String::from_utf8_lossy(&body).into_owned();
 
     if text.contains("<MPD") {
@@ -6083,6 +6374,7 @@ pub async fn probe_stream(
                     cookies.as_deref(),
                     None,
                     &user_agent,
+                    &route,
                     cap,
                 )
                 .await
@@ -6225,7 +6517,14 @@ mod peek_zip_tests {
         let file = w.finish().unwrap().into_inner();
         let (port, _) = serve(file);
         let url = format!("http://127.0.0.1:{port}/small.zip");
-        let entries = block_on(peek_zip(url, "test".into(), vec![], None)).expect("peek");
+        let entries = block_on(peek_zip(
+            url,
+            "test".into(),
+            vec![],
+            None,
+            crate::model::ProxyChoice::Default,
+        ))
+        .expect("peek");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a.txt");
         assert_eq!(entries[0].size, 5);
@@ -6270,7 +6569,14 @@ mod peek_zip_tests {
             }
         });
         let url = format!("http://127.0.0.1:{hop_port}/go");
-        let entries = block_on(peek_zip(url, "test".into(), vec![], Some(total))).expect("peek");
+        let entries = block_on(peek_zip(
+            url,
+            "test".into(),
+            vec![],
+            Some(total),
+            crate::model::ProxyChoice::Default,
+        ))
+        .expect("peek");
         assert_eq!(entries[0].name, "b.txt");
         assert_eq!(heads.load(Ordering::SeqCst), 0, "no probe was made");
     }
@@ -6280,7 +6586,14 @@ mod peek_zip_tests {
         let junk = vec![b'x'; 200_000];
         let (port, _) = serve(junk);
         let url = format!("http://127.0.0.1:{port}/not.zip");
-        let err = block_on(peek_zip(url, "test".into(), vec![], None)).expect_err("not a zip");
+        let err = block_on(peek_zip(
+            url,
+            "test".into(),
+            vec![],
+            None,
+            crate::model::ProxyChoice::Default,
+        ))
+        .expect_err("not a zip");
         assert_eq!(err, crate::i18n::tr("This file is not a ZIP archive."));
     }
 
@@ -6296,9 +6609,9 @@ mod peek_zip_tests {
         let original = url.clone();
         block_on(async {
             let t0 = std::time::Instant::now();
-            let connector = shared_connector().unwrap();
+            let connector = connector_for(None).unwrap();
             let c = connector.as_ref();
-            let (url, p) = resolve_link(c, url, "hydra-test", &[])
+            let (url, p) = resolve_link(c, url, "hydra-test", &[], &Route::direct())
                 .await
                 .expect("resolve");
             eprintln!(
@@ -6309,7 +6622,7 @@ mod peek_zip_tests {
                 p.ranges
             );
             let u = parse_url(&url).unwrap();
-            let t = target_of(&u, vec![], "hydra-test");
+            let t = target_via(None, &u, vec![], "hydra-test");
             let t1 = std::time::Instant::now();
             let total = p.size;
             let tail = hya_net::fetch_small_range(
@@ -6330,18 +6643,30 @@ mod peek_zip_tests {
                 dir.offset >= total - tail.len() as u64
             );
             let t2 = std::time::Instant::now();
-            let all = peek_zip(url, "hydra-test".into(), vec![], None)
-                .await
-                .expect("peek");
+            let all = peek_zip(
+                url,
+                "hydra-test".into(),
+                vec![],
+                None,
+                crate::model::ProxyChoice::Default,
+            )
+            .await
+            .expect("peek");
             eprintln!(
                 "peek_zip, probing: {:?}  {} entries",
                 t2.elapsed(),
                 all.len()
             );
             let t3 = std::time::Instant::now();
-            let all = peek_zip(original, "hydra-test".into(), vec![], Some(total))
-                .await
-                .expect("peek");
+            let all = peek_zip(
+                original,
+                "hydra-test".into(),
+                vec![],
+                Some(total),
+                crate::model::ProxyChoice::Default,
+            )
+            .await
+            .expect("peek");
             eprintln!(
                 "peek_zip, size known, from the original url: {:?}  {} entries",
                 t3.elapsed(),
@@ -6369,11 +6694,350 @@ mod peek_zip_tests {
             ..StartSpec::plain()
         };
         let u = parse_url("https://cdn.example.com/a.mp4?e=1&s=2").unwrap();
-        let t = format!("{:?}", target_for(&u, &spec));
+        let t = format!("{:?}", target_for(&u, &spec, &Route::direct()));
         assert!(
             t.contains("Referer: https://www.example.com/watch"),
             "no referer on the target: {t}"
         );
         assert!(t.contains("Cookie: sid=1"), "no cookie on the target: {t}");
+    }
+}
+
+#[cfg(test)]
+mod proxy_route_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc::{channel, Receiver};
+
+    /// An origin serving `body`: `HEAD` answers with the size and no body —
+    /// a HEAD that sends one would leave the bytes in the connection for the
+    /// next request on it to read as a response — and `GET` serves the whole
+    /// object or the requested range.
+    fn origin(body: &'static [u8]) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let total = body.len();
+                    let range = head.lines().find_map(|l| {
+                        let v = l.strip_prefix("Range: bytes=")?;
+                        let (lo, hi) = v.trim().split_once('-')?;
+                        let lo: usize = lo.parse().ok()?;
+                        let hi: usize = hi.parse().unwrap_or(total - 1);
+                        Some((lo, hi.min(total - 1)))
+                    });
+                    let (status, span): (&str, &[u8]) = if head.starts_with("HEAD") {
+                        ("200 OK", &[])
+                    } else if let Some((lo, hi)) = range {
+                        ("206 Partial Content", &body[lo..=hi])
+                    } else {
+                        ("200 OK", body)
+                    };
+                    let len = if head.starts_with("HEAD") {
+                        total
+                    } else {
+                        span.len()
+                    };
+                    let mut headers = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\n"
+                    );
+                    if let Some((lo, hi)) = range.filter(|_| !head.starts_with("HEAD")) {
+                        headers.push_str(&format!("Content-Range: bytes {lo}-{hi}/{total}\r\n"));
+                    }
+                    headers.push_str("Connection: close\r\n\r\n");
+                    let _ = sock.write_all(headers.as_bytes());
+                    let _ = sock.write_all(span);
+                });
+            }
+        });
+        port
+    }
+
+    /// A SOCKS5 proxy that accepts no-auth, honours one CONNECT, and reports
+    /// the destination it was asked for.
+    ///
+    /// The destination is the assertion this test exists for: a download that
+    /// reaches the origin anyway proves nothing about routing, because a
+    /// direct connection reaches it too.
+    fn socks5_proxy() -> (u16, Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut client) = conn else { continue };
+                let mut greet = [0u8; 2];
+                if client.read_exact(&mut greet).is_err() {
+                    continue;
+                }
+                let mut methods = vec![0u8; greet[1] as usize];
+                let _ = client.read_exact(&mut methods);
+                let _ = client.write_all(&[0x05, 0x00]);
+
+                let mut head = [0u8; 4];
+                if client.read_exact(&mut head).is_err() {
+                    continue;
+                }
+                let host = match head[3] {
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        let _ = client.read_exact(&mut len);
+                        let mut name = vec![0u8; len[0] as usize];
+                        let _ = client.read_exact(&mut name);
+                        String::from_utf8_lossy(&name).into_owned()
+                    }
+                    _ => {
+                        let mut ip = [0u8; 4];
+                        let _ = client.read_exact(&mut ip);
+                        format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+                    }
+                };
+                let mut p = [0u8; 2];
+                let _ = client.read_exact(&mut p);
+                let dst_port = u16::from_be_bytes(p);
+                let _ = tx.send(format!("{host}:{dst_port}"));
+
+                let Ok(mut upstream) = TcpStream::connect((host.as_str(), dst_port)) else {
+                    let _ = client.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                    continue;
+                };
+                let _ = client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                let (mut c2, mut u2) = (
+                    client.try_clone().expect("clone"),
+                    upstream.try_clone().expect("clone"),
+                );
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c2, &mut u2);
+                });
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut upstream, &mut client);
+                });
+            }
+        });
+        (port, rx)
+    }
+
+    /// A forward proxy that answers only an absolute-form request line, which
+    /// is the shape RFC 9112 requires of a client speaking to one. A target
+    /// built without the proxy would send `GET /f` here and be refused.
+    fn http_proxy(body: &'static [u8]) -> (u16, Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let mut buf = [0u8; 1024];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = head.lines().next().unwrap_or_default().to_string();
+                let _ = tx.send(line.clone());
+                let answer: Vec<u8> = if line.contains("GET http://") {
+                    let mut v = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    v.extend_from_slice(body);
+                    v
+                } else {
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_vec()
+                };
+                let _ = sock.write_all(&answer);
+            }
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn an_http_route_sends_the_origin_in_the_request_line() {
+        let body: &[u8] = b"via the forward proxy";
+        let (proxy_port, saw) = http_proxy(body);
+        let u = parse_url("http://origin.example:8080/f").unwrap();
+        let t = target_via(Some(("127.0.0.1", proxy_port)), &u, vec![], "hydra-test");
+
+        let connector = connector_for(None).expect("connector");
+        let got = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hya_net::fetch_small(connector.as_ref(), &t, 4096))
+            .expect("fetch through the proxy");
+        assert_eq!(got, body);
+        assert_eq!(
+            saw.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the proxy saw a request"),
+            "GET http://origin.example:8080/f HTTP/1.1"
+        );
+    }
+
+    /// The per-download choice, end to end: an item that names its own proxy
+    /// is fetched through it even though the app-wide route is direct. The
+    /// proxy's record of the destination is the assertion — the file would
+    /// arrive either way.
+    /// An origin behind AWS WAF: a non-browser is turned away with `202` and
+    /// no body, exactly as `data.dtu.dk` does.
+    fn waf_challenged_origin() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf);
+                    let _ = sock.write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\
+x-amzn-waf-action: challenge\r\nConnection: close\r\n\r\n",
+                    );
+                });
+            }
+        });
+        port
+    }
+
+    /// The reported defect, in the GUI's own transfer path.
+    ///
+    /// `status < 300` admitted the whole of 2xx, so a bot challenge became "an
+    /// object of unknown size", took the single-stream path, read nothing, and
+    /// finished. The row said **Complete — 0 B** and left an empty file in
+    /// Downloads: a failure the user cannot see, reported as a success.
+    #[test]
+    fn a_bot_challenge_fails_the_download_instead_of_completing_it_empty() {
+        let port = waf_challenged_origin();
+        let dir = std::env::temp_dir().join(format!("hydra-waf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("26003087");
+
+        let spec = StartSpec {
+            id: 11,
+            url: format!("http://127.0.0.1:{port}/ndownloader/files/26003087"),
+            user_agent: "hydra-test".into(),
+            temp_path: out.with_extension("part").to_string_lossy().into_owned(),
+            final_path: out.to_string_lossy().into_owned(),
+            ..StartSpec::plain()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let final_path = out.to_string_lossy().into_owned();
+        let outcome = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                run_download(
+                    spec,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(RateLimiter::new(0)),
+                    Arc::new(Mutex::new(final_path)),
+                    tx,
+                )
+                .await;
+                let mut outcome = None;
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        Event::Finished { .. } => outcome = Some(Err(())),
+                        Event::Failed { error, .. } => outcome = Some(Ok(error)),
+                        _ => {}
+                    }
+                }
+                outcome
+            });
+
+        match outcome {
+            Some(Ok(error)) => {
+                assert!(error.contains("202"), "{error}");
+                assert!(error.contains("carries no file"), "{error}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(!out.exists(), "no empty file may be left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_download_with_its_own_proxy_leaves_by_that_door() {
+        let body: &[u8] = b"one download, one tunnel";
+        let origin_port = origin(body);
+        let (proxy_port, saw) = socks5_proxy();
+        let dir = std::env::temp_dir().join(format!("hydra-proxy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("own-proxy.bin");
+
+        let spec = StartSpec {
+            id: 7,
+            url: format!("http://127.0.0.1:{origin_port}/f"),
+            user_agent: "hydra-test".into(),
+            temp_path: out.with_extension("part").to_string_lossy().into_owned(),
+            final_path: out.to_string_lossy().into_owned(),
+            proxy: crate::model::ProxyChoice::Custom(format!("socks5://127.0.0.1:{proxy_port}")),
+            ..StartSpec::plain()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let final_path = out.to_string_lossy().into_owned();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                run_download(
+                    spec,
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(RateLimiter::new(0)),
+                    Arc::new(Mutex::new(final_path)),
+                    tx,
+                )
+                .await;
+                while let Some(ev) = rx.recv().await {
+                    match ev {
+                        Event::Finished { .. } => break,
+                        Event::Failed { error, .. } => panic!("download failed: {error}"),
+                        _ => {}
+                    }
+                }
+            });
+        assert_eq!(std::fs::read(&out).expect("the finished file"), body);
+        assert_eq!(
+            saw.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the proxy was asked for a destination"),
+            format!("127.0.0.1:{origin_port}"),
+            "the download must leave through its own proxy, not directly"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// The whole chain the GUI had never used: a SOCKS proxy resolved from the
+    /// settings reaches the connector, the socket is opened to the PROXY, the
+    /// origin is named in the handshake, and the bytes come back.
+    #[test]
+    fn a_socks_route_carries_the_transfer_through_the_proxy() {
+        let body: &[u8] = b"through the tunnel";
+        let origin_port = origin(body);
+        let (proxy_port, saw) = socks5_proxy();
+
+        let px = hya_net::Proxy::parse(&format!("socks5://127.0.0.1:{proxy_port}")).unwrap();
+        let connector = connector_for(Some(px)).expect("connector");
+        let u = parse_url(&format!("http://127.0.0.1:{origin_port}/f")).unwrap();
+        let t = target_via(None, &u, vec![], "hydra-test");
+
+        let got = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(hya_net::fetch_small(connector.as_ref(), &t, 4096))
+            .expect("fetch through the proxy");
+        assert_eq!(got, body);
+        assert_eq!(
+            saw.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the proxy was asked for a destination"),
+            format!("127.0.0.1:{origin_port}"),
+            "the handshake must name the origin, not the proxy"
+        );
     }
 }

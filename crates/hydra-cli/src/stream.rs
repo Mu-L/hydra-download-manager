@@ -1109,8 +1109,8 @@ pub async fn inspect_file(job: &Job) -> Result<(), String> {
         break p;
     };
 
-    if probe.status >= 400 {
-        return Err(format!("the server answered {} for {url}", probe.status));
+    if let Some(why) = probe.refusal() {
+        return Err(format!("the {why} for {url}"));
     }
 
     let name = probe

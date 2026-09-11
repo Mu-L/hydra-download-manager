@@ -11,6 +11,7 @@ use iced::Length;
 
 pub fn cat_icon(name: &str) -> svg::Handle {
     match name {
+        crate::model::AI_CATEGORY => icons::folder_ai(),
         "Compressed" => icons::folder_compressed(),
         "Documents" => icons::folder_documents(),
         "Music" => icons::folder_music(),

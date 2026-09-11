@@ -5,8 +5,8 @@
 
 use crate::engine::{self, Cmd, StartSpec};
 use crate::model::{
-    self, categorize, ConfigFile, DlId, DlQuota, DlState, DownloadItem, PowerAction, ProxyMode,
-    SiteLogin, StateFile, ThemeMode,
+    self, categorize, ConfigFile, DlId, DlQuota, DlState, DownloadItem, PowerAction, ProxyChoice,
+    ProxyMode, ProxyPick, SiteLogin, StateFile, ThemeMode,
 };
 use crate::sounds;
 use crate::{fmt, i18n};
@@ -358,6 +358,15 @@ pub struct FileInfoState {
     pub login: String,
     pub password: String,
     pub cookies: String,
+    /// Which proxy this download takes. The address box keeps its text while
+    /// the picker sits on Default or No proxy, so switching back does not
+    /// mean retyping it.
+    pub proxy_pick: ProxyPick,
+    pub proxy_spec: String,
+    /// Set when OK or Start Download was refused because "this download
+    /// only" names no address. It is what turns the empty box red: an
+    /// address not yet typed is not a mistake until it is used.
+    pub proxy_needs_address: bool,
     /// New-download dialog (auto-started in the background, Cancel removes
     /// the item) vs Properties on an existing entry.
     pub is_new: bool,
@@ -415,6 +424,8 @@ pub enum ProgTab {
     #[default]
     Status,
     Speed,
+    /// Which proxy this one download takes.
+    Proxy,
     Completion,
 }
 
@@ -425,6 +436,11 @@ pub struct ProgState {
     pub limit_on: bool,
     pub limit_kb: String,
     pub remember_limit: bool,
+    /// The proxy row, seeded from the item when the window opens. Edits go
+    /// straight onto the item — the transfer is stopped while they are
+    /// possible, so there is nothing to keep a draft for.
+    pub proxy_pick: ProxyPick,
+    pub proxy_spec: String,
 }
 
 /// A virus scan over one finished file: what the scanner has printed so far,
@@ -949,6 +965,8 @@ pub enum Message {
     FiLogin(String),
     FiPass(String),
     FiCookies(String),
+    FiProxyPick(ProxyPick),
+    FiProxySpec(String),
     FiDownloadLater,
     FiStartDownload,
     FiCancel,
@@ -964,6 +982,8 @@ pub enum Message {
     ProgLimitOn(DlId, bool),
     ProgLimitKb(DlId, String),
     ProgLimitRemember(DlId, bool),
+    ProgProxyPick(DlId, ProxyPick),
+    ProgProxySpec(DlId, String),
     ProgShutdownAfter(DlId, bool),
     ProgShutdownAction(DlId, PowerAction),
     /// Options-on-completion tab mirror of Options > Downloads >
@@ -1109,9 +1129,7 @@ pub enum OptField {
     ProxyPort(String),
     ProxyUser(String),
     ProxyPass(String),
-    ProxyHttp(bool),
-    ProxyHttps(bool),
-    ProxyFtp(bool),
+    ProxyType(crate::model::ProxyType),
     FtpPasv(bool),
     SelCategory(String),
     CatDir(String),
@@ -1731,11 +1749,25 @@ impl App {
             // does not scroll, so too little clips the buttons and too
             // much leaves a dead strip under them.
             WinKind::FileInfo(dl) => {
+                // The proxy row is always drawn, and costs what any other
+                // field row costs: the input's own height plus the gap above
+                // it. The line under it is only there when the address typed
+                // into the row is not a proxy.
+                let proxy = 40.0
+                    + if crate::windows::file_info::proxy_problem(&self.file_info).is_some() {
+                        24.0
+                    } else {
+                        0.0
+                    };
                 if self.file_info.is_new {
-                    (680.0, 276.0)
+                    (680.0, 276.0 + proxy)
                 } else {
-                    let failed = self.item(dl).is_some_and(|d| d.error.is_some());
-                    (680.0, if failed { 368.0 } else { 336.0 })
+                    let result = self
+                        .item(dl)
+                        .and_then(|d| d.error.as_deref())
+                        .map(result_row_height)
+                        .unwrap_or(0.0);
+                    (680.0, 336.0 + result + proxy)
                 }
             }
             // Matches ProgToggleDetails: a box whose details are hidden
@@ -1764,6 +1796,7 @@ impl App {
     /// asking to see a transfer (double-click, File Properties) still opens
     /// the box in front.
     fn open_progress_window(&mut self, dl: DlId) -> Task<Message> {
+        self.sync_prog_state(dl);
         let kind = WinKind::Progress(dl);
         let existed = self.win_of(kind).is_some();
         let task = self.open_window(kind);
@@ -2120,12 +2153,11 @@ impl App {
                 conns: stream_conns,
                 max_seconds: si.max_seconds,
                 limit: stream_limit,
+                proxy: d.proxy.clone(),
             };
             engine::send(Cmd::StartStream(Box::new(ss)));
             self.save_state();
             return if open_progress {
-                let seed = self.item(id).and_then(|d| d.speed_limit);
-                self.prog.entry(id).or_insert_with(|| prog_state_seed(seed));
                 self.open_progress_window(id)
             } else {
                 Task::none()
@@ -2181,6 +2213,7 @@ impl App {
             attested_size: d.metalink.as_ref().and_then(|m| m.size),
             attested_digest: d.metalink.as_ref().and_then(|m| m.digest.clone()),
             pieces: d.metalink.as_ref().and_then(|m| m.pieces.clone()),
+            proxy: d.proxy.clone(),
         };
         let url = d.url.clone();
         let limit = self.effective_limit(self.item(id).unwrap());
@@ -2193,8 +2226,6 @@ impl App {
         engine::send(Cmd::Start(Box::new(spec)));
         self.save_state();
         if open_progress {
-            let seed = self.item(id).and_then(|d| d.speed_limit);
-            self.prog.entry(id).or_insert_with(|| prog_state_seed(seed));
             self.open_progress_window(id)
         } else {
             Task::none()
@@ -2315,6 +2346,33 @@ impl App {
         self.save_state();
     }
 
+    /// What a progress window's controls start out showing for `id`.
+    fn prog_seed_of(&self, id: DlId) -> (Option<u64>, ProxyChoice) {
+        match self.item(id) {
+            Some(d) => (d.speed_limit, d.proxy.clone()),
+            None => (None, ProxyChoice::default()),
+        }
+    }
+
+    /// Give `id` a progress-window state if it has none, and re-read the
+    /// proxy row from the item.
+    ///
+    /// Re-read rather than seeded once: File Info edits the same setting, so
+    /// a window opened again after a change there would otherwise still show
+    /// the route the download no longer takes. Only the address box's text is
+    /// the window's own — it survives unless the item names an address.
+    fn sync_prog_state(&mut self, id: DlId) {
+        let (seed, proxy) = self.prog_seed_of(id);
+        let p = self
+            .prog
+            .entry(id)
+            .or_insert_with(|| prog_state_seed(seed, &proxy));
+        p.proxy_pick = proxy.pick();
+        if !proxy.spec().is_empty() {
+            p.proxy_spec = proxy.spec().to_string();
+        }
+    }
+
     /// Create a new list entry for a URL; returns its id. Every download
     /// belongs to a queue (the first one — "Main download queue" — unless the
     /// caller names another), so Start/Stop Queue always govern the whole
@@ -2377,6 +2435,7 @@ impl App {
             stream: None,
             metalink: None,
             name_locked: false,
+            proxy: ProxyChoice::default(),
         });
         self.save_state();
         id
@@ -3599,7 +3658,10 @@ impl App {
                     match st {
                         // Active transfer: its progress box. Anything else:
                         // the File Properties dialog.
-                        Some(s) if s.is_active() => self.open_window(WinKind::Progress(id)),
+                        Some(s) if s.is_active() => {
+                            self.sync_prog_state(id);
+                            self.open_window(WinKind::Progress(id))
+                        }
                         Some(_) => self.update(Message::Menu(MenuAction::Properties)),
                         None => Task::none(),
                     }
@@ -4177,7 +4239,22 @@ impl App {
                 }
                 self.add_url = AddUrlState::default();
                 let close = self.close_window(WinKind::AddUrl);
-                if self.cfg.settings.show_file_info_dialog {
+                // A signed URL is perishable, and the File Info dialog waits for
+                // a person. An S3 presigned link can allow as little as ten
+                // seconds — `s3q.ait.dtu.dk` issues exactly that — so parking one
+                // behind a confirmation is not a delay, it is a guaranteed 403:
+                // the deadline is checked when each request ARRIVES, and no
+                // human clicks that fast. Start it now and let the item be
+                // edited in the list, which is the only ordering where the
+                // download can still happen.
+                let perishable = self.item(id).is_some_and(|d| expiring_soon(&d.url));
+                if perishable {
+                    crate::log::info(&format!(
+                        "expiring link: starting at once, skipping the File Info dialog for {}",
+                        self.item(id).map(|d| d.url.as_str()).unwrap_or("-")
+                    ));
+                }
+                if self.cfg.settings.show_file_info_dialog && !perishable {
                     let d = self.item(id).unwrap();
                     self.file_info = FileInfoState {
                         dl: id,
@@ -4194,6 +4271,8 @@ impl App {
                         login: d.auth.clone().map(|a| a.0).unwrap_or_default(),
                         password: d.auth.clone().map(|a| a.1).unwrap_or_default(),
                         cookies: d.cookies.clone().unwrap_or_default(),
+                        proxy_pick: d.proxy.pick(),
+                        proxy_spec: d.proxy.spec().to_string(),
                         bg_blocked: !self.auto_start_type(id),
                         ..FileInfoState::default()
                     };
@@ -4381,8 +4460,30 @@ impl App {
                 self.file_info.cookies = v;
                 Task::none()
             }
+            // Both can add or remove the line under the row, and the dialog
+            // does not scroll: without the re-fit the sentence explaining the
+            // address would sit below the window's bottom edge.
+            Message::FiProxyPick(p) => {
+                self.file_info.proxy_pick = p;
+                self.resize_open(WinKind::FileInfo(self.file_info.dl))
+            }
+            Message::FiProxySpec(v) => {
+                self.file_info.proxy_spec = v;
+                self.resize_open(WinKind::FileInfo(self.file_info.dl))
+            }
             Message::FiDownloadLater | Message::FiStartDownload => {
                 let start = matches!(message, Message::FiStartDownload);
+                // A route the transport cannot take stops here, with the
+                // reason under the row. Letting the dialog close would start
+                // a download that fails a moment later for a reason the user
+                // can no longer see — which is how "empty proxy
+                // specification" ended up in the Result line instead of
+                // beside the box that caused it.
+                self.file_info.proxy_needs_address = true;
+                if crate::windows::file_info::proxy_problem(&self.file_info).is_some() {
+                    return self.resize_open(WinKind::FileInfo(self.file_info.dl));
+                }
+                self.file_info.proxy_needs_address = false;
                 let mut fi = self.file_info.clone();
                 if fi.save_dir.trim().is_empty() {
                     // A bare file name in Save As: keep the folder the item
@@ -4418,18 +4519,29 @@ impl App {
                     .map(|d| !fi.url.trim().is_empty() && d.url != fi.url.trim())
                     .unwrap_or(false)
                     && engine::parse_url(fi.url.trim()).is_ok();
+                let (new_proxy, proxy_changed) = match self.item(fi.dl) {
+                    Some(d) => reroute(d, &fi),
+                    None => (
+                        ProxyChoice::from_parts(fi.proxy_pick, &fi.proxy_spec),
+                        false,
+                    ),
+                };
+                if proxy_changed {
+                    crate::log::info(&format!("#{} proxy -> {:?}", fi.dl, new_proxy.pick()));
+                }
                 if url_changed {
                     // Mirror switch: keep the held byte spans — the engine
                     // verifies the new source reports the same size and
                     // continues where mirror A stopped.
                     crate::log::info(&format!("#{} mirror -> {}", fi.dl, fi.url.trim()));
-                    if self
+                }
+                if (url_changed || proxy_changed)
+                    && self
                         .item(fi.dl)
                         .map(|d| d.state.is_active())
                         .unwrap_or(false)
-                    {
-                        engine::send(Cmd::Stop(fi.dl));
-                    }
+                {
+                    engine::send(Cmd::Stop(fi.dl));
                 }
                 if let Some(d) = self.item_mut(fi.dl) {
                     d.category = Some(fi.category.clone());
@@ -4444,6 +4556,8 @@ impl App {
                     d.description = fi.description.clone();
                     if url_changed {
                         d.url = fi.url.trim().to_string();
+                    }
+                    if url_changed || proxy_changed {
                         d.state = DlState::Paused;
                         d.error = None;
                     }
@@ -4451,6 +4565,7 @@ impl App {
                         (!fi.login.is_empty()).then(|| (fi.login.clone(), fi.password.clone()));
                     d.cookies =
                         (!fi.cookies.trim().is_empty()).then(|| fi.cookies.trim().to_string());
+                    d.proxy = new_proxy;
                     was = Some(d.state);
                 }
                 // Aim the running transfer at the edited destination; if a
@@ -4476,10 +4591,6 @@ impl App {
                 match (start, was) {
                     // Reveal the already-running background transfer.
                     (true, Some(st)) if st.is_active() => {
-                        let seed = self.item(fi.dl).and_then(|d| d.speed_limit);
-                        self.prog
-                            .entry(fi.dl)
-                            .or_insert_with(|| prog_state_seed(seed));
                         Task::batch([close, self.open_progress_window(fi.dl)])
                     }
                     (true, _) => Task::batch([close, self.start_download(fi.dl, true)]),
@@ -4547,9 +4658,11 @@ impl App {
                 // The size the probe (or the transfer running behind the
                 // dialog) already found saves the peek two round trips.
                 let size = self.item(dl).and_then(|d| d.size);
-                let peek = Task::perform(engine::peek_zip(url, ua, headers, size), move |r| {
-                    Message::ZipPeeked(dl, r)
-                });
+                let proxy = self.item(dl).map(|d| d.proxy.clone()).unwrap_or_default();
+                let peek =
+                    Task::perform(engine::peek_zip(url, ua, headers, size, proxy), move |r| {
+                        Message::ZipPeeked(dl, r)
+                    });
                 Task::batch([self.open_window(WinKind::ZipPreview(dl)), peek])
             }
             Message::ZipPeeked(dl, result) => {
@@ -4693,6 +4806,30 @@ impl App {
                 engine::send(Cmd::SetLimit(id, lim));
                 Task::none()
             }
+            // The proxy is editable in this dialog only while the transfer is
+            // stopped (the view withholds the handlers otherwise), so the
+            // edit lands on the item and takes effect on the next start —
+            // there is no running connection to move.
+            Message::ProgProxyPick(id, pick) => {
+                let p = self.prog.entry(id).or_default();
+                p.proxy_pick = pick;
+                let choice = ProxyChoice::from_parts(pick, &p.proxy_spec);
+                if let Some(d) = self.item_mut(id) {
+                    d.proxy = choice;
+                }
+                self.save_state();
+                Task::none()
+            }
+            Message::ProgProxySpec(id, spec) => {
+                let p = self.prog.entry(id).or_default();
+                p.proxy_spec = spec;
+                let choice = ProxyChoice::from_parts(p.proxy_pick, &p.proxy_spec);
+                if let Some(d) = self.item_mut(id) {
+                    d.proxy = choice;
+                }
+                self.save_state();
+                Task::none()
+            }
             Message::ProgLimitRemember(id, b) => {
                 // The live cap stays as it is; the flag only decides whether
                 // it survives the transfer (Stopped/Finished clear the item's
@@ -4782,6 +4919,10 @@ impl App {
                 self.cfg.settings = self.options.draft.clone();
                 self.cfg.categories = self.options.draft_cats.clone();
                 self.save_config();
+                // Re-resolve the proxy here rather than at the next transfer:
+                // a route the app cannot take must be reported while the user
+                // is still looking at the tab they set it on.
+                crate::proxy::apply(&self.cfg.settings);
                 // Re-assert Dock policy for the new setting. Windows are
                 // still open here (Options itself), so this stays Regular;
                 // the actual hide happens when the last window closes —
@@ -5555,7 +5696,11 @@ impl App {
                     }
                 }
                 self.save_state();
-                if self.cfg.settings.show_file_info_dialog {
+                // Same rule as the first-time path: a signed URL cannot afford
+                // a second dialog either, and having just spent one on the
+                // duplicate question it can afford it least of all.
+                let perishable = self.item(id).is_some_and(|d| expiring_soon(&d.url));
+                if self.cfg.settings.show_file_info_dialog && !perishable {
                     let d = self.item(id).unwrap();
                     self.file_info = FileInfoState {
                         dl: id,
@@ -5570,6 +5715,8 @@ impl App {
                         is_new: true,
                         url: d.url.clone(),
                         name_touched: true,
+                        proxy_pick: d.proxy.pick(),
+                        proxy_spec: d.proxy.spec().to_string(),
                         bg_blocked: !self.auto_start_type(id),
                         ..FileInfoState::default()
                     };
@@ -6011,6 +6158,8 @@ impl App {
                     login: d.auth.clone().map(|a| a.0).unwrap_or_default(),
                     password: d.auth.clone().map(|a| a.1).unwrap_or_default(),
                     cookies: d.cookies.clone().unwrap_or_default(),
+                    proxy_pick: d.proxy.pick(),
+                    proxy_spec: d.proxy.spec().to_string(),
                     ..FileInfoState::default()
                 });
                 if let Some(fi) = fi {
@@ -6130,9 +6279,7 @@ impl App {
             OptField::ProxyPort(v) => s.proxy_port = v,
             OptField::ProxyUser(v) => s.proxy_user = v,
             OptField::ProxyPass(v) => s.proxy_pass = v,
-            OptField::ProxyHttp(b) => s.proxy_http = b,
-            OptField::ProxyHttps(b) => s.proxy_https = b,
-            OptField::ProxyFtp(b) => s.proxy_ftp = b,
+            OptField::ProxyType(t) => s.proxy_type = t,
             OptField::FtpPasv(b) => s.ftp_pasv = b,
             OptField::SelCategory(c) => self.options.sel_category = c,
             OptField::CatDir(v) => {
@@ -6420,6 +6567,17 @@ pub fn auto_start_type(file_name: &str, url: &str, auto_types: &str) -> bool {
     }
 }
 
+/// Is this a signed URL whose window is too short to survive a dialog?
+///
+/// The hour is a policy, not a property of the URL: a link good for a week can
+/// wait behind a confirmation like any other, while the fifteen-minute and
+/// ten-second windows object stores actually hand out cannot. Erring long is
+/// the safe direction — the cost of being wrong is a dialog the user did not
+/// get, against a download that could not have happened at all.
+pub(crate) fn expiring_soon(url: &str) -> bool {
+    hya_net::signed::perishable(url, crate::fmt::now_unix().max(0) as u64)
+}
+
 /// Does this URL's host match an entry in the Options > File types
 /// "Don't start downloading automatically from the following sites" list?
 /// Entries are separated by whitespace or commas; a host matches a pattern
@@ -6570,6 +6728,40 @@ fn adopt_dialog_edits(
     }
     std::fs::rename(&old, &new)?;
     Ok(Some(new))
+}
+
+/// Height the File Info dialog's Result row needs for `error`.
+///
+/// The message is whatever the server or the transport had to say, and a bot
+/// challenge, a refused proxy or a connection error easily runs past one
+/// line. The dialog does not scroll and is sized to the rows it draws, so a
+/// two-line message measured as one pushes everything below it down — and
+/// what iced then squeezes is the LAST row, which is the proxy row: its
+/// picker came out visibly shorter than the Category picker above it.
+fn result_row_height(error: &str) -> f32 {
+    // Characters that fit on one line of the value column at the dialog's
+    // font, once the label column and the icon column have taken theirs.
+    const PER_LINE: usize = 70;
+    // A row costs its text plus the gap above it; each further line costs
+    // only the text. Three lines is where the message stops being read and
+    // starts being scrolled past, so the dialog stops growing there.
+    let lines = error.len().div_ceil(PER_LINE).clamp(1, 3);
+    32.0 + (lines - 1) as f32 * 18.0
+}
+
+/// The route the File Info dialog is asking for, and whether it differs from
+/// the one the item already has.
+///
+/// A connection's route is chosen when the socket is opened, so a transfer
+/// already pulling bytes cannot be moved onto a new one: a difference here
+/// means stop and start again, keeping the spans already on disk. Accepting
+/// the change without that would leave the download running through the old
+/// route — which, when the new choice is "no proxy" or a different tunnel, is
+/// the leak the setting exists to prevent.
+fn reroute(d: &DownloadItem, fi: &FileInfoState) -> (ProxyChoice, bool) {
+    let want = ProxyChoice::from_parts(fi.proxy_pick, &fi.proxy_spec);
+    let changed = d.proxy != want;
+    (want, changed)
 }
 
 /// The file the duplicate dialog should warn about, if any.
@@ -6912,12 +7104,14 @@ pub fn promote_queue_members(downloads: &mut [DownloadItem], queue: &str) {
 /// Progress-dialog state seeded from the item's live cap, so the Speed
 /// Limiter tab tells the truth about a persisted per-download limit instead
 /// of showing an unchecked box while the cap is active.
-fn prog_state_seed(speed_limit: Option<u64>) -> ProgState {
+fn prog_state_seed(speed_limit: Option<u64>, proxy: &ProxyChoice) -> ProgState {
     ProgState {
         details: true,
         limit_on: speed_limit.is_some(),
         limit_kb: (speed_limit.unwrap_or(10 * 1024) / 1024).to_string(),
         remember_limit: speed_limit.is_some(),
+        proxy_pick: proxy.pick(),
+        proxy_spec: proxy.spec().to_string(),
         ..ProgState::default()
     }
 }
@@ -7150,6 +7344,7 @@ mod tests {
             stream: None,
             metalink: None,
             name_locked: false,
+            proxy: ProxyChoice::default(),
         }
     }
 
@@ -7293,6 +7488,44 @@ mod tests {
             "https://ex.com/download",
             TYPES
         ));
+    }
+
+    /// The reported defect: a presigned link captured from the browser was
+    /// parked behind the File Info dialog until its signature died, so every
+    /// attempt ended in `403 Request has expired`. Ten seconds is what the
+    /// origin in the report really issues.
+    #[test]
+    fn a_short_lived_signed_link_is_recognised_as_perishable() {
+        let now = crate::fmt::now_unix().max(0) as u64;
+        let ten_seconds = format!(
+            "https://s3q.ait.dtu.dk:9000/figshare/26003087/TEP_Mode1.h5\
+?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date={}&X-Amz-Expires=10&X-Amz-Signature=ab",
+            crate::app::tests::basic_iso8601(now)
+        );
+        assert!(expiring_soon(&ten_seconds));
+
+        // A plain URL waits for the dialog like anything else.
+        assert!(!expiring_soon("https://example.com/big.iso"));
+        // So does a signature with a week of headroom: the dialog costs it
+        // nothing, and suppressing it there would be a UI change with no
+        // failure behind it.
+        let a_week = format!(
+            "https://ex.com/o?X-Amz-Date={}&X-Amz-Expires=604800&X-Amz-Signature=ab",
+            crate::app::tests::basic_iso8601(now)
+        );
+        assert!(!expiring_soon(&a_week));
+    }
+
+    /// Render a unix timestamp the way SigV4 writes `X-Amz-Date`, so the test
+    /// above can build a URL that is expiring RIGHT NOW rather than pinning a
+    /// date that silently stops being short-lived as the clock passes it.
+    pub(super) fn basic_iso8601(unix: u64) -> String {
+        use chrono::{TimeZone, Utc};
+        Utc.timestamp_opt(unix as i64, 0)
+            .single()
+            .expect("valid timestamp")
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string()
     }
 
     #[test]
@@ -7880,13 +8113,65 @@ mod tests {
         assert_eq!(unique_file_name(dir, "a.zip", &[me], 7), "a.zip");
     }
 
+    /// The Result line carries the server's own sentence, and the dialog does
+    /// not scroll: measuring a two-line message as one is what squeezed the
+    /// row below it — the proxy row — out of shape.
+    #[test]
+    fn a_long_result_message_is_measured_by_the_lines_it_takes() {
+        let one = "ftp: login failed";
+        let two = "HEAD failed (Connection refused (os error 61)), ranged GET failed \
+                   (Connection refused (os error 61))";
+        assert_eq!(result_row_height(one), 32.0);
+        assert!(
+            result_row_height(two) > result_row_height(one),
+            "a message that wraps must be given the room to wrap"
+        );
+        // However long the sentence, the dialog stops growing.
+        assert_eq!(
+            result_row_height(&"x".repeat(4000)),
+            result_row_height(&"x".repeat(200))
+        );
+    }
+
+    /// Changing a download's proxy is not a field edit like a description:
+    /// the transfer has to be stopped and started again, so the dialog has
+    /// to be able to tell that it changed at all.
+    #[test]
+    fn a_changed_proxy_is_what_tells_the_dialog_to_restart_the_transfer() {
+        let mut d = item(1, "/tmp", "a.zip", None, DlState::Receiving);
+        let fi = FileInfoState::default();
+        assert_eq!(reroute(&d, &fi), (ProxyChoice::Default, false));
+
+        let own = FileInfoState {
+            proxy_pick: ProxyPick::Custom,
+            proxy_spec: "  socks5://127.0.0.1:10808 ".into(),
+            ..FileInfoState::default()
+        };
+        let (want, changed) = reroute(&d, &own);
+        assert!(changed);
+        assert_eq!(want, ProxyChoice::Custom("socks5://127.0.0.1:10808".into()));
+
+        // The same address again, differently spaced, is not a change: it
+        // must not restart a running transfer for nothing.
+        d.proxy = want;
+        assert!(!reroute(&d, &own).1);
+
+        // The picker alone is enough: "no proxy" on a download that had one
+        // is a reroute even though the address box still holds the text.
+        let none = FileInfoState {
+            proxy_pick: ProxyPick::Direct,
+            ..own.clone()
+        };
+        assert_eq!(reroute(&d, &none), (ProxyChoice::Direct, true));
+    }
+
     #[test]
     fn prog_state_seed_reflects_persisted_limit() {
-        let p = prog_state_seed(Some(512 * 1024));
+        let p = prog_state_seed(Some(512 * 1024), &ProxyChoice::Default);
         assert!(p.limit_on);
         assert!(p.remember_limit);
         assert_eq!(p.limit_kb, "512");
-        let p = prog_state_seed(None);
+        let p = prog_state_seed(None, &ProxyChoice::Default);
         assert!(!p.limit_on);
         assert!(!p.remember_limit);
         assert_eq!(p.limit_kb, "10");

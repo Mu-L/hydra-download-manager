@@ -137,6 +137,11 @@ pub struct DownloadItem {
     /// renamed back over the file it had just warned about.
     #[serde(default)]
     pub name_locked: bool,
+    /// Which proxy this download takes: the app default, none, or its own.
+    /// Editable in File Info and, while the transfer is stopped, in the
+    /// progress dialog.
+    #[serde(default)]
+    pub proxy: ProxyChoice,
 }
 
 /// What a stream item needs beyond a URL: which rendition was chosen, and
@@ -316,6 +321,60 @@ fn sub(cat: &str) -> String {
         .into_owned()
 }
 
+/// The category model weights and datasets are filed under.
+///
+/// A constant rather than a literal because three places have to agree on it:
+/// the default list, the tree's icon lookup, and the one-time migration that
+/// adds it to an install that predates it.
+pub const AI_CATEGORY: &str = "AI & Datasets";
+
+/// Model weights, checkpoints and dataset containers.
+///
+/// Deliberately WITHOUT csv, tsv and json. They are dataset formats, but they
+/// are also what a large part of the ordinary web serves, and a capture list
+/// that swallows every one of them turns the browser into a nuisance — the
+/// user can add them, but they must ask.
+pub const AI_TYPES: &[&str] = &[
+    "SAFETENSORS",
+    "GGUF",
+    "GGML",
+    "ONNX",
+    "PT",
+    "PTH",
+    "CKPT",
+    "PB",
+    "TFLITE",
+    "H5",
+    "HDF5",
+    "KERAS",
+    "NPY",
+    "NPZ",
+    "PKL",
+    "MLMODEL",
+    "MLPACKAGE",
+    "CAFFEMODEL",
+    "PARQUET",
+    "PQ",
+    "ARROW",
+    "FEATHER",
+    "AVRO",
+    "ORC",
+    "TFRECORD",
+    "JSONL",
+    "NDJSON",
+];
+
+/// The stock capture list: the classic media/archive set plus [`AI_TYPES`].
+///
+/// Composed rather than spelled out so the model formats have one definition
+/// shared with the category and the migration.
+pub fn default_auto_types() -> String {
+    const BASE: &str = "3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 DMG EXE GZ GZIP IMG ISO \
+LZH M4A M4V MKV MOV MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PKG PPS PPT QT RA RAR RM \
+RMVB SEA SIT SITX TAR TIF TIFF WAV WMA WMV Z ZIP";
+    format!("{BASE} {}", AI_TYPES.join(" "))
+}
+
 pub fn default_categories() -> Vec<CategoryDef> {
     let e = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
     vec![
@@ -323,6 +382,11 @@ pub fn default_categories() -> Vec<CategoryDef> {
             name: "General".into(),
             exts: vec![],
             dir: downloads_dir(),
+        },
+        CategoryDef {
+            name: AI_CATEGORY.into(),
+            exts: AI_TYPES.iter().map(|e| e.to_ascii_lowercase()).collect(),
+            dir: sub(AI_CATEGORY),
         },
         CategoryDef {
             name: "Compressed".into(),
@@ -409,6 +473,129 @@ pub enum ProxyMode {
     Manual,
 }
 
+/// What the manually configured proxy speaks.
+///
+/// The distinction is not cosmetic: a SOCKS proxy carries a TCP stream and is
+/// dialled by the connector, while an HTTP proxy parses the request line and
+/// is addressed by the target. `crate::proxy` turns this into one or the
+/// other; picking the wrong one produces a connection that fails with a
+/// message about the wrong protocol.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ProxyType {
+    /// Forward proxy: absolute-form requests, `CONNECT` for TLS. The default
+    /// because it is what a bare `host:port` means everywhere else.
+    #[default]
+    Http,
+    Socks4,
+    Socks4a,
+    Socks5,
+}
+
+impl ProxyType {
+    /// The URL scheme this type is spelled with, which is also what
+    /// `hya_net::Proxy::parse` reads.
+    pub fn scheme(self) -> &'static str {
+        match self {
+            ProxyType::Http => "http",
+            ProxyType::Socks4 => "socks4",
+            ProxyType::Socks4a => "socks4a",
+            ProxyType::Socks5 => "socks5",
+        }
+    }
+
+    /// Every type, in the order the Options picker lists them.
+    pub const ALL: [ProxyType; 4] = [
+        ProxyType::Http,
+        ProxyType::Socks4,
+        ProxyType::Socks4a,
+        ProxyType::Socks5,
+    ];
+}
+
+impl std::fmt::Display for ProxyType {
+    /// The picker's label. Not translated: these are protocol names.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProxyType::Http => "HTTP",
+            ProxyType::Socks4 => "SOCKS4",
+            ProxyType::Socks4a => "SOCKS4a",
+            ProxyType::Socks5 => "SOCKS5",
+        })
+    }
+}
+
+/// Which proxy ONE download uses.
+///
+/// A download manager is often the reason a proxy exists on the machine at
+/// all: one large file has to go through the tunnel while everything else
+/// stays on the fast direct path, or the other way round. The choice travels
+/// with the item and is persisted, so a download resumed tomorrow still takes
+/// the route it was started on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProxyChoice {
+    /// Whatever Options > Proxy/Socks says, including later changes to it.
+    #[default]
+    Default,
+    /// Straight to the origin, whatever Options says.
+    Direct,
+    /// This download's own proxy, as a full specification —
+    /// `socks5://user:pass@host:port`.
+    Custom(String),
+}
+
+impl ProxyChoice {
+    /// Which of the three this is, for the dialogs' picker.
+    pub fn pick(&self) -> ProxyPick {
+        match self {
+            ProxyChoice::Default => ProxyPick::Default,
+            ProxyChoice::Direct => ProxyPick::Direct,
+            ProxyChoice::Custom(_) => ProxyPick::Custom,
+        }
+    }
+
+    /// The specification the user typed, empty for the other two.
+    pub fn spec(&self) -> &str {
+        match self {
+            ProxyChoice::Custom(s) => s,
+            _ => "",
+        }
+    }
+
+    /// Rebuild from what a dialog holds: a picker value and the address box
+    /// beside it, which keeps its text while the picker is on something else
+    /// so switching back does not retype it.
+    pub fn from_parts(pick: ProxyPick, spec: &str) -> Self {
+        match pick {
+            ProxyPick::Default => ProxyChoice::Default,
+            ProxyPick::Direct => ProxyChoice::Direct,
+            ProxyPick::Custom => ProxyChoice::Custom(spec.trim().to_string()),
+        }
+    }
+}
+
+/// The three options a per-download proxy picker offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ProxyPick {
+    #[default]
+    Default,
+    Direct,
+    Custom,
+}
+
+impl ProxyPick {
+    pub const ALL: [ProxyPick; 3] = [ProxyPick::Default, ProxyPick::Direct, ProxyPick::Custom];
+}
+
+impl std::fmt::Display for ProxyPick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            ProxyPick::Default => crate::i18n::tr("Default (Options)"),
+            ProxyPick::Direct => crate::i18n::tr("No proxy"),
+            ProxyPick::Custom => crate::i18n::tr("This download only"),
+        })
+    }
+}
+
 /// What "when done" should do to the machine — a queue's
 /// [`Schedule::shutdown_when_done`] or a download's
 /// [`DownloadItem::shutdown_after`].
@@ -479,6 +666,18 @@ pub struct Settings {
     pub capture_browsers: Vec<(String, bool)>,
     // File types tab
     pub auto_types: String,
+    /// Whether the model/dataset formats have already been offered to this
+    /// install. See [`seed_ai_formats`] — it is a one-time additive migration,
+    /// and this is what stops it from undoing a user's later edits.
+    ///
+    /// The field-level `default` is load-bearing and NOT redundant with the
+    /// one on the struct: the struct's fills a missing field from
+    /// `Settings::default()`, which says `true` because a fresh config already
+    /// lists these formats. A config written before the flag existed would
+    /// then read as "already seeded" and the migration would never run — the
+    /// exact installs it exists for. Field-level wins, and gives `false`.
+    #[serde(default)]
+    pub ai_formats_seeded: bool,
     pub dont_start_sites: String,
     pub addr_exceptions: Vec<String>,
     pub show_exception_dialog: bool,
@@ -526,13 +725,15 @@ pub struct Settings {
     // Proxy tab
     pub proxy_mode: ProxyMode,
     pub proxy_script: String,
+    /// Address of the manual proxy: a host, or a full `socks5://host:port`
+    /// spec pasted from whatever published it.
     pub proxy_host: String,
     pub proxy_port: String,
     pub proxy_user: String,
     pub proxy_pass: String,
-    pub proxy_http: bool,
-    pub proxy_https: bool,
-    pub proxy_ftp: bool,
+    /// What that address speaks. Configs written before the setting existed
+    /// deserialize as `Http`, which is what they were treated as.
+    pub proxy_type: ProxyType,
     pub ftp_pasv: bool,
     // Sites logins
     pub logins: Vec<SiteLogin>,
@@ -570,11 +771,19 @@ impl Default for Settings {
             hide_from_taskbar: false,
             gpu_render: false,
             monitor_clipboard: false,
-            capture_browsers: ["Apple Safari", "Google Chrome", "Microsoft Edge", "Mozilla Firefox", "Opera"]
-                .iter()
-                .map(|b| (b.to_string(), true))
-                .collect(),
-            auto_types: "3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 DMG EXE GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PKG PPS PPT QT RA RAR RM RMVB SEA SIT SITX TAR TIF TIFF WAV WMA WMV Z ZIP".into(),
+            capture_browsers: [
+                "Apple Safari",
+                "Google Chrome",
+                "Microsoft Edge",
+                "Mozilla Firefox",
+                "Opera",
+            ]
+            .iter()
+            .map(|b| (b.to_string(), true))
+            .collect(),
+            auto_types: default_auto_types(),
+            // A fresh config already has them, so there is nothing to add.
+            ai_formats_seeded: true,
             dont_start_sites: "*.update.microsoft.com download.windowsupdate.com".into(),
             addr_exceptions: vec![],
             show_exception_dialog: true,
@@ -607,9 +816,7 @@ impl Default for Settings {
             proxy_port: String::new(),
             proxy_user: String::new(),
             proxy_pass: String::new(),
-            proxy_http: false,
-            proxy_https: false,
-            proxy_ftp: false,
+            proxy_type: ProxyType::default(),
             ftp_pasv: false,
             logins: vec![],
             sounds: [
@@ -619,7 +826,11 @@ impl Default for Settings {
                 "Queue processing stopped/finished",
             ]
             .iter()
-            .map(|e| SoundRow { event: e.to_string(), enabled: false, file: String::new() })
+            .map(|e| SoundRow {
+                event: e.to_string(),
+                enabled: false,
+                file: String::new(),
+            })
             .collect(),
             theme_mode: None,
             dark_mode: None,
@@ -928,7 +1139,62 @@ pub fn load_config() -> ConfigFile {
         cfg.settings = Settings::default();
     }
     migrate_theme_mode(&mut cfg.settings);
+    seed_ai_formats(&mut cfg);
     cfg
+}
+
+/// Add the model and dataset formats to an install that predates them.
+///
+/// Changing the DEFAULTS only ever reaches a fresh install: `auto_types` and
+/// the category list are both written to `config.toml` in full, so an existing
+/// user would never see the new formats no matter what the defaults said.
+///
+/// Additive and one-time. It appends the types the list does not already have
+/// and adds the category if it is absent, then records that it has run — so a
+/// user who afterwards trims the list or deletes the category does not find
+/// either restored on the next launch.
+fn seed_ai_formats(cfg: &mut ConfigFile) {
+    if cfg.settings.ai_formats_seeded {
+        return;
+    }
+    cfg.settings.ai_formats_seeded = true;
+
+    let listed: std::collections::HashSet<String> = cfg
+        .settings
+        .auto_types
+        .split_whitespace()
+        .map(|t| t.to_ascii_uppercase())
+        .collect();
+    let missing: Vec<&str> = AI_TYPES
+        .iter()
+        .copied()
+        .filter(|t| !listed.contains(*t))
+        .collect();
+    if !missing.is_empty() {
+        // Appended rather than merged and re-sorted: the field is a set, and
+        // rewriting the order a user typed is not this migration's business.
+        let sep = if cfg.settings.auto_types.trim().is_empty() {
+            ""
+        } else {
+            " "
+        };
+        cfg.settings.auto_types = format!(
+            "{}{sep}{}",
+            cfg.settings.auto_types.trim_end(),
+            missing.join(" ")
+        );
+    }
+    if !cfg.categories.iter().any(|c| c.name == AI_CATEGORY) {
+        cfg.categories.push(CategoryDef {
+            name: AI_CATEGORY.into(),
+            exts: AI_TYPES.iter().map(|e| e.to_ascii_lowercase()).collect(),
+            dir: sub(AI_CATEGORY),
+        });
+    }
+    crate::log::info(&format!(
+        "config: seeded {} model/dataset formats",
+        missing.len()
+    ));
 }
 
 /// View > Theme replaced the Dark Mode checkbox: a config written before it
@@ -1098,7 +1364,178 @@ pub fn save_quota(q: &DlQuota) {
 
 #[cfg(test)]
 mod tests {
+    /// The load-bearing half of the migration flag.
+    ///
+    /// `Settings` carries `#[serde(default)]`, which fills a missing field
+    /// from `Settings::default()` — and that says `true`, because a fresh
+    /// config already lists the model formats. Without the field's OWN
+    /// `#[serde(default)]` an upgraded install would read as "already seeded"
+    /// and never receive them, which is the only case the migration exists for.
+    #[test]
+    fn a_config_written_before_the_flag_reads_as_unseeded() {
+        let old: Settings = toml::from_str("font_size = 13").expect("parse");
+        assert!(!old.ai_formats_seeded, "an old config must still be seeded");
+        assert!(
+            Settings::default().ai_formats_seeded,
+            "a fresh one must not"
+        );
+    }
+
+    fn legacy_config() -> ConfigFile {
+        let mut cfg = ConfigFile {
+            settings: Settings {
+                auto_types: "ZIP EXE MP4".into(),
+                ai_formats_seeded: false,
+                ..Settings::default()
+            },
+            categories: default_categories(),
+            ..ConfigFile::default()
+        };
+        cfg.categories.retain(|c| c.name != AI_CATEGORY);
+        cfg
+    }
+
+    #[test]
+    fn the_model_formats_reach_an_install_that_predates_them() {
+        let mut cfg = legacy_config();
+        seed_ai_formats(&mut cfg);
+
+        let listed: Vec<&str> = cfg.settings.auto_types.split_whitespace().collect();
+        for want in ["SAFETENSORS", "GGUF", "H5", "PQ", "PARQUET", "ONNX"] {
+            assert!(listed.contains(&want), "{want} missing from {listed:?}");
+        }
+        // What was already there survives.
+        for kept in ["ZIP", "EXE", "MP4"] {
+            assert!(listed.contains(&kept), "{kept} was dropped");
+        }
+        assert!(cfg.categories.iter().any(|c| c.name == AI_CATEGORY));
+        assert!(cfg.settings.ai_formats_seeded);
+    }
+
+    #[test]
+    fn seeding_twice_changes_nothing_the_second_time() {
+        let mut cfg = legacy_config();
+        seed_ai_formats(&mut cfg);
+        let once = cfg.clone();
+        seed_ai_formats(&mut cfg);
+        assert_eq!(cfg.settings.auto_types, once.settings.auto_types);
+        assert_eq!(cfg.categories.len(), once.categories.len());
+    }
+
+    /// The flag's real job: a user who trims the list afterwards keeps it
+    /// trimmed. Restoring it on every launch would make the setting unusable.
+    #[test]
+    fn a_later_edit_is_not_undone_on_the_next_launch() {
+        let mut cfg = legacy_config();
+        seed_ai_formats(&mut cfg);
+        cfg.settings.auto_types = "ZIP".into();
+        cfg.categories.retain(|c| c.name != AI_CATEGORY);
+        seed_ai_formats(&mut cfg);
+        assert_eq!(cfg.settings.auto_types, "ZIP");
+        assert!(!cfg.categories.iter().any(|c| c.name == AI_CATEGORY));
+    }
+
+    #[test]
+    fn a_type_already_listed_is_not_added_twice() {
+        let mut cfg = legacy_config();
+        // Lower case, because the list is matched case-insensitively.
+        cfg.settings.auto_types = "zip safetensors".into();
+        seed_ai_formats(&mut cfg);
+        let n = cfg
+            .settings
+            .auto_types
+            .split_whitespace()
+            .filter(|t| t.eq_ignore_ascii_case("safetensors"))
+            .count();
+        assert_eq!(n, 1, "in {:?}", cfg.settings.auto_types);
+    }
+
+    #[test]
+    fn model_and_dataset_files_land_in_the_ai_category() {
+        let cats = default_categories();
+        for f in [
+            "model.safetensors",
+            "llama-3-8b.Q4_K_M.gguf",
+            "TEP_Mode1.h5",
+            "train.parquet",
+            "shard.pq",
+            "net.onnx",
+            "weights.ckpt",
+        ] {
+            assert_eq!(
+                categorize(f, &cats).as_deref(),
+                Some(AI_CATEGORY),
+                "{f} was filed wrong"
+            );
+        }
+        // The formats deliberately left out stay where they were.
+        assert_eq!(
+            categorize("export.csv", &cats).as_deref(),
+            Some("Documents")
+        );
+    }
+
     use super::*;
+
+    /// The Options picker lists `ProxyType::ALL` and routing reads
+    /// `scheme()`: a type missing from either is a protocol the user can
+    /// never choose, or one that resolves as something else.
+    #[test]
+    fn every_proxy_type_is_offered_and_names_its_own_scheme() {
+        assert_eq!(ProxyType::ALL.len(), 4);
+        for t in ProxyType::ALL {
+            let spec = format!("{}://127.0.0.1:1080", t.scheme());
+            let px = hya_net::Proxy::parse(&spec).expect("a scheme the transport knows");
+            assert_eq!(px.kind.as_str(), t.scheme());
+            assert!(
+                t.to_string().eq_ignore_ascii_case(t.scheme()),
+                "the label and the scheme must name the same protocol: {t}"
+            );
+        }
+    }
+
+    /// The dialogs hold a picker and an address box; the item holds one
+    /// value. Round-tripping between them must not lose the address when the
+    /// picker moves off "this download only" and back.
+    #[test]
+    fn a_per_download_proxy_round_trips_between_the_dialog_and_the_item() {
+        let own = ProxyChoice::Custom("socks5://127.0.0.1:10808".into());
+        assert_eq!(own.pick(), ProxyPick::Custom);
+        assert_eq!(own.spec(), "socks5://127.0.0.1:10808");
+        assert_eq!(ProxyChoice::from_parts(own.pick(), own.spec()), own);
+
+        // The other two carry no address, whatever is still in the box.
+        assert_eq!(
+            ProxyChoice::from_parts(ProxyPick::Default, "socks5://h:1"),
+            ProxyChoice::Default
+        );
+        assert_eq!(
+            ProxyChoice::from_parts(ProxyPick::Direct, "socks5://h:1"),
+            ProxyChoice::Direct
+        );
+        assert_eq!(ProxyChoice::default().spec(), "");
+        assert_eq!(ProxyChoice::Direct.pick(), ProxyPick::Direct);
+    }
+
+    /// A config written before the proxy settings worked must still load, and
+    /// must not silently acquire a proxy: the keys it carries are gone, and
+    /// the ones that replaced them default to "no proxy".
+    #[test]
+    fn a_config_from_before_the_proxy_settings_worked_still_loads() {
+        let old = r#"
+            proxy_mode = "Manual"
+            proxy_host = "127.0.0.1"
+            proxy_port = "10808"
+            proxy_http = true
+            proxy_https = false
+            proxy_ftp = false
+            font_size = 13
+        "#;
+        let s: Settings = toml::from_str(old).expect("an old config still parses");
+        assert_eq!(s.proxy_mode, ProxyMode::Manual);
+        assert_eq!(s.proxy_host, "127.0.0.1");
+        assert_eq!(s.proxy_type, ProxyType::Http);
+    }
 
     #[test]
     fn a_new_queue_gets_a_colour_no_other_queue_has() {

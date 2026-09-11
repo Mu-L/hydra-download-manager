@@ -6,11 +6,12 @@
 //! progress by connections" strip, and the per-connection table.
 
 use crate::app::{App, El, Message, ProgTab, ScanState};
-use crate::model::{DlState, DownloadItem, PowerAction};
+use crate::model::{DlState, DownloadItem, PowerAction, ProxyPick};
 use crate::windows::{dlg_btn, dlg_btn_primary};
 use crate::{fmt, i18n::tr, theme};
 use iced::widget::{
-    button, checkbox, column, container, progress_bar, radio, row, scrollable, text, text_input,
+    button, checkbox, column, container, pick_list, progress_bar, radio, row, scrollable, text,
+    text_input,
 };
 use iced::Length;
 
@@ -115,6 +116,100 @@ fn status_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
     ]
     .spacing(7)
     .into()
+}
+
+/// The route this download takes, changeable here while it is stopped.
+///
+/// Only while it is stopped: a running transfer holds connections that were
+/// opened through the proxy in force when it started, and moving an open
+/// socket to another proxy is not something TCP offers. Pause and Start apply
+/// the new route to the same bytes, which is why the tab says which button to
+/// press rather than greying the row out with no explanation.
+fn proxy_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
+    let p = app.prog.get(&d.id).cloned().unwrap_or_default();
+    let running = d.state.is_active();
+    let id = d.id;
+    let label = text(tr("Proxy for this download"))
+        .size(theme::FONT_SIZE)
+        .width(170.0);
+    // While it runs the row REPORTS instead of offering: a picker that
+    // accepts a click it cannot act on is the same broken promise as a
+    // setting that never reaches the transport.
+    let mut r = if running {
+        row![
+            label,
+            text(match p.proxy_pick {
+                ProxyPick::Custom => p.proxy_spec.clone(),
+                other => other.to_string(),
+            })
+            .size(theme::FONT_SIZE),
+        ]
+    } else {
+        row![
+            label,
+            pick_list(&ProxyPick::ALL[..], Some(p.proxy_pick), move |v| {
+                Message::ProgProxyPick(id, v)
+            })
+            .text_size(theme::FONT_SIZE)
+            .style(theme::picker)
+            .width(170.0),
+        ]
+    }
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+    if !running && p.proxy_pick == ProxyPick::Custom {
+        r = r.push(
+            text_input("socks5://127.0.0.1:10808", &p.proxy_spec)
+                .on_input(move |v| Message::ProgProxySpec(id, v))
+                .size(theme::FONT_SIZE)
+                .style(theme::input)
+                .width(Length::Fill),
+        );
+    }
+    let mut col = column![r].spacing(6);
+    if let Some(why) = proxy_problem(&p).filter(|_| !running) {
+        col = col.push(
+            text(why)
+                .size(theme::FONT_SIZE - 1.0)
+                .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B)),
+        );
+    }
+    // What "Default" actually resolves to right now. A proxy tab that only
+    // repeats the word "default" cannot answer the question people arrive
+    // here with — whether the app can see the proxy they configured.
+    if p.proxy_pick == ProxyPick::Default {
+        col = col.push(
+            text(
+                tr("Options > Proxy/Socks currently uses: {route}")
+                    .replace("{route}", &crate::proxy::active().describe()),
+            )
+            .size(theme::FONT_SIZE - 1.0)
+            .color(theme::dim_text(&iced::Theme::Light)),
+        );
+    }
+    col = col.push(
+        text(if running {
+            tr(
+                "Pause the download to change its proxy; Start applies the new route to the \
+                bytes already on disk.",
+            )
+        } else {
+            tr(
+                "A SOCKS proxy carries every download; an HTTP proxy carries HTTP and HTTPS, \
+                but not FTP.",
+            )
+        })
+        .size(theme::FONT_SIZE - 1.0)
+        .color(theme::dim_text(&iced::Theme::Light)),
+    );
+    col.into()
+}
+
+/// Why the address in the row is not a proxy, or `None` when it is one, when
+/// none is being asked for, or when the box is still empty — an address not
+/// yet typed is not a mistake to point at in red.
+fn proxy_problem(p: &crate::app::ProgState) -> Option<String> {
+    crate::proxy::typed_spec_error(p.proxy_pick, &p.proxy_spec)
 }
 
 fn speed_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
@@ -436,6 +531,14 @@ pub fn view(app: &App, id: crate::model::DlId) -> El<'_> {
             Message::ProgTabSet(id, ProgTab::Speed),
         ));
     }
+    // No hide-tab switch for this one: the two that have one are the tabs
+    // IDM lets you dismiss, and a route the user cannot find is how the
+    // proxy came to look broken in the first place.
+    tabs = tabs.push(tab_btn(
+        tr("Proxy"),
+        p.tab == ProgTab::Proxy,
+        Message::ProgTabSet(id, ProgTab::Proxy),
+    ));
     if s.show_completion_tab {
         tabs = tabs.push(tab_btn(
             tr("Options on completion"),
@@ -447,6 +550,7 @@ pub fn view(app: &App, id: crate::model::DlId) -> El<'_> {
     let tab_body: El<'_> = match p.tab {
         ProgTab::Status => status_tab(app, d),
         ProgTab::Speed => speed_tab(app, d),
+        ProgTab::Proxy => proxy_tab(app, d),
         ProgTab::Completion => completion_tab(app, d),
     };
 
@@ -573,5 +677,45 @@ pub fn title(app: &App, id: crate::model::DlId) -> String {
             format!("{pct}{}", d.file_name)
         }
         None => "Hydra".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::ProgState;
+
+    /// The progress dialog says why an address is unusable while the
+    /// download is stopped and the box can still be corrected — and says
+    /// nothing about text left in the box under another choice.
+    #[test]
+    fn a_bad_address_is_reported_only_while_it_is_being_asked_for() {
+        let bad = ProgState {
+            proxy_pick: ProxyPick::Custom,
+            proxy_spec: "gopher://p".into(),
+            ..ProgState::default()
+        };
+        assert!(proxy_problem(&bad).is_some());
+        assert_eq!(
+            proxy_problem(&ProgState {
+                proxy_pick: ProxyPick::Direct,
+                ..bad.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            proxy_problem(&ProgState {
+                proxy_spec: "socks5://127.0.0.1:10808".into(),
+                ..bad.clone()
+            }),
+            None
+        );
+        assert_eq!(
+            proxy_problem(&ProgState {
+                proxy_spec: String::new(),
+                ..bad
+            }),
+            None
+        );
     }
 }

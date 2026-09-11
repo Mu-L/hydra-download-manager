@@ -55,6 +55,7 @@ pub mod parity;
 pub mod polite;
 pub mod redirect;
 pub mod scheme;
+pub mod signed;
 pub mod socks;
 pub mod stream_digest;
 pub mod tls;
@@ -197,10 +198,35 @@ impl Target {
     }
 
     /// The request-target for the start line, and the `Host` header value.
-    fn request_target(&self) -> (String, &str) {
+    fn request_target(&self) -> (String, std::borrow::Cow<'_, str>) {
         match &self.origin {
-            Some(o) => (format!("http://{}{}", o, self.path), o.as_str()),
-            None => (self.path.clone(), self.host.as_str()),
+            Some(o) => (
+                format!("http://{}{}", o, self.path),
+                std::borrow::Cow::Borrowed(o.as_str()),
+            ),
+            None => (self.path.clone(), self.authority()),
+        }
+    }
+
+    /// The `Host:` value for a direct request: the name, plus the port whenever
+    /// it is not the scheme's default.
+    ///
+    /// RFC 9110 §7.2 requires the port here, and omitting it is not cosmetic.
+    /// An AWS SigV4 presigned URL signs `host` as part of the canonical
+    /// request, so a signature minted for `s3q.ait.dtu.dk:9000` is rejected
+    /// outright when the request arrives claiming `s3q.ait.dtu.dk` —
+    /// `SignatureDoesNotMatch`, on a URL that is perfectly valid and that curl
+    /// fetches from the same machine a second later. Any object store on a
+    /// non-default port was unreachable because of this.
+    ///
+    /// Borrowed in the common case: the default port is the overwhelming
+    /// majority, and this runs once per request head.
+    fn authority(&self) -> std::borrow::Cow<'_, str> {
+        let default = if self.tls { 443 } else { 80 };
+        if self.port == default {
+            std::borrow::Cow::Borrowed(self.host.as_str())
+        } else {
+            std::borrow::Cow::Owned(format!("{}:{}", self.host, self.port))
         }
     }
 }
