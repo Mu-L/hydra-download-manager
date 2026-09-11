@@ -11,9 +11,11 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File set-user-path.ps1 -Action Append -Dir "C:\some\dir"
 #   powershell -NoProfile -ExecutionPolicy Bypass -File set-user-path.ps1 -Action Remove -Dir "C:\some\dir"
 #
-# The directory is matched case-insensitively and without trailing
-# backslashes, in either direction: appending a directory that is already
-# present in another spelling is a no-op rather than a duplicate.
+# The change is minimal by design: anything already in the value keeps its
+# position and spelling. Append is a no-op when the directory is present in
+# any spelling (case, quoting, trailing backslash); Remove is a no-op when it
+# is absent. Running processes are notified by the installer itself (a plain
+# SendMessage there) rather than from here, so this script needs no Add-Type.
 #
 # Exit codes: 0 = the PATH is in the wanted state (written or already was),
 # 1 = something failed and nothing was written.
@@ -24,10 +26,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$key = $null
 try {
   if ([string]::IsNullOrWhiteSpace($Dir)) { exit 1 }
 
-  $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+  # CreateSubKey, not OpenSubKey: an absent Environment key is created for
+  # writing, mirroring what WriteRegExpandStr did.
+  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
   if (-not $key) { exit 1 }
 
   # Read the raw value unexpanded so %VAR% entries round-trip unchanged, and
@@ -38,31 +43,38 @@ try {
   $kind = [Microsoft.Win32.RegistryValueKind]::ExpandString
   try { $kind = $key.GetValueKind('Path') } catch { }
 
-  $dirNorm = $Dir.TrimEnd('\').ToLowerInvariant()
+  $dirNorm = $Dir.Trim().Trim('"').TrimEnd('\').ToLowerInvariant()
   $entries = @()
   if ($current -ne '') {
-    $entries = @($current -split ';' | Where-Object { $_ -ne '' })
+    $entries = @($current -split ';' | Where-Object { $_.Trim() -ne '' })
   }
-  $kept = @($entries | Where-Object { $_.TrimEnd('\').ToLowerInvariant() -ne $dirNorm })
-  if ($Action -eq 'Append') { $kept += $Dir }
 
-  $new = ($kept -join ';')
-  if ($new -eq $current) { exit 0 }
+  $present = $entries | Where-Object {
+    $_.Trim().Trim('"').TrimEnd('\').ToLowerInvariant() -eq $dirNorm
+  }
+
+  if ($Action -eq 'Append') {
+    # Already present in any spelling: keep the user's own ordering and
+    # formatting untouched rather than rewriting the value.
+    if ($present) { exit 0 }
+    $new = if ($current -ne '') {
+      if ($current.EndsWith(';')) { "$current$Dir" } else { "$current;$Dir" }
+    } else {
+      $Dir
+    }
+  } else {
+    # Not present: nothing to remove, leave the value exactly as it is.
+    if (-not $present) { exit 0 }
+    $kept = @($entries | Where-Object {
+      $_.Trim().Trim('"').TrimEnd('\').ToLowerInvariant() -ne $dirNorm
+    })
+    $new = ($kept -join ';')
+  }
 
   $key.SetValue('Path', $new, $kind)
-
-  # Registry writes do not notify running processes. Tell Explorer and friends
-  # so newly started shells pick the change up without a logoff; failures
-  # here must not turn a successful write into a reported error.
-  try {
-    Add-Type -Namespace Win32 -Name HydraPathBroadcast -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
-public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);
-'@
-    $smResult = [UIntPtr]::Zero
-    [Win32.HydraPathBroadcast]::SendMessageTimeout([IntPtr]0xFFFF, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$smResult) | Out-Null
-  } catch { }
 } catch {
   exit 1
+} finally {
+  if ($key) { $key.Close() }
 }
 exit 0
