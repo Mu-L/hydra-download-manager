@@ -135,8 +135,6 @@ VIAddVersionKey "LegalCopyright"  "(C) 2026 ${PUBLISHER}. GPL-3.0-or-later."
 !include "StrFunc.nsh"
 !include "Sections.nsh"
 ${Using:StrFunc} StrRep
-${Using:StrFunc} StrStr
-${Using:StrFunc} UnStrRep
 
 ;--------------------------------
 ; UI
@@ -252,21 +250,41 @@ Section "Command-Line Tool (hydra, hya) + PATH" SEC_CLI
 
   ; Append $INSTDIR to the per-user PATH (HKCU\Environment) so `hydra`,
   ; `hydra-gui`, and `hydra-host` resolve in cmd, PowerShell, and any
-  ; terminal. REG_EXPAND_SZ so pre-existing %VAR% entries keep expanding.
-  ReadRegStr $0 HKCU "Environment" "Path"
-  ${StrStr} $1 "$0" "$INSTDIR"
-  StrCmp $1 "" 0 path_done          ; already present -> skip
-  StrCmp $0 "" 0 path_append
-  StrCpy $0 "$INSTDIR"              ; PATH was empty/absent
-  Goto path_write
-path_append:
-  StrCpy $0 "$0;$INSTDIR"
-path_write:
-  WriteRegExpandStr HKCU "Environment" "Path" $0
+  ; terminal.
+  ;
+  ; The read/modify/write runs in PowerShell rather than ReadRegStr +
+  ; WriteRegExpandStr here: NSIS runtime strings cap at NSIS_MAX_STRLEN
+  ; (1024 characters in official builds), so a longer PATH reads back EMPTY
+  ; and this block used to take its "PATH was empty" branch and REPLACE the
+  ; whole value with $INSTDIR, wiping every existing entry (the uninstaller
+  ; correspondingly wrote an empty PATH). The helper script uses .NET
+  ; registry APIs, which have no length limit, keep %VAR% entries
+  ; unexpanded, and write back in the value's original REG_EXPAND_SZ kind.
+  ; If PowerShell cannot start, the step is skipped: a missing PATH entry
+  ; is recoverable, a wiped PATH is not.
+  ;
+  ; nsExec::Exec (not ExecToStack) pushes a single value, and comparing it
+  ; as a string keeps "error"/"timeout" from being mistaken for success.
+  ; The environment-change broadcast is done here on success, so the
+  ; helper needs no Add-Type (no csc.exe round trip, and it stays usable
+  ; under ConstrainedLanguage mode).
+  StrCpy $0 "$INSTDIR" "" -1        ; normalize $INSTDIR: drop a trailing
+  StrCmp $0 "\" 0 +3                ; backslash so the helper sees the same
+  StrCpy $0 "$INSTDIR" -1           ; spelling the uninstaller will strip
+  Goto +2
+  StrCpy $0 "$INSTDIR"
+  InitPluginsDir
+  File "/oname=$PLUGINSDIR\set-user-path.ps1" "set-user-path.ps1"
+  nsExec::Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\set-user-path.ps1" -Action Append -Dir "$0"'
+  Pop $0
+  StrCmp $0 "0" 0 ps_path_skip
   ; Tell running shells/Explorer the environment changed; new terminals
   ; pick it up immediately, already-open ones still need a restart.
   SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
-path_done:
+  Goto ps_path_done
+ps_path_skip:
+  DetailPrint "user PATH not updated (set-user-path.ps1 exit $0)"
+ps_path_done:
 SectionEnd
 
 Section "Browser Extensions" SEC_EXT
@@ -423,13 +441,26 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\Vivaldi\NativeMessagingHosts\${HOST_NAME}"
   DeleteRegKey HKCU "Software\Mozilla\NativeMessagingHosts\${HOST_NAME}"
 
-  ; Strip $INSTDIR out of the per-user PATH (all three separator shapes).
-  ReadRegStr $0 HKCU "Environment" "Path"
-  ${UnStrRep} $0 "$0" ";$INSTDIR" ""
-  ${UnStrRep} $0 "$0" "$INSTDIR;" ""
-  ${UnStrRep} $0 "$0" "$INSTDIR"  ""
-  WriteRegExpandStr HKCU "Environment" "Path" $0
+  ; Strip $INSTDIR out of the per-user PATH. Same PowerShell helper as the
+  ; installer: with NSIS_MAX_STRLEN at 1024, a longer PATH reads back empty
+  ; and writing it out here used to wipe the whole value. nsExec::Exec
+  ; pushes a single value, compared as a string so "error"/"timeout" cannot
+  ; pass for success; the broadcast runs here on success.
+  StrCpy $0 "$INSTDIR" "" -1        ; normalize $INSTDIR: drop a trailing
+  StrCmp $0 "\" 0 +3                ; backslash so both directions see the
+  StrCpy $0 "$INSTDIR" -1           ; same spelling
+  Goto +2
+  StrCpy $0 "$INSTDIR"
+  InitPluginsDir
+  File "/oname=$PLUGINSDIR\set-user-path.ps1" "set-user-path.ps1"
+  nsExec::Exec '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\set-user-path.ps1" -Action Remove -Dir "$0"'
+  Pop $0
+  StrCmp $0 "0" 0 ps_unpath_skip
   SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  Goto ps_unpath_done
+ps_unpath_skip:
+  DetailPrint "user PATH not updated (set-user-path.ps1 exit $0)"
+ps_unpath_done:
 
   Delete "$INSTDIR\hydra-gui.exe"
   Delete "$INSTDIR\hydra.exe"
