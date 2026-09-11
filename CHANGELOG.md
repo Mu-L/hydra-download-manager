@@ -5,6 +5,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.4.4] - 2026-09-11
+
+### Added
+
+- **Per-Download & Global Proxy Routing Engine (`hydra-gui`, `hya-net`)**:
+  - Connected the application-wide proxy configuration (*Options → Proxy/Socks*) to actual network transfers across single-file downloads, segmented multi-connection transfers, media stream sniffing, and link probes.
+  - Implemented a dedicated `Route` manager in `hydra-gui::proxy`: routes SOCKS proxies (`socks4`, `socks5`, `socks5h`) at the transport connector level via `TlsCapableConnector::with_socks` and routes HTTP forward proxies per-request using absolute URI targets or TLS `CONNECT` tunnels.
+  - Added per-download proxy configuration in the *Download File Info* dialog, allowing users to choose between *Default (from Options)*, *None (direct connection)*, or *Custom proxy...* (`socks5://...`, `http://...`) for individual downloads without altering global settings.
+  - Added live inline validation in the *Download File Info* dialog to report syntax and configuration errors for custom proxy addresses prior to starting downloads.
+  - Implemented live reload: updating proxy settings in the Options dialog immediately takes effect for all subsequent network transfers without requiring an application restart.
+  - Synchronized proxy UI settings and validation messages across all 30 supported languages.
+- **Expiring Signed URL Detection & Automatic Re-Resolution (`hya-net::signed`, `extensions/`, Chrome, Firefox, Safari)**:
+  - Added short-lived signed URL detection in `hya_net::signed` supporting AWS SigV4 (`X-Amz-Date` and `X-Amz-Expires`), CloudFront, and Google Cloud Storage signed URLs (`Expires` epoch timestamp).
+  - Updated browser extensions (`v0.3.4`) to inspect resolved URLs: if a signed URL has a short expiration window (within 1 hour, or as brief as 10 seconds), the extension forwards the original redirecting page URL alongside session cookies to Hydra instead of the ephemeral signed link.
+  - Enables downloads to reliably refresh and mint fresh signatures on retries, pause/resume, or reconnection rather than permanently failing with HTTP 403 Forbidden or 410 Gone when credentials expire.
+- **WAF & Bot Challenge Detection and Retry Handling (`hya-net::http`, `hydra-cli`)**:
+  - Enhanced probe and transfer validation (`Probe::refusal`) to detect bot challenges (such as AWS WAF returning HTTP 202 Accepted with empty content lengths) and prevent them from being mistaken for valid 0-byte file downloads.
+  - Added automatic server error detail extraction: parses and extracts human-readable failure explanations directly from XML and short response bodies (such as S3 `<Message>Request has expired</Message>`) instead of presenting generic HTTP status codes.
+  - Added automatic challenge retry handling in `hydra-net` prior to refusing links.
+- **Multi-Distribution Ubuntu PPA Support (`packaging/debian/`, `.github/workflows/release.yml`)**:
+  - Expanded Launchpad PPA packaging and release workflows to build and publish source packages for multiple Ubuntu distributions (including Ubuntu 24.04 Noble, 22.04 Jammy, and 20.04 Focal).
+
+### Fixed
+
+- **NSIS Installer & Uninstaller User PATH Protection (`scripts/windows/hydra-installer.nsi`, `scripts/windows/set-user-path.ps1`)**:
+  - Fixed a critical regression on Windows where the NSIS installer or uninstaller wiped the per-user `PATH` environment variable if the existing `PATH` exceeded the 1024-character `NSIS_MAX_STRLEN` limit.
+  - Replaced native NSIS string operations with a companion PowerShell helper script (`set-user-path.ps1`) utilizing .NET registry APIs without string length constraints.
+  - Preserves unexpanded `%VAR%` references (`REG_EXPAND_SZ`), retains existing entry casing and ordering, performs idempotent directory addition and removal, and broadcasts `WM_SETTINGCHANGE` so running shells and Windows Explorer immediately update their environment without requiring user logoff.
+- **Native Messaging Host Breakaway & GUI Capture Lifecycles (`crates/hydra-host`, `crates/hydra-gui`, `extensions/`)**:
+  - Fixed captured browser downloads aborting when Hydra GUI is launched on demand by the native messaging host on Windows. Browsers run native messaging hosts inside Windows Job Objects and terminate all processes in the job when the host exits after answering `sendNativeMessage`.
+  - Configured `hydra-host` to launch `hydra-gui` using `CREATE_BREAKAWAY_FROM_JOB` (falling back gracefully if breakaway is restricted) so the desktop GUI process outlives the host.
+  - Updated `extbus` so download capture is acknowledged only after the UI thread has successfully placed the item into the download list; if unreachable, the download is handed back to the browser to resume untouched.
+  - Configured panic hooks in GUI builds to write complete backtraces to `gui.log` when standard I/O streams are detached.
+  - Added automated test suites covering native messaging framing, IPC lock handling, and GUI process launch.
+- **Gecko / Firefox Irreversible Download Pause (`extensions/`, Chrome, Firefox, Safari)**:
+  - Stopped parking downloads on Gecko (Firefox), where `downloads.pause()` cannot be undone programmatically, allowing downloads to remain active during capture evaluation and gracefully resume in the browser if Hydra does not accept the transfer.
+  - Added service worker console debugging in browser extensions detailing why downloads are bypassed or handed back to the browser.
+- **False-Positive Existing File Warnings on Browser Captures (`crates/hydra-gui`)**:
+  - Fixed the Add Download dialog erroneously reporting "A file with this name already exists" when capturing downloads from Firefox.
+  - Firefox creates a 0-byte file placeholder under the final filename while actively writing data to an adjacent `.part` file; updated `collision_file` to ignore empty files, preventing false collision warnings for browser reservations that are deleted once Hydra assumes the transfer.
+- **UI Font Ratio Double-Scaling & Display Boundary Clamping (`crates/hydra-gui`)**:
+  - Fixed an issue where saved window dimensions in OS points were scaled by the UI font ratio twice upon relaunch, causing windows to expand on every start until exceeding bounds and resetting.
+  - Added `fit_to_display` logic to clamp fixed-size secondary dialogs (Configuration, Scheduler, Batch Download, Progress) to usable display bounds across high-DPI screens and custom font scales, preventing action buttons (OK/Cancel) from being pushed off-screen.
+- **Start Progress Dialog Minimized Setting (`crates/hydra-gui`)**:
+  - Fixed the *"Start download progress dialog minimized"* setting being ignored when starting downloads manually.
+  - Deferred window minimization to the `WindowOpened` event when the native window handle is valid, and prevented subsequent focus acquisition from unminimizing the progress window.
+- **Download File Info & File Properties Layout Refinements (`crates/hydra-gui`)**:
+  - Reorganized the *Download File Info* and *File Properties* dialog layout:
+    - Grouped immutable properties (*Status*, *Size*, *Last try date*, and *Result* error message) into a clean read-only block at the top of the dialog for existing downloads.
+    - Centered the category file-type icon and archive ZIP preview button in the side column alongside input fields.
+    - Moved dialog action buttons to a dedicated footer bar spanning the dialog width, keeping buttons centered relative to the window and eliminating empty margins.
+    - Dynamically computed dialog heights based on rendered rows to prevent control clipping.
+    - Standardized field label colon punctuation across all language localizations.
+- **Windows Installer Extension Version Documentation (`scripts/build-windows-installer.sh`, `scripts/windows/hydra-installer.nsi`)**:
+  - Corrected Windows installer packaging to dynamically populate the actual browser extension version in `INSTALL.txt` during build time.
+
+---
+
 ## [0.4.3] - 2026-09-08
 
 ### Added
