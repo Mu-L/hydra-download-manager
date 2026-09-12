@@ -55,6 +55,7 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
       // off its absence, so a mock that always offers it can only ever test
       // the Chromium half.
       ...(gecko ? {} : { onDeterminingFilename: onDetermining }),
+      download: async (opts) => calls.push(["download", opts.url]),
       pause: async (id) => calls.push(["pause", id]),
       resume: async (id) => calls.push(["resume", id]),
       cancel: async (id) => calls.push(["cancel", id]),
@@ -163,6 +164,27 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
   h.onDetermining.fire(item, () => {}); await tick(6);
   check("alt bypass: nothing is sent to Hydra", !h.sent.some((m) => m.type === "download"));
   check("alt bypass: the browser keeps the download", h.calls.some(([c]) => c === "resume"));
+}
+
+// ------------------------------- 3b. the Gecko stand-in for an Alt+click save
+//
+// `browser.altClickSave` has defaulted to false since Firefox 13, so standing
+// aside on Gecko left the user with no download anywhere. The extension saves
+// the link itself there; `captureEligible` skips its own downloads, so the
+// file cannot bounce straight back into Hydra.
+{
+  const h = build({ gecko: true });
+  await tick(4);
+  await h.send({ type: "alt-download", url: "https://cdn.example/pack.zip" });
+  check("alt stand-in: the browser is asked to download the link",
+    h.calls.some(([c, u]) => c === "download" && u === "https://cdn.example/pack.zip"),
+    JSON.stringify(h.calls));
+  check("alt stand-in: nothing is sent to Hydra", !h.sent.some((m) => m.type === "download"));
+
+  const refused = await h.send({ type: "alt-download", url: "javascript:alert(1)" });
+  check("alt stand-in: a non-http link is refused", refused?.ok === false);
+  check("alt stand-in: and never reaches the downloads API",
+    h.calls.filter(([c]) => c === "download").length === 1, JSON.stringify(h.calls));
 }
 
 // ------------------------------------------------------- 4. excluded site
