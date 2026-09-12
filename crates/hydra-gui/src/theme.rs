@@ -20,10 +20,15 @@ use iced::{Background, Border, Color, Theme};
 /// boxes that would then be the wrong height for it.
 pub const FONT_SIZE: f32 = 13.0;
 
-/// The View > Font entries: the label and the text size it stands for. Both
-/// menu surfaces (`ui::menu` in-window, `macos_menu` native) build their Font
-/// group from this, so the tick lines up with the setting on either.
-pub const FONT_CHOICES: [(&str, u16); 3] = [("Small", 12), ("Medium", 13), ("Large", 15)];
+/// The text sizes View > Font offers, in points. Both menu surfaces
+/// (`ui::menu` in-window, `macos_menu` native) build their Font group from
+/// this, so the tick lines up with the setting on either.
+///
+/// A point value rather than a Small/Medium/Large triple: three presets have
+/// to land on displays from a 1080p laptop to a 4K panel, and the step
+/// between them is the whole complaint — the size a reader wants is usually
+/// one of the ones in between.
+pub const FONT_SIZES: [u16; 11] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
 
 /// The View > Theme entries: the label and the mode it stands for. Both menu
 /// surfaces (`ui::menu` in-window, `macos_menu` native) build their Theme
@@ -35,8 +40,8 @@ pub const THEME_CHOICES: [(&str, ThemeMode); 3] = [
 ];
 
 /// The window scale factor for a View > Font choice: the ratio of the chosen
-/// size to the [`FONT_SIZE`] the layout was drawn at (12 -> 0.92, 13 -> 1.0,
-/// 15 -> 1.15). iced multiplies the whole interface by it, so text, the rows
+/// size to the [`FONT_SIZE`] the layout was drawn at (10 -> 0.77, 13 -> 1.0,
+/// 20 -> 1.54). iced multiplies the whole interface by it, so text, the rows
 /// and buttons around it and the dialogs those sit in all grow together.
 ///
 /// Clamped either side of a factor of two, and a config missing the field
@@ -555,6 +560,20 @@ mod tests {
         assert_eq!(ui_scale(13), 1.0);
         assert!((ui_scale(12) - 12.0 / 13.0).abs() < f32::EPSILON);
         assert!((ui_scale(15) - 15.0 / 13.0).abs() < f32::EPSILON);
+
+        // Every offered size stays inside the clamp and grows with the
+        // number, so no entry in the menu is a no-op or a surprise.
+        let mut previous = 0.0;
+        for size in FONT_SIZES {
+            let scale = ui_scale(size);
+            assert!(scale > previous, "size {size} did not grow the interface");
+            assert!((0.5..=2.0).contains(&scale), "size {size} scales {scale}");
+            previous = scale;
+        }
+        assert!(
+            FONT_SIZES.contains(&(FONT_SIZE as u16)),
+            "the base size is offered"
+        );
         // A config written before the field existed, and hand-edited
         // nonsense, both stay usable.
         assert_eq!(ui_scale(0), 1.0);
