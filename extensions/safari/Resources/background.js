@@ -413,6 +413,8 @@ async function sendToHydra(url, extras = {}) {
   });
 }
 
+// The cheap half of `offerToHydra`'s gates: what can be decided without asking
+// the app anything, which is all parking is allowed to cost.
 function captureEligible(item, state) {
   const url = captureUrl(item);
   return (
@@ -438,12 +440,39 @@ async function parkDownload(item) {
   }
 }
 
+// The gates every capture passes, and the handoff itself. Returns null when
+// Hydra took the transfer, otherwise the reason it was left to the browser.
+//
+// Two callers ask these questions, in this order, about the same transfer at
+// different moments: the Chromium path from a parked DownloadItem, the Gecko
+// path from response headers that have not become a download yet. Only what
+// they do with the answer differs.
+async function offerToHydra({ url, filename, mime, size, referer }) {
+  const state = await getState();
+  if (!state.enabled || !state.guiCapture) return "capture is switched off";
+  if (!/^(https?|ftp):/i.test(url)) return "not an http(s)/ftp download";
+  if (siteSkipped(state.skipSites, url)) return "site is on the skip list";
+  if (await altBypassed()) return "Alt was held down";
+  if (!typeMatches(state.autoTypes, filename, url, mime)) {
+    return (
+      `"${extOf(filename) || extOf(url) || "no extension"}" is not in the ` +
+      `capture list (Options > Downloaded file types)`
+    );
+  }
+  const reply = await sendToHydra(url, {
+    filename: filename ? String(filename).split(/[/\\]/).pop() : null,
+    referer: referer || null,
+    size: size > 0 ? size : null,
+    mime: mime || null,
+  });
+  return reply && reply.ok ? null : "Hydra did not take it";
+}
+
 // `parked` says whether the browser's own download is being held for us, and
 // therefore whether there is anything to hand back. Resuming one that was
 // never parked is not harmless: on Gecko it throws, and the throw used to be
 // swallowed next to a download that had already been cancelled.
 async function decideCapture(item, parked) {
-  const state = await getState();
   const url = captureUrl(item);
 
   // Declining used to be silent, and a download Hydra never sees is then
@@ -459,31 +488,17 @@ async function decideCapture(item, parked) {
     } catch {}
   };
 
-  if (!captureEligible(item, state)) {
-    return giveBack(
-      !state.enabled || !state.guiCapture
-        ? "capture is switched off"
-        : "not an http(s)/ftp download",
-    );
-  }
-  if (siteSkipped(state.skipSites, url)) return giveBack("site is on the skip list");
-  if (await altBypassed()) return giveBack("Alt was held down");
-  if (!typeMatches(state.autoTypes, item.filename, url, item.mime)) {
-    return giveBack(
-      `"${extOf(item.filename) || extOf(url) || "no extension"}" is not in the ` +
-        `capture list (Options > Downloaded file types)`,
-    );
-  }
+  if (item.byExtensionId === chrome.runtime.id) return giveBack("started by this extension");
 
-  const size = item.totalBytes > 0 ? item.totalBytes : item.fileSize > 0 ? item.fileSize : null;
-  const reply = await sendToHydra(url, {
-    filename: item.filename ? item.filename.split(/[/\\]/).pop() : null,
-    referer: item.referrer || null,
-    size,
-    mime: item.mime || null,
+  const why = await offerToHydra({
+    url,
+    filename: item.filename,
+    mime: item.mime,
+    size: item.totalBytes > 0 ? item.totalBytes : item.fileSize,
+    referer: item.referrer,
   });
 
-  if (reply && reply.ok) {
+  if (!why) {
     // Hydra owns it now; drop the browser's copy. Erasing only after the
     // cancel really took: a download that finished before the answer came
     // back is already a file on disk, and erasing its record would leave
@@ -493,9 +508,152 @@ async function decideCapture(item, parked) {
       await chrome.downloads.erase({ id: item.id });
     } catch {}
   } else {
-    // Hydra unreachable: the browser download continues untouched.
-    await giveBack("Hydra did not take it");
+    // A gate turned it away, or Hydra is unreachable: the browser download
+    // continues untouched.
+    await giveBack(why);
   }
+}
+
+// Small key->value notes with a lifetime. The capture paths hand transfers to
+// one another by URL (and redirect chains by request id) across events that
+// fire milliseconds apart; nothing here is worth persisting, and an entry that
+// outlives its transfer must not decide the next one.
+function expiringNotes(ttlMs) {
+  const notes = new Map();
+  return {
+    set(key, value = true) {
+      const now = Date.now();
+      for (const [k, n] of notes) if (n.until <= now) notes.delete(k);
+      notes.set(key, { until: now + ttlMs, value });
+    },
+    get(key) {
+      const n = notes.get(key);
+      return n && n.until > Date.now() ? n.value : undefined;
+    },
+    take(key) {
+      const value = this.get(key);
+      notes.delete(key);
+      return value;
+    },
+  };
+}
+
+// The two capture paths, each standing the other down, in the one direction it
+// can arrive from.
+//
+// A response judged at the header stage and declined, waiting for the download
+// the browser is about to make of it. Read once, then forgotten: clicking the
+// same link again is a new question.
+const headerVerdicts = expiringNotes(15000);
+// The other way round — a download the browser started before its response
+// came back, so the header stage must not offer the same transfer again. That
+// is "Save Link As", a retry from the downloads panel, another add-on, and the
+// Alt bypass's own `downloads.download()`, which cancelling would defeat.
+const browserOwned = expiringNotes(30000);
+// requestId -> the URL the chain started at, so `captureUrl` still has both.
+const redirectOrigins = expiringNotes(60000);
+
+// The request types a browser download can arrive as. An `xmlhttprequest` or
+// an `image` carrying a zip belongs to the page that asked for it — cancelling
+// those breaks the page and creates no download row to begin with.
+const DOWNLOAD_TYPES = ["main_frame", "sub_frame", "object", "other"];
+
+// Content types the browser SHOWS. Cancelling one of these would take a page
+// away from the user, so only what is left — octet-stream, application/zip, a
+// type with no viewer behind it — counts as a download in the making.
+const VIEWABLE_MIME = new Set([
+  "application/pdf",
+  "application/json",
+  "application/xml",
+  "application/xhtml+xml",
+  "application/javascript",
+  "application/x-javascript",
+  "application/ecmascript",
+  "application/wasm",
+  "application/manifest+json",
+]);
+
+function willDownload(headers) {
+  // `attachment` is the server saying so outright, whatever the type is.
+  if (/^\s*attachment\s*(?:;|$)/i.test(headers["content-disposition"] || "")) return true;
+  const mime = (headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+  // No type at all means the browser sniffs for one, and we would be guessing
+  // against it. Let it through; `downloads.onCreated` still sees the result.
+  if (!mime) return false;
+  return !/^(?:text|image|audio|video|font)\//i.test(mime) && !VIEWABLE_MIME.has(mime);
+}
+
+// Just enough of RFC 6266 to get a name — and through it an extension — out of
+// a Content-Disposition. The encoded form wins where a server sends both,
+// which is the order browsers read them in.
+function dispositionName(disp) {
+  const encoded = /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i.exec(disp || "");
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded[1].trim());
+    } catch {
+      // Malformed percent-escapes: fall through to the plain parameter.
+    }
+  }
+  const plain = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(disp || "");
+  const name = plain && (plain[1] ?? plain[2]).trim();
+  return name || null;
+}
+
+// A download link with target="_blank" opens a tab first, and the browser
+// closes that tab itself once the response turns out to be a download. A
+// response we cancelled never reaches that point, so the blank tab is ours to
+// clean up. An opener and a URL that never committed are what separate it from
+// the tab a plain link click navigates, which must be left alone.
+async function closeBlankTab(tabId) {
+  if (tabId == null || tabId < 0) return;
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.openerTabId != null && (!tab.url || tab.url === "about:blank")) {
+      await chrome.tabs.remove(tabId);
+    }
+  } catch {
+    // Already gone, or not ours to close.
+  }
+}
+
+/// Gecko's capture point: a response that is ABOUT to become a download.
+///
+/// Cancelling here leaves nothing behind — no bytes fetched past the headers,
+/// and no "Canceled" row in the browser's download list, which is what handing
+/// a file to Hydra used to cost on Firefox. Blocking a response to decide
+/// costs the round-trip to the app, paid only on transfers that were going to
+/// be downloads anyway. Chromium has no blocking webRequest under MV3 and
+/// needs none: it can park a download and hand it back intact.
+function interceptResponse(details) {
+  const headers = Object.fromEntries(
+    (details.responseHeaders || []).map((h) => [h.name.toLowerCase(), h.value]),
+  );
+  if (!willDownload(headers)) return;
+  if (browserOwned.get(details.url) !== undefined) return;
+
+  // The same choice `decideCapture` makes, given the same two URLs: a resolved
+  // URL that is a short-lived signature is dead by Hydra's first retry, and
+  // the link that minted it is not.
+  const url = captureUrl({ url: redirectOrigins.get(details.requestId), finalUrl: details.url });
+
+  return offerToHydra({
+    url,
+    filename: dispositionName(headers["content-disposition"]),
+    mime: (headers["content-type"] || "").split(";")[0].trim(),
+    size: parseInt(headers["content-length"] || "", 10),
+    referer: details.originUrl || details.documentUrl || null,
+  }).then((why) => {
+    if (!why) {
+      if (details.type === "main_frame") closeBlankTab(details.tabId);
+      return { cancel: true };
+    }
+    console.debug(`hydra: left to the browser (${why}) — ${url}`);
+    // Keyed by the RESOLVED url, which is what a DownloadItem reports as its
+    // own, so the download this response becomes can find the answer.
+    headerVerdicts.set(details.url);
+    return {};
+  });
 }
 
 // Looked up by name rather than written as a property access: the event is
@@ -518,14 +676,32 @@ if (onDeterminingFilename) {
   // which needs `hasPartialData` — false for a download still at byte 0.
   // Parking on creation is therefore a one-way trip: every download we
   // then handed back (the wrong file type, a skipped site, Hydra saying
-  // no) stayed "Canceled" forever, and the failed resume was swallowed.
+  // no) would stay "Canceled" forever.
   //
-  // So the browser keeps its own transfer running while we decide. It is
-  // only cancelled once Hydra has actually taken the file, and a refusal
-  // costs nothing but the seconds of bytes the browser had already
-  // fetched. `filename` is resolved on the create event here, so the whole
-  // decision can be made from it.
-  chrome.downloads.onCreated.addListener((item) => decideCapture(item, false));
+  // So the decision is made one step earlier instead, off the response
+  // headers, before a download exists at all (`interceptResponse` above).
+  // This listener is the net under that: a transfer that never passed
+  // through a response we were shown — a retry from the downloads panel,
+  // a `downloads.download()` from another add-on — still gets offered,
+  // and pays the cancelled row for it.
+  chrome.downloads.onCreated.addListener((item) => {
+    const url = item.finalUrl || item.url;
+    // Answered already at the header stage — asking again could reach an app
+    // that the first ask has just LAUNCHED, and that second answer is the
+    // cancelled row this whole path exists to avoid.
+    if (headerVerdicts.take(url) !== undefined) return;
+    browserOwned.set(url);
+    decideCapture(item, false);
+  });
+  const filter = { urls: ["http://*/*", "https://*/*"], types: DOWNLOAD_TYPES };
+  chrome.webRequest?.onBeforeRedirect?.addListener((d) => {
+    // First hop wins: what we want is the link the user actually followed.
+    if (redirectOrigins.get(d.requestId) === undefined) redirectOrigins.set(d.requestId, d.url);
+  }, filter);
+  chrome.webRequest?.onHeadersReceived?.addListener(interceptResponse, filter, [
+    "blocking",
+    "responseHeaders",
+  ]);
 }
 // Safari has no downloads API at all; there the extension is menus +
 // selection pill + sniffing only.
@@ -1215,12 +1391,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case "alt-download": {
         // Gecko's stand-in save (see the content script): the Alt bypass
         // promises the browser keeps this one, and on Firefox only the
-        // extension can make that happen. `captureEligible` ignores our own
-        // downloads, so this cannot fall back into capture.
+        // extension can make that happen. Both capture paths recognise our
+        // own downloads, so this cannot fall back into capture.
         if (!/^https?:/i.test(msg.url || "")) {
           return sendResponse({ ok: false, error: "not an http(s) link" });
         }
         try {
+          // The header-stage capture does not see who asked; say so here, or
+          // the bypass cancels the very download it just promised.
+          browserOwned.set(msg.url);
           await chrome.downloads.download({ url: msg.url });
           sendResponse({ ok: true });
         } catch (e) {
