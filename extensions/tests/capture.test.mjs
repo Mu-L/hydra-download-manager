@@ -18,7 +18,7 @@ const check = (label, cond, extra = "") => {
 };
 const tick = (n = 3) => new Promise((r) => { let i = 0; const f = () => (++i >= n ? r() : setImmediate(f)); setImmediate(f); });
 
-function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
+function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = null } = {}) {
   const sent = [];          // messages that reached "Hydra"
   const calls = [];         // downloads API calls
   const listeners = {};
@@ -64,7 +64,8 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
     contextMenus: { removeAll: async () => {}, create: () => {}, onClicked: onMenu },
     tabs: {
       query: async () => [{ id: 7, url: "https://page.example/watch" }],
-      get: async () => ({ id: 7, url: "https://page.example/watch", title: "Sunset Timelapse 4K" }),
+      get: async () => tab ?? { id: 7, url: "https://page.example/watch", title: "Sunset Timelapse 4K" },
+      remove: async (id) => calls.push(["tabRemove", id]),
       sendMessage: async () => ({ urls: ["https://a.example/1.zip", "https://b.example/2.zip"] }),
       create: () => {}, onRemoved: ev(), onUpdated: ev(),
     },
@@ -75,6 +76,16 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
           listeners.sniff = fn;
           listeners.sniffFilter = filter;
         },
+      },
+      onHeadersReceived: {
+        addListener: (fn, filter, spec) => {
+          listeners.headers = fn;
+          listeners.headersFilter = filter;
+          listeners.headersSpec = spec;
+        },
+      },
+      onBeforeRedirect: {
+        addListener: (fn) => { listeners.redirect = fn; },
       },
     },
   };
@@ -117,9 +128,25 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
         { name: "Content-Length", value: String(size) },
       ],
     });
+  // One response as the browser hands it to a BLOCKING listener, gated by the
+  // registered `types` filter the way the browser gates it: a test that called
+  // the listener directly would pass against a filter the response never
+  // reaches. Returns whatever the listener returns — the blocking verdict.
+  const headResponse = ({ url, headers = {}, type = "main_frame", tabId = 7, requestId = "r1" }) =>
+    (listeners.headersFilter?.types || []).includes(type)
+      ? listeners.headers?.({
+          url, type, tabId, requestId,
+          responseHeaders: Object.entries(headers).map(([name, value]) => ({ name, value })),
+        })
+      : undefined;
+  const redirected = ({ url, redirectUrl, requestId = "r1" }) =>
+    listeners.redirect?.({ url, redirectUrl, requestId, type: "main_frame", tabId: 7 });
+
   return {
     sent, calls, onCreated, onDetermining, onMenu, send, store, respond,
+    headResponse, redirected,
     sniffFilter: () => listeners.sniffFilter,
+    headersSpec: () => listeners.headersSpec,
   };
 }
 
@@ -237,6 +264,163 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false } = {}) {
   h.onCreated.fire(item); await tick(10);
   check("gecko: a refused hand-off leaves the browser download running",
     !h.calls.some(([c]) => c === "cancel") && !h.calls.some(([c]) => c === "resume"), JSON.stringify(h.calls));
+}
+
+// ------------------------------- 5c. the Gecko capture point: before a download
+//
+// Cancelling a download on Gecko leaves a "Canceled" row in the browser's own
+// list for every file Hydra takes, and nothing can erase the browser's memory
+// of it. So the decision is made one event earlier, off the response headers:
+// a response cancelled there never becomes a download at all.
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  check("gecko headers: the listener is registered as blocking",
+    (h.headersSpec() || []).includes("blocking"), JSON.stringify(h.headersSpec()));
+
+  const verdict = await h.headResponse({
+    url: "https://cdn.example/pack.zip",
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Length": "5000000",
+      "Content-Disposition": 'attachment; filename="pack.zip"',
+    },
+  });
+  check("gecko headers: a matching response is cancelled before it downloads",
+    verdict?.cancel === true, JSON.stringify(verdict));
+  const dl = h.sent.find((m) => m.type === "download");
+  check("gecko headers: it reaches Hydra with name, size and mime",
+    dl?.url === "https://cdn.example/pack.zip" && dl?.filename === "pack.zip" &&
+      dl?.size === 5e6 && dl?.mime === "application/zip",
+    JSON.stringify(dl));
+  check("gecko headers: no download record is created, so none is cancelled",
+    h.calls.length === 0, JSON.stringify(h.calls));
+}
+
+// What the browser SHOWS is not a download, and cancelling it would take the
+// page away from the user.
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  const page = await h.headResponse({
+    url: "https://page.example/index.html",
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+  const pdf = await h.headResponse({
+    url: "https://cdn.example/manual.pdf",
+    headers: { "Content-Type": "application/pdf" },
+  });
+  check("gecko headers: a page the browser renders is left alone", page === undefined);
+  check("gecko headers: a PDF the built-in viewer opens is left to the viewer", pdf === undefined);
+  check("gecko headers: neither is offered to Hydra", !h.sent.some((m) => m.type === "download"));
+}
+
+// A response Hydra refuses becomes a download — and that download must not
+// ask the same question again: between the two asks the native host may have
+// LAUNCHED the app, and the second answer is the cancelled row we avoided.
+{
+  const h = build({ gecko: true, hydraReply: { ok: false, error: "nope" } });
+  await tick(12);
+  const verdict = await h.headResponse({
+    url: "https://cdn.example/pack.zip",
+    headers: { "Content-Type": "application/zip" },
+  });
+  check("gecko headers: a refused response is not cancelled", !verdict?.cancel, JSON.stringify(verdict));
+  const asked = h.sent.filter((m) => m.type === "download").length;
+  h.onCreated.fire({ id: 61, url: "https://cdn.example/pack.zip", filename: "pack.zip", mime: "application/zip" });
+  await tick(10);
+  check("gecko headers: the download it becomes does not ask a second time",
+    h.sent.filter((m) => m.type === "download").length === asked,
+    JSON.stringify(h.sent.map((m) => m.type)));
+  check("gecko headers: and is never cancelled",
+    !h.calls.some(([c]) => c === "cancel"), JSON.stringify(h.calls));
+}
+
+// The name lives in Content-Disposition when the URL carries no extension —
+// which is most "download.php?id=" links.
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  const verdict = await h.headResponse({
+    url: "https://cdn.example/download?id=884",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": "attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.zip",
+    },
+  });
+  check("gecko headers: an RFC 5987 filename supplies the extension the URL lacks",
+    verdict?.cancel === true &&
+      h.sent.find((m) => m.type === "download")?.filename === "résumé.zip",
+    JSON.stringify(h.sent));
+}
+
+// The Alt bypass saves the link through `downloads.download()` on Gecko. The
+// header stage cannot see who asked, so cancelling here would defeat the very
+// bypass the download exists to honour.
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  await h.send({ type: "alt-download", url: "https://cdn.example/pack.zip" });
+  const verdict = await h.headResponse({
+    url: "https://cdn.example/pack.zip",
+    headers: { "Content-Type": "application/zip" },
+  });
+  check("gecko headers: the Alt bypass's own download survives",
+    !verdict?.cancel && !h.sent.some((m) => m.type === "download"), JSON.stringify(verdict));
+}
+
+// The net runs the other way round too. "Save Link As" and a retry from the
+// downloads panel create the download BEFORE the response comes back, so the
+// header stage would otherwise offer the same transfer a second time and Hydra
+// would queue it twice.
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  h.onCreated.fire({ id: 71, url: "https://cdn.example/pack.zip", filename: "pack.zip", mime: "application/zip" });
+  await tick(10);
+  check("gecko: a download the browser started first still reaches Hydra",
+    h.sent.filter((m) => m.type === "download").length === 1, JSON.stringify(h.sent.map((m) => m.type)));
+  const verdict = await h.headResponse({
+    url: "https://cdn.example/pack.zip",
+    headers: { "Content-Type": "application/zip" },
+  });
+  check("gecko: and its response is not offered a second time",
+    verdict === undefined && h.sent.filter((m) => m.type === "download").length === 1,
+    JSON.stringify(h.sent.map((m) => m.type)));
+}
+
+// A redirect to a signature good for ten seconds: our copy of it is dead by
+// Hydra's first retry, and only the link that minted it can be replayed.
+{
+  const h = build({ gecko: true });
+  await tick(12);
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
+  const signed = `https://store.example/blob?X-Amz-Date=${stamp}&X-Amz-Expires=10&X-Amz-Signature=dead`;
+  h.redirected({ url: "https://files.example/pack.zip", redirectUrl: signed, requestId: "r9" });
+  const verdict = await h.headResponse({
+    url: signed,
+    requestId: "r9",
+    headers: { "Content-Type": "application/zip" },
+  });
+  check("gecko headers: a short-lived signature is taken, not handed over",
+    verdict?.cancel === true &&
+      h.sent.find((m) => m.type === "download")?.url === "https://files.example/pack.zip",
+    JSON.stringify(h.sent.find((m) => m.type === "download")));
+}
+
+// A download link with target="_blank" opens a tab the browser would have
+// closed itself once the response turned into a download.
+{
+  const h = build({ gecko: true, tab: { id: 9, url: "about:blank", openerTabId: 7 } });
+  await tick(12);
+  await h.headResponse({
+    url: "https://cdn.example/pack.zip",
+    tabId: 9,
+    headers: { "Content-Type": "application/zip" },
+  });
+  await tick(6);
+  check("gecko headers: the blank tab the link opened is closed after all",
+    h.calls.some(([c, id]) => c === "tabRemove" && id === 9), JSON.stringify(h.calls));
 }
 
 // ------------------------------------------- 6. right-click a link / media
