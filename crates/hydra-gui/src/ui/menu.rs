@@ -13,9 +13,14 @@ use iced::Length;
 /// Flyouts longer than this many rows scroll instead of growing past the
 /// window (the Language menu lists 30+ locales).
 const FLYOUT_MAX_ROWS: usize = 10;
-/// Height of one flyout row: the label's line height (iced's default is
+/// Height of one dropdown row: the label's line height (iced's default is
 /// 1.3 × font size) plus the button's vertical padding.
-const FLYOUT_ROW_H: f32 = theme::FONT_SIZE * 1.3 + 10.0;
+const ROW_H: f32 = theme::FONT_SIZE * 1.3 + 10.0;
+/// Height of a separator: the hairline plus `sep_row`'s vertical padding.
+const SEP_H: f32 = 1.0 + 6.0;
+/// The dropdown panel's fixed width and the padding around its rows.
+const PANEL_W: f32 = 260.0;
+const PANEL_PAD: f32 = 4.0;
 
 pub struct Entry {
     pub action: Option<MenuAction>,
@@ -436,8 +441,8 @@ pub fn dropdown<'a>(items: &[Entry], open_submenu: Option<usize>) -> El<'a> {
         col = col.push(entry_row(e, i, open_submenu));
     }
     let panel = container(col)
-        .padding(4)
-        .width(260.0)
+        .padding(PANEL_PAD)
+        .width(PANEL_W)
         .style(theme::menu_panel);
 
     let open = open_submenu
@@ -450,7 +455,7 @@ pub fn dropdown<'a>(items: &[Entry], open_submenu: Option<usize>) -> El<'a> {
     // The flyout column replays the panel's top padding and every row above
     // the parent as invisible ghosts, so the flyout's top edge lands exactly
     // on the parent row for any font, size, or locale.
-    let mut spacer = column![space::vertical().height(4.0)].spacing(0);
+    let mut spacer = column![space::vertical().height(PANEL_PAD)].spacing(0);
     for e in items.iter().take(idx) {
         if e.sep {
             spacer = spacer.push(sep_row(false));
@@ -476,7 +481,7 @@ pub fn dropdown<'a>(items: &[Entry], open_submenu: Option<usize>) -> El<'a> {
     let sub: El<'a> = if parent.submenu.len() > FLYOUT_MAX_ROWS {
         scrollable(sub)
             .width(Length::Fill)
-            .height(FLYOUT_ROW_H * FLYOUT_MAX_ROWS as f32)
+            .height(ROW_H * FLYOUT_MAX_ROWS as f32)
             .into()
     } else {
         sub.into()
@@ -489,8 +494,40 @@ pub fn dropdown<'a>(items: &[Entry], open_submenu: Option<usize>) -> El<'a> {
     row![panel, column![spacer, flyout]].into()
 }
 
+/// The height `dropdown` lays a panel out at: one row per entry, a hairline
+/// above each entry that carries one, and the panel's padding. Every row is
+/// a single line of text in every locale, so this is the laid-out height and
+/// not a guess at it.
+fn panel_height(items: &[Entry]) -> f32 {
+    let seps = items.iter().filter(|e| e.sep).count() as f32;
+    PANEL_PAD * 2.0 + items.len() as f32 * ROW_H + seps * SEP_H
+}
+
+/// Where a menu of `panel` opened at `at` has to sit to stay inside a window
+/// of `view`.
+///
+/// One that does not fit below the pointer opens *above* it instead — what
+/// every native menu does, and the only placement that shows the whole menu
+/// for a row near the bottom edge. Taller than the window either way, it is
+/// pushed against the bottom edge, which keeps the entries by the pointer
+/// reachable. Horizontally the panel is a fixed width, so a menu opened near
+/// the right edge only has to slide left far enough to fit.
+fn anchor(at: iced::Point, panel: iced::Size, view: iced::Size) -> iced::Point {
+    let x = at.x.min(view.width - panel.width).max(0.0);
+    let y = if at.y + panel.height <= view.height {
+        at.y
+    } else if panel.height <= at.y {
+        at.y - panel.height
+    } else {
+        (view.height - panel.height).max(0.0)
+    };
+    iced::Point::new(x, y)
+}
+
 /// Full-window overlay: click-away layer + positioned dropdown.
 pub fn overlay<'a>(app: &'a App, items: Vec<Entry>, at: iced::Point) -> El<'a> {
+    let size = iced::Size::new(PANEL_W, panel_height(&items));
+    let at = anchor(at, size, app.main_viewport());
     let panel = dropdown(&items, app.open_submenu);
     iced::widget::stack![
         mouse_area(space::horizontal().width(Length::Fill).height(Length::Fill))
@@ -501,4 +538,97 @@ pub fn overlay<'a>(app: &'a App, items: Vec<Entry>, at: iced::Point) -> El<'a> {
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::{Point, Size};
+
+    fn entries(n: usize, seps: usize) -> Vec<Entry> {
+        (0..n)
+            .map(|i| {
+                let e = Entry::plain(format!("item {i}"), MenuAction::Options, true);
+                if i < seps {
+                    e.sep()
+                } else {
+                    e
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn panel_height_counts_rows_separators_and_padding() {
+        assert_eq!(
+            panel_height(&entries(4, 2)),
+            PANEL_PAD * 2.0 + 4.0 * ROW_H + 2.0 * SEP_H
+        );
+    }
+
+    #[test]
+    fn menu_that_fits_opens_at_the_pointer() {
+        let panel = Size::new(PANEL_W, 200.0);
+        let view = Size::new(900.0, 600.0);
+        assert_eq!(
+            anchor(Point::new(120.0, 80.0), panel, view),
+            Point::new(120.0, 80.0)
+        );
+    }
+
+    #[test]
+    fn menu_near_the_bottom_opens_above_the_pointer() {
+        let panel = Size::new(PANEL_W, 200.0);
+        let view = Size::new(900.0, 600.0);
+        // 560 + 200 runs 160px past the window; the whole menu still fits
+        // above the pointer, so that is where it goes.
+        assert_eq!(
+            anchor(Point::new(10.0, 560.0), panel, view),
+            Point::new(10.0, 360.0)
+        );
+    }
+
+    #[test]
+    fn menu_exactly_reaching_the_bottom_edge_stays_below() {
+        let panel = Size::new(PANEL_W, 200.0);
+        let view = Size::new(900.0, 600.0);
+        assert_eq!(
+            anchor(Point::new(0.0, 400.0), panel, view),
+            Point::new(0.0, 400.0)
+        );
+    }
+
+    #[test]
+    fn menu_too_tall_for_either_side_sits_on_the_bottom_edge() {
+        let panel = Size::new(PANEL_W, 500.0);
+        let view = Size::new(900.0, 600.0);
+        assert_eq!(
+            anchor(Point::new(0.0, 300.0), panel, view),
+            Point::new(0.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn menu_taller_than_the_window_starts_at_the_top() {
+        let panel = Size::new(PANEL_W, 700.0);
+        let view = Size::new(900.0, 600.0);
+        assert_eq!(anchor(Point::new(0.0, 300.0), panel, view).y, 0.0);
+    }
+
+    #[test]
+    fn menu_near_the_right_edge_slides_left_to_fit() {
+        let panel = Size::new(PANEL_W, 100.0);
+        let view = Size::new(900.0, 600.0);
+        assert_eq!(
+            anchor(Point::new(800.0, 10.0), panel, view).x,
+            900.0 - PANEL_W
+        );
+    }
+
+    #[test]
+    fn menu_wider_than_the_window_starts_at_the_left_edge() {
+        let panel = Size::new(PANEL_W, 100.0);
+        let view = Size::new(200.0, 600.0);
+        assert_eq!(anchor(Point::new(150.0, 10.0), panel, view).x, 0.0);
+    }
 }
