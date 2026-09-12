@@ -15,6 +15,7 @@ mod engine;
 mod ext_info;
 mod extbus;
 mod fmt;
+mod font;
 mod i18n;
 mod icons;
 #[cfg(target_os = "linux")]
@@ -123,10 +124,12 @@ fn main() -> iced::Result {
         std::env::set_var("ICED_BACKEND", "tiny-skia");
     }
 
-    // Vazirmatn ships in the binary and is ALWAYS the default face: system
-    // per-glyph fallback shaped some Arabic-script runs to nothing (blank
-    // button labels), and a single bundled family renders identically on
-    // every OS in every language — its Latin set is clean too.
+    // The interface is drawn with the platform's own UI face, so a Hydra
+    // window looks like the windows beside it; Persian and Arabic keep the
+    // bundled Vazirmatn, because per-glyph fallback shaped some
+    // Arabic-script runs to nothing (blank button labels). Vazirmatn is
+    // loaded either way — it is the last resort when a machine has none of
+    // the faces its platform is supposed to have.
     iced::daemon(boot, App::update, view)
         .title(title)
         .theme(theme_of)
@@ -137,7 +140,7 @@ fn main() -> iced::Result {
         .scale_factor(scale_of)
         .subscription(subscription)
         .font(include_bytes!("../assets/fonts/Vazirmatn-Regular.ttf").as_slice())
-        .default_font(iced::Font::with_name("Vazirmatn"))
+        .default_font(font::default_font(pre.language.as_deref()))
         .run()
 }
 
