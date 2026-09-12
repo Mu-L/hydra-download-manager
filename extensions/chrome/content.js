@@ -3,7 +3,8 @@
 //
 // Content script, three jobs:
 //  1. Stamp Alt+clicks so the background honors the "hold Alt to let the
-//     browser download normally" convention.
+//     browser download normally" convention, and on Gecko perform that
+//     download, because Firefox itself will not.
 //  2. Collect page links for "Download all links with Hydra".
 //  3. The selection pill: highlight one or more links and a floating
 //     "Download with Hydra" button appears next to the selection.
@@ -21,6 +22,38 @@ window.addEventListener(
   },
   true
 );
+
+// Gecko is the one browser where standing aside is not enough: it has shipped
+// `browser.altClickSave` defaulting to false since Firefox 13, so Alt+click
+// saves nothing there. Declining to capture and leaving the click to Firefox
+// therefore produced no download at all, in Hydra or in the browser. Chromium
+// and Safari do save the link themselves, and their own save is the better one
+// (Content-Disposition, the "always ask" setting, the Save As dialog), so the
+// extension only stands in where the browser declines.
+const ALT_SAVE_IS_OURS = /\bFirefox\/\d/.test(navigator.userAgent || "");
+
+// The link this click is asking the browser to save, or null if it is not
+// that gesture.
+function altSaveUrl(e) {
+  if (!ALT_SAVE_IS_OURS || !e.altKey || e.button !== 0 || e.defaultPrevented) return null;
+  const href = e.target?.closest?.("a[href]")?.href;
+  return href && /^https?:/i.test(href) ? href : null;
+}
+
+// Bubble phase, not capture: the page gets to claim its own Alt+click first,
+// and `defaultPrevented` above is only meaningful once it has.
+window.addEventListener("click", (e) => {
+  const url = altSaveUrl(e);
+  if (!url) return;
+  // Suppress Gecko's own handling too, so a profile that has turned
+  // `browser.altClickSave` back on downloads the file once, not twice.
+  e.preventDefault();
+  try {
+    chrome.runtime.sendMessage({ type: "alt-download", url });
+  } catch {
+    // Extension reloaded underneath us; harmless.
+  }
+});
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === "collect-links") {

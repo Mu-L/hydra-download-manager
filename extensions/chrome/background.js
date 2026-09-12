@@ -1212,6 +1212,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await sessionStore().set({ altTs: Date.now() });
         sendResponse({ ok: true });
         break;
+      case "alt-download": {
+        // Gecko's stand-in save (see the content script): the Alt bypass
+        // promises the browser keeps this one, and on Firefox only the
+        // extension can make that happen. `captureEligible` ignores our own
+        // downloads, so this cannot fall back into capture.
+        if (!/^https?:/i.test(msg.url || "")) {
+          return sendResponse({ ok: false, error: "not an http(s) link" });
+        }
+        try {
+          await chrome.downloads.download({ url: msg.url });
+          sendResponse({ ok: true });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e) });
+        }
+        break;
+      }
       case "get-state": {
         const state = await getState();
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
