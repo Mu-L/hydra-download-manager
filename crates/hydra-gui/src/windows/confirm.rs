@@ -72,6 +72,10 @@ pub fn view(app: &App) -> El<'_> {
             ),
             false,
         ),
+        Some(ConfirmKind::FontNeedsRestart) => (
+            tr("The interface font for this language applies the next time Hydra starts."),
+            false,
+        ),
         Some(ConfirmKind::UpdateCheckFailed(e)) => (
             format!(
                 "{}\n\n{e}",
@@ -198,7 +202,7 @@ pub fn view(app: &App) -> El<'_> {
 
     // Good news gets the info bubble; everything else warns.
     let icon = match &app.confirm {
-        Some(ConfirmKind::UpToDate) => icons::info(),
+        Some(ConfirmKind::UpToDate) | Some(ConfirmKind::FontNeedsRestart) => icons::info(),
         _ => icons::warning(),
     };
     container(

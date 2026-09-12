@@ -176,8 +176,14 @@ pub fn reinstall(state: &MenuState, queues: &[String], languages: &[String]) {
     let _ = view.append(&theme_m);
     let font = Submenu::new(tr("Font"), true);
     let mut fonts = Vec::new();
-    for (label, size) in crate::theme::FONT_CHOICES {
-        let it = check(label, MenuAction::FontSize(size), state.font_size == size);
+    for size in crate::theme::FONT_SIZES {
+        // A bare number: `tr` leaves it alone unless a catalogue localises
+        // the digits, which is exactly what a locale that wants ۱۴ needs.
+        let it = check(
+            &size.to_string(),
+            MenuAction::FontSize(size),
+            state.font_size == size,
+        );
         let _ = font.append(&it);
         fonts.push((size, it));
     }

@@ -854,6 +854,9 @@ pub enum ConfirmKind {
     },
     /// Help > Check for updates found nothing newer (info box, OK).
     UpToDate,
+    /// View > Language moved the interface onto a different face than the
+    /// running renderer was built with (info box, OK).
+    FontNeedsRestart,
     /// Help > Check for updates could not reach the release server.
     UpdateCheckFailed(String),
     /// "Warn me before stopping downloads" (Connection tab): the stop only
@@ -6045,6 +6048,13 @@ impl App {
                 Task::batch(resizes)
             }
             MenuAction::Language(l) => {
+                // The face is chosen from the locale, but the renderer took
+                // its default font when the window system came up: a switch
+                // onto (or off) the bundled Persian/Arabic face only reaches
+                // the interface on the next launch, and the user has to be
+                // told rather than left looking at the wrong one.
+                let face_changes =
+                    crate::font::changes_face(self.cfg.language.as_deref(), Some(&l));
                 i18n::set_locale(&l);
                 self.cfg.language = Some(l);
                 self.save_config();
@@ -6054,6 +6064,10 @@ impl App {
                     let queues: Vec<String> =
                         self.cfg.queues.iter().map(|q| q.name.clone()).collect();
                     crate::tray::reinstall(&queues, self.cfg.settings.power_save);
+                }
+                if face_changes {
+                    self.confirm = Some(ConfirmKind::FontNeedsRestart);
+                    return self.open_window(WinKind::Confirm);
                 }
                 Task::none()
             }
@@ -7358,7 +7372,7 @@ mod tests {
         // the window grows by the ratio on every launch, until it is bigger
         // than the sanity range above and snaps back to the default size.
         let left_at = (1400.0, 900.0);
-        for size in crate::theme::FONT_CHOICES.map(|(_, s)| s) {
+        for size in crate::theme::FONT_SIZES {
             let scale = crate::theme::ui_scale(size);
             let (w, h) = main_open_size(Some(left_at), scale);
             assert!(
@@ -7405,7 +7419,7 @@ mod tests {
         // View menu offers. The window reaches the screen multiplied by the
         // ratio, so that is what has to fit — with room to spare for the
         // taskbar and the title bar.
-        for size in crate::theme::FONT_CHOICES.map(|(_, s)| s) {
+        for size in crate::theme::FONT_SIZES {
             let scale = crate::theme::ui_scale(size);
             let (w, h) = fit_to_display((760.0, 700.0), laptop, scale);
             assert!(
