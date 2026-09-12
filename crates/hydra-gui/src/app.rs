@@ -1526,6 +1526,17 @@ impl App {
         self.cursor_cell.get()
     }
 
+    /// The main window in interface units — the ones the cursor probe reads
+    /// and the overlays are laid out in, so the units a menu has to be kept
+    /// inside.
+    pub fn main_viewport(&self) -> iced::Size {
+        main_viewport(
+            self.main_size,
+            self.window_size(WinKind::Main),
+            self.ui_scale(),
+        )
+    }
+
     /// Ids of [`Self::visible`], in the same order.
     pub fn visible_ids(&self) -> Vec<DlId> {
         self.visible().iter().map(|d| d.id).collect()
@@ -6492,6 +6503,18 @@ pub fn main_window_size() -> iced::Size {
 /// rejects nonsense: `min_size` holds the window to a full toolbar row
 /// whatever the saved size says, and that floor moves with the font ratio
 /// while this range does not.
+/// The main window in interface units, from what a resize last reported.
+/// `main_size` is in OS points, so it converts back through the View > Font
+/// ratio; before the first resize event it is zero and `opened_at` — the
+/// size the window was asked to open at, already in interface units — stands
+/// in, so a menu is placed against the right window from the first click.
+fn main_viewport(main_size: iced::Size, opened_at: (f32, f32), scale: f32) -> iced::Size {
+    if main_size.width > 0.0 && main_size.height > 0.0 {
+        return iced::Size::new(main_size.width / scale, main_size.height / scale);
+    }
+    iced::Size::new(opened_at.0, opened_at.1)
+}
+
 fn main_open_size(saved: Option<(f32, f32)>, scale: f32) -> (f32, f32) {
     let os = saved
         .filter(|(w, h)| (400.0..=4000.0).contains(w) && (300.0..=2500.0).contains(h))
@@ -7387,6 +7410,27 @@ mod tests {
         // derives from the display instead, which is never this small.
         let (w, _) = main_open_size(Some((80.0, 40.0)), 1.0);
         assert!(w >= 900.0, "nonsense is replaced, not restored: {w}");
+    }
+
+    #[test]
+    fn a_menu_is_placed_against_the_window_in_the_units_it_is_laid_out_in() {
+        use super::main_viewport;
+
+        // A resize reports OS points; the overlays, and the cursor position
+        // a menu is placed at, are in interface units. Skip the conversion
+        // and a Large-font window reads as half again as tall as it is, so
+        // a menu near the bottom is left running off it.
+        let opened_at = (900.0, 600.0);
+        let scale = crate::theme::ui_scale(20);
+        let v = main_viewport(iced::Size::new(1400.0, 900.0), opened_at, scale);
+        assert!((v.width - 1400.0 / scale).abs() < 0.5 && (v.height - 900.0 / scale).abs() < 0.5);
+
+        // No resize has arrived yet: the size the window was opened at is
+        // already in interface units and is used as it stands.
+        assert_eq!(
+            main_viewport(iced::Size::ZERO, opened_at, scale),
+            iced::Size::new(900.0, 600.0)
+        );
     }
 
     #[test]
