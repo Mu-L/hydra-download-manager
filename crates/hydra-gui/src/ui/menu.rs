@@ -200,10 +200,10 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
             .sep(),
             Entry::sub(
                 tr("Font"),
-                crate::theme::FONT_CHOICES
+                crate::theme::FONT_SIZES
                     .into_iter()
-                    .map(|(l, s)| {
-                        Entry::item(tr(l), MenuAction::FontSize(s))
+                    .map(|s| {
+                        Entry::item(s.to_string(), MenuAction::FontSize(s))
                             .check(app.cfg.settings.font_size == s)
                     })
                     .collect(),
