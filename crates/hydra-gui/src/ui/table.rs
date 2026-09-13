@@ -20,23 +20,11 @@
 
 use std::collections::HashSet;
 
-use crate::app::{App, El, Message, SortKey};
-use crate::model::{DlId, DownloadItem};
+use crate::app::{App, El, Message};
+use crate::model::{Column, DlId, DownloadItem};
 use crate::{fmt, i18n::tr, icons, theme};
 use iced::widget::{column, container, mouse_area, row, scrollable, stack, svg, text};
 use iced::Length;
-
-const COLS: [(&str, f32, Option<SortKey>); 8] = [
-    ("File Name", 300.0, Some(SortKey::Name)),
-    // "Q" strip: icon-only, so the width stays at the resize minimum.
-    ("Q", 40.0, Some(SortKey::Queue)),
-    ("Size", 110.0, Some(SortKey::Size)),
-    ("Status", 120.0, Some(SortKey::Status)),
-    ("Time left", 130.0, Some(SortKey::TimeLeft)),
-    ("Transfer rate", 150.0, Some(SortKey::Rate)),
-    ("Last Try Date", 175.0, Some(SortKey::LastTry)),
-    ("Description", 200.0, Some(SortKey::Description)),
-];
 
 /// Width of the draggable divider between header cells.
 const GRIP: f32 = 6.0;
@@ -50,62 +38,67 @@ const ROW_H: f32 = CELL_H + 1.0;
 /// lands between two frames never uncovers a gap.
 const OVERSCAN: usize = 6;
 
-pub fn default_widths() -> Vec<f32> {
-    COLS.iter().map(|c| c.1).collect()
+/// The columns the header draws, left to right, with their widths — the
+/// hidden ones are simply not in it. `model::migrate_columns` guarantees the
+/// stored list names every column exactly once, so this is the whole table.
+fn cols(app: &App) -> Vec<(Column, f32)> {
+    app.cfg
+        .settings
+        .columns
+        .iter()
+        .filter(|p| p.visible)
+        .map(|p| (p.id, p.width))
+        .collect()
 }
 
-fn widths(app: &App) -> Vec<f32> {
-    if app.col_widths.len() == COLS.len() {
-        app.col_widths.clone()
-    } else {
-        default_widths()
-    }
+fn total_width(c: &[(Column, f32)]) -> f32 {
+    c.iter().map(|(_, w)| w).sum::<f32>() + GRIP * c.len() as f32
 }
 
-fn total_width(w: &[f32]) -> f32 {
-    w.iter().sum::<f32>() + GRIP * w.len() as f32
-}
-
-fn header<'a>(app: &App, w: &[f32], tw: f32) -> El<'a> {
+fn header<'a>(app: &App, c: &[(Column, f32)], tw: f32) -> El<'a> {
     let mut r = row![].spacing(0);
-    for (i, (label, _, key)) in COLS.iter().enumerate() {
-        let arrow = match key {
-            Some(k) if app.sort.0 == *k => {
-                if app.sort.1 {
-                    " ▴"
-                } else {
-                    " ▾"
-                }
+    for (col, w) in c {
+        let arrow = if app.sort.0 == *col {
+            if app.sort.1 {
+                " \u{25b4}"
+            } else {
+                " \u{25be}"
             }
-            _ => "",
+        } else {
+            ""
         };
         let cell = container(
-            text(format!("{}{arrow}", tr(label)))
+            text(format!("{}{arrow}", tr(col.label())))
                 .size(theme::FONT_SIZE)
                 .wrapping(iced::widget::text::Wrapping::None),
         )
         .padding([3, 6])
-        .width(w[i])
+        .width(*w)
         .height(CELL_H)
         .clip(true)
-        .style(theme::header_cell(app.hover_col == Some(i)));
+        .style(theme::header_cell(app.hover_col == Some(*col)));
         // A container under a `mouse_area`, not a `button`: a button forces the
         // hand cursor, and `mouse_area::interaction` can only override a child
         // that asks for none.
-        let cell = mouse_area(cell)
-            .interaction(iced::mouse::Interaction::Idle)
-            .on_enter(Message::HeaderEnter(i))
-            .on_exit(Message::HeaderExit(i));
-        r = match key {
-            Some(k) => r.push(cell.on_press(Message::SortBy(*k))),
-            None => r.push(cell),
-        };
+        //
+        // The press only marks where the drag would start; sorting happens on
+        // release, so that a press which travels reorders the columns instead
+        // (see `App::drag_header_to`).
+        r = r.push(
+            mouse_area(cell)
+                .interaction(iced::mouse::Interaction::Idle)
+                .on_enter(Message::HeaderEnter(*col))
+                .on_exit(Message::HeaderExit(*col))
+                .on_press(Message::HeaderPress(*col))
+                .on_right_press(Message::HeaderRightClick(*col)),
+        );
         // Drag grip on the column's right edge, drawing the same hairline the
         // body rows do so the separators run continuously like a listview.
         r = r.push(
             mouse_area(rule_grip())
                 .interaction(iced::mouse::Interaction::ResizingHorizontally)
-                .on_press(Message::ColResizeStart(i)),
+                .on_press(Message::ColResizeStart(*col))
+                .on_right_press(Message::HeaderRightClick(*col)),
         );
     }
     // The strip is painted as a whole, not cell by cell: the header floats
@@ -154,8 +147,8 @@ fn hairline<'a>() -> El<'a> {
 
 /// Where the hairline between column `i` and the next one sits, measured from
 /// the left edge of the list.
-fn line_x(w: &[f32], i: usize) -> f32 {
-    w[..=i].iter().sum::<f32>() + GRIP * i as f32 + (GRIP - 1.0) / 2.0
+fn line_x(c: &[(Column, f32)], i: usize) -> f32 {
+    c[..=i].iter().map(|(_, w)| w).sum::<f32>() + GRIP * i as f32 + (GRIP - 1.0) / 2.0
 }
 
 /// 1 px horizontal rule under a row.
@@ -190,7 +183,7 @@ fn spacer<'a>(tw: f32, h: f32) -> El<'a> {
 /// scroll offset `off` and places its own hairlines; `rows` is an upper bound
 /// on what can be seen, and iced's flex layout drops whatever does not fit in
 /// the space left below the last download.
-fn filler_block<'a>(w: &[f32], tw: f32, off: f32, rows: usize) -> El<'a> {
+fn filler_block<'a>(c: &[(Column, f32)], tw: f32, off: f32, rows: usize) -> El<'a> {
     let rw = (tw - off).max(0.0);
     let mut lines = column![].width(rw);
     for _ in 0..rows {
@@ -199,8 +192,8 @@ fn filler_block<'a>(w: &[f32], tw: f32, off: f32, rows: usize) -> El<'a> {
     }
     let mut verts = row![].spacing(0);
     let mut placed = 0.0;
-    for i in 0..w.len() {
-        let x = line_x(w, i) - off;
+    for i in 0..c.len() {
+        let x = line_x(c, i) - off;
         if x < placed {
             continue;
         }
@@ -256,53 +249,48 @@ fn queue_glyph<'a>(app: &App, d: &DownloadItem) -> El<'a> {
     }
 }
 
-fn data_row<'a>(app: &App, d: &'a DownloadItem, w: &[f32], tw: f32, selected: bool) -> El<'a> {
-    let size_txt = d.size.map(fmt::size2).unwrap_or_default();
-    let eta_txt = match d.state {
-        crate::model::DlState::Receiving => d.eta_secs.map(fmt::eta).unwrap_or_default(),
-        _ => String::new(),
-    };
-    let rate_txt = if d.state.is_active() && d.rate > 0.0 {
-        fmt::rate_steady(d.rate, app.effective_limit(d))
-    } else {
-        String::new()
-    };
-    let grip = rule_grip;
-    let content = row![
-        cell(
-            row![
-                svg(file_icon(app, d)).width(15.0).height(15.0),
-                text(&d.file_name)
-                    .size(theme::FONT_SIZE)
-                    .wrapping(iced::widget::text::Wrapping::None),
-            ]
-            .spacing(5)
-            .align_y(iced::Alignment::Center)
-            .into(),
-            w[0],
-        ),
-        grip(),
-        cell(queue_glyph(app, d), w[1]),
-        grip(),
-        cell(text(size_txt).size(theme::FONT_SIZE).into(), w[2]),
-        grip(),
-        cell(text(d.status_text()).size(theme::FONT_SIZE).into(), w[3]),
-        grip(),
-        cell(text(eta_txt).size(theme::FONT_SIZE).into(), w[4]),
-        grip(),
-        cell(text(rate_txt).size(theme::FONT_SIZE).into(), w[5]),
-        grip(),
-        cell(
-            text(d.last_try.map(fmt::date).unwrap_or_default())
+/// What one column shows for one download.
+fn cell_content<'a>(app: &App, d: &'a DownloadItem, col: Column) -> El<'a> {
+    let txt = |s: String| -> El<'a> { text(s).size(theme::FONT_SIZE).into() };
+    match col {
+        Column::Name => row![
+            svg(file_icon(app, d)).width(15.0).height(15.0),
+            text(&d.file_name)
                 .size(theme::FONT_SIZE)
-                .into(),
-            w[6]
-        ),
-        grip(),
-        cell(text(&d.description).size(theme::FONT_SIZE).into(), w[7]),
-        grip(),
-    ]
-    .spacing(0);
+                .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center)
+        .into(),
+        Column::Queue => queue_glyph(app, d),
+        Column::Size => txt(d.size.map(fmt::size2).unwrap_or_default()),
+        Column::Status => txt(d.status_text()),
+        Column::TimeLeft => txt(match d.state {
+            crate::model::DlState::Receiving => d.eta_secs.map(fmt::eta).unwrap_or_default(),
+            _ => String::new(),
+        }),
+        Column::Rate => txt(if d.state.is_active() && d.rate > 0.0 {
+            fmt::rate_steady(d.rate, app.effective_limit(d))
+        } else {
+            String::new()
+        }),
+        Column::LastTry => txt(d.last_try.map(fmt::date).unwrap_or_default()),
+        Column::Description => text(&d.description).size(theme::FONT_SIZE).into(),
+    }
+}
+
+fn data_row<'a>(
+    app: &App,
+    d: &'a DownloadItem,
+    c: &[(Column, f32)],
+    tw: f32,
+    selected: bool,
+) -> El<'a> {
+    let mut content = row![].spacing(0);
+    for (col, w) in c {
+        content = content.push(cell(cell_content(app, d, *col), *w));
+        content = content.push(rule_grip());
+    }
 
     // The row is a plain container, not a button: `button` reports its press
     // only on mouse-*release* (so the drag never knows where it started) and
@@ -325,8 +313,8 @@ fn data_row<'a>(app: &App, d: &'a DownloadItem, w: &[f32], tw: f32, selected: bo
 }
 
 pub fn view(app: &App) -> El<'_> {
-    let w = widths(app);
-    let tw = total_width(&w);
+    let c = cols(app);
+    let tw = total_width(&c);
     let items = app.visible();
     let n = items.len();
     // Membership lookup for the selected-row styling: `Vec::contains` per row
@@ -359,14 +347,14 @@ pub fn view(app: &App) -> El<'_> {
     rows = rows.push(spacer(tw, ROW_H));
     rows = rows.push(spacer(tw, first as f32 * ROW_H));
     for d in &items[first..last] {
-        rows = rows.push(data_row(app, d, &w, tw, sel.contains(&d.id)));
+        rows = rows.push(data_row(app, d, &c, tw, sel.contains(&d.id)));
     }
     rows = rows.push(spacer(tw, (n - last) as f32 * ROW_H));
 
     // The header, pushed back down by exactly what the list has scrolled: it
     // stays pinned to the top of the viewport while the rows run under it.
     // As a layer it adds no height of its own, so it cannot lengthen the list.
-    let head = column![spacer(tw, app.table_scroll), header(app, &w, tw)].width(tw);
+    let head = column![spacer(tw, app.table_scroll), header(app, &c, tw)].width(tw);
 
     // Rows first: `stack` takes its size from the bottom layer, so only the
     // rows decide how far the list scrolls.
@@ -393,7 +381,7 @@ pub fn view(app: &App) -> El<'_> {
     let fillers = (vh.max(app.main_size.height) / ROW_H).ceil() as usize + 1;
     let grid = column![
         spacer(tw, below),
-        filler_block(&w, tw, app.table_scroll_x, fillers)
+        filler_block(&c, tw, app.table_scroll_x, fillers)
     ]
     .width(Length::Fill)
     .height(Length::Fill);

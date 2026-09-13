@@ -56,6 +56,8 @@ pub fn view(app: &App) -> El<'_> {
     // when there is nothing to overlay.
     let overlay: Option<El<'_>> = if let Some(kind) = app.open_menu {
         Some(menu::bar_overlay(app, kind))
+    } else if let (Some(col), Some(at)) = (app.header_ctx, app.ctx_at) {
+        Some(menu::overlay(app, menu::header_entries(app, col), at))
     } else if let (Some(start), Some(at)) = (app.queue_menu, app.ctx_at) {
         let items: Vec<menu::Entry> = app
             .cfg

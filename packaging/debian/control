@@ -1,4 +1,4 @@
-Source: hydra
+Source: hydra-download-manager
 Section: net
 Priority: optional
 Maintainer: Javad Rajabzadeh <ja7ad@live.com>
@@ -16,10 +16,15 @@ Build-Depends: debhelper-compat (= 13),
 Standards-Version: 4.6.2
 Homepage: https://github.com/ja7ad/hydra
 
-Package: hydra
+# Not "hydra": that binary package already exists in universe (THC-Hydra, the
+# login cracker, built from the thc-hydra source) at version 9.x, so a PPA
+# package of the same name loses every version comparison and
+# `apt install hydra` silently installs the cracker instead. The conflict is
+# over /usr/bin/hydra, which both ship.
+Package: hydra-download-manager
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, libgtk-3-0 | libgtk-3-0t64
-Conflicts: thc-hydra, hydra-gtk
+Conflicts: hydra
 Recommends: gnome-shell-extension-appindicator
 Description: Multi-connection download manager (GUI, CLI, browser integration)
  Hydra downloads files over many parallel connections with integrity
