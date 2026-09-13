@@ -25,11 +25,18 @@ latter is regenerated on every sync.
 - **Manifest V3 with an event page** (`background.scripts`) instead of a
   service worker — Firefox's MV3 background is a non-persistent event page,
   and the shared code runs unchanged on both.
-- **Capture uses a single `onCreated` listener.** Firefox has no
-  `onDeterminingFilename` (a Chrome-only event), but it resolves `filename`
-  on the create event itself, so the extension parks and decides in one
-  sequential step. Splitting them across two listeners would race, because
-  listeners on the same event run concurrently.
+- **Capture happens at the response, not at the download.** Firefox has no
+  `onDeterminingFilename`, and a download it has already created cannot be
+  handed to Hydra without leaving a "Canceled" row in the browser's own
+  download list — `downloads.erase()` drops the extension's view of it, not
+  the browser's memory. So Gecko decides one event earlier, in a blocking
+  `webRequest.onHeadersReceived`: a response bound for Hydra is cancelled
+  before a download exists, and one left to the browser is never touched.
+  That is what `webRequestBlocking` is in the manifest for; Chromium has no
+  such permission under MV3 and does not need one, because it can park a
+  download with `downloads.pause()` and hand it back intact.
+  `downloads.onCreated` stays registered underneath as the net for transfers
+  that arrive without a response we were shown.
 - **Stable add-on id** (`hydra@ja7ad.github.io`, in
   `browser_specific_settings.gecko`) — native messaging allow-lists Firefox
   add-ons by id (`allowed_extensions`), not by an extension-origin URL the

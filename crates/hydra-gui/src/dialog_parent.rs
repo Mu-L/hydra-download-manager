@@ -94,11 +94,19 @@ pub fn attach(child: &dyn iced::window::Window, parent: usize) {
             if child as usize == parent {
                 return;
             }
+            // `raw-window-handle` carries an HWND as a `NonZeroIsize` while
+            // windows-sys spells it as a pointer (since 0.59). The same opaque
+            // machine word; only the two crates' spelling of it differs.
+            //
             // SAFETY: plain Win32 call on a window this process owns; an
             // owner that no longer exists is rejected by the system, not
             // dereferenced.
             unsafe {
-                SetWindowLongPtrW(child, GWLP_HWNDPARENT, parent as isize);
+                SetWindowLongPtrW(
+                    child as *mut std::ffi::c_void,
+                    GWLP_HWNDPARENT,
+                    parent as isize,
+                );
             }
             crate::log::debug("dialog kept above the main window");
         }

@@ -30,6 +30,22 @@ use sni as backend;
 use crate::app::MenuAction;
 use crate::i18n::tr;
 
+/// Reserved [`crate::menubus`] id: the desktop's theme changed and the tray
+/// glyph has to be re-tinted for it. Not a [`MenuAction`] — nothing in the
+/// menu produces it — so `app.rs` answers it the way it answers `show_main`.
+/// It travels on the menu channel because that is the route a native surface
+/// already has to the UI thread, and only the UI thread may touch the icon.
+pub const THEME_CHANGED: &str = "tray_theme_changed";
+
+/// Re-tint the tray glyph for the theme in force now. Must run on the UI
+/// thread. A no-op where the platform recolors the glyph itself (macOS
+/// template images) or watches it already (the Linux backend re-tints from
+/// its own thread).
+pub fn refresh_icon() {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    backend::refresh_icon();
+}
+
 /// Backend-neutral menu description, built once per rebuild and rendered by
 /// muda or by ksni. Labels are already translated; ids are
 /// [`MenuAction::id`] strings (plus the `show_main` special case `app.rs`
