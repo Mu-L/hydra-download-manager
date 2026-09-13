@@ -5,6 +5,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.5.0] - 2026-09-13
+
+### Added
+
+- **Toolbar Speed Limiter Quick Control & Named Profiles (`hydra-gui`)**:
+  - Added a dedicated Speed Limit button with a profile dropdown menu directly to the main toolbar for instantaneous bandwidth throttling.
+  - The toolbar button dynamically reflects the active rate cap (e.g. `500 KB/s`, `5 MB/s`) or displays *Speed Limit* when unconstrained.
+  - Introduced named speed limiter profiles (*Unlimited*, *Background* at 500 KB/s, *Night* at 5 MB/s) selectable from the toolbar dropdown, native macOS menu, and in-window application menu.
+  - Added speed profile management in *Options → Connection*, enabling users to create, rename, adjust rate limits for, and delete custom profiles.
+- **Download Table Column Customization & Reordering (`hydra-gui`)**:
+  - Added an interactive column manager dialog (*View → Columns* or header context menu) allowing users to hide, show, and reorder download table columns (*File Name*, *Size*, *Status*, *Time Left*, *Speed*, *Last Try Date*, *Description*, *Queue*).
+  - Enforced *File Name* as a locked, mandatory column to ensure row identity while all other columns can be toggled freely.
+  - Added a *Reset* button to immediately restore default column ordering and visibility.
+  - Column visibility preferences and custom widths persist across sessions in `config.toml` (`settings.columns`).
+- **Custom Download Category Management (`hydra-gui`)**:
+  - Added full category customization in *Options → Save to* and the sidebar categories context menu, allowing users to create, rename, delete, and retype download categories.
+  - Supports defining custom file extension lists per category, automatically transferring claimed extensions between categories to avoid classification conflicts.
+  - Protected stock built-in categories (*General*, *Programs*, *Video*, *Music*, *Documents*, *Archives*, *Compressed*, *AI Models*) against accidental deletion or renaming.
+  - Added strict category name sanitization, enforcing 64-character limits and rejecting cross-platform reserved characters (`/`, `\`, `:`, `<`, `>`, `"`, `|`, `?`, `*`) and directory traversal.
+- **Point Font Sizing & Locale-Aware Font Resolution (`hydra-gui`)**:
+  - Replaced coarse Small/Medium/Large presets with fine-grained point font sizes from 10 pt to 20 pt in *View → Font*.
+  - Added locale-aware typography resolution: pairs Arabic and Persian scripts (`ar`, `fa`) with the bundled `Vazirmatn` font for complete shaping coverage, while selecting the highest-priority installed system font for other locales (`Segoe UI Variable Text`/`Segoe UI`/`Tahoma` on Windows, `SF Pro Text`/`SF Pro`/`Helvetica Neue` on macOS, `Cantarell`/`Ubuntu`/`Noto Sans` on Linux).
+  - Added a restart confirmation prompt when switching between locales requiring different font faces.
+- **Configurable Progress Connection Details Visibility (`hydra-gui`)**:
+  - Added a *"Show connection details"* setting in *Options → Downloads* (`show_conn_details`).
+  - Allows download progress dialogs to open in a compact, collapsed view without expanding per-connection transfer segments by default, while retaining the in-dialog button to expand details on demand.
+- **Connection Limit Exceptions Management (`hydra-gui`)**:
+  - Added an interactive scrollable list in *Options → Connection* allowing users to select and remove per-host connection limit exceptions.
+  - Added support for wildcard subdomain matching (`*.example.com`) and domain suffixes (e.g. `uplod.ir`) in connection limit exception rules.
+
+### Fixed
+
+- **Unresponsive Origin Hang & Immediate Stop Cancellation (`hya-net::http`, `hydra-gui::engine`)**:
+  - Added a 10-second patience timeout (`HEAD_PATIENCE`) in `probe_resilient` for origins that accept TCP connections but never return an HTTP response or terminate the connection (e.g. `s7.uplod.ir:182`).
+  - Automatically falls back to a ranged GET request (`bytes=0-0` / HTTP 206) when HEAD requests time out or fail without headers.
+  - Wrapped connection probes, FTP greeting/SIZE commands, and Metalink document retrieval in `cancellable` async wrappers, allowing *Stop* and *Stop All* to immediately terminate downloads stalled in the initial connecting phase instead of hanging indefinitely.
+- **Windows Taskbar Theme Detection & Tray Icon Recolor (`hydra-gui::tray`)**:
+  - Fixed invisible system tray icons on Windows when Windows mode (taskbar) is set to Dark while application mode is set to Light.
+  - Directly queries `SystemUsesLightTheme` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` rather than relying on application-level theme detection.
+  - Added asynchronous registry monitoring via `RegNotifyChangeKeyValue` to dynamically re-tint the tray icon between light and dark monochrome glyphs in real-time as the Windows taskbar theme changes.
+- **Gecko / Firefox Leftover "Canceled" Downloads (`extensions/`, Firefox)**:
+  - Fixed captured browser downloads leaving orphaned "Canceled" entries in Firefox's native download list.
+  - Intercepts download responses during `webRequest.onHeadersReceived` (using `webRequestBlocking`) to cancel captured transfers before Firefox creates a download object, keeping the native browser download list clean while allowing uncaptured downloads to proceed untouched.
+- **Gecko / Firefox Alt+Click Capture Bypass (`extensions/`, Firefox)**:
+  - Fixed Alt+click capture bypass failing on Firefox, where `browser.altClickSave` defaults to false since Firefox 13.
+  - Content script now captures Alt+click on Firefox and triggers a native browser download (`chrome.downloads.download`) while skipping Hydra capture.
+- **Context Menu Window Boundary Clamping (`hydra-gui::ui::menu`)**:
+  - Fixed context menus clipping outside the application window when right-clicking download rows near the bottom or right edges.
+  - Implemented dynamic panel height calculation and boundary clamping (`anchor`), opening the menu above the cursor when approaching the bottom edge and shifting left when approaching the right edge, accounting for UI font scaling.
+
+---
+
 ## [0.4.4] - 2026-09-11
 
 ### Added
