@@ -305,6 +305,23 @@ pub struct CategoryDef {
     pub exts: Vec<String>,
     /// Default download directory for the category.
     pub dir: String,
+    /// The stock categories cannot be renamed or deleted — their file types
+    /// and folder are the user's, their identity is not: the tree icons, the
+    /// [`categorize`] fallback and the AI seeding all name them.
+    #[serde(default)]
+    pub builtin: bool,
+}
+
+impl CategoryDef {
+    /// A user-made category: no file types yet, filed under `Downloads/<name>`.
+    pub fn new(name: &str) -> Self {
+        CategoryDef {
+            name: name.to_string(),
+            exts: vec![],
+            dir: sub(name),
+            builtin: false,
+        }
+    }
 }
 
 fn downloads_dir() -> String {
@@ -320,6 +337,14 @@ fn sub(cat: &str) -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+/// The catch-all category: the file types no other list claims, and the
+/// folder [`category_dir`] falls back to.
+///
+/// It is the first entry and stays first — new categories are appended, and
+/// Options refuses to rename or remove this one — because "uncategorised"
+/// and "category folders are switched off" both resolve through it.
+pub const DEFAULT_CATEGORY: &str = "General";
 
 /// The category model weights and datasets are filed under.
 ///
@@ -379,39 +404,46 @@ pub fn default_categories() -> Vec<CategoryDef> {
     let e = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
     vec![
         CategoryDef {
-            name: "General".into(),
+            name: DEFAULT_CATEGORY.into(),
             exts: vec![],
             dir: downloads_dir(),
+            builtin: true,
         },
         CategoryDef {
             name: AI_CATEGORY.into(),
             exts: AI_TYPES.iter().map(|e| e.to_ascii_lowercase()).collect(),
             dir: sub(AI_CATEGORY),
+            builtin: true,
         },
         CategoryDef {
             name: "Compressed".into(),
             exts: e("zip rar 7z gz gzip bz2 tar arj lzh sit sitx sea ace z xz zst"),
             dir: sub("Compressed"),
+            builtin: true,
         },
         CategoryDef {
             name: "Documents".into(),
             exts: e("doc docx pdf ppt pptx pps txt rtf odt xls xlsx csv epub chm djvu"),
             dir: sub("Documents"),
+            builtin: true,
         },
         CategoryDef {
             name: "Music".into(),
             exts: e("mp3 aac m4a wav wma ogg flac aif mpa ra"),
             dir: sub("Music"),
+            builtin: true,
         },
         CategoryDef {
             name: "Programs".into(),
             exts: e("exe msi msu dmg pkg deb rpm appimage apk bin img iso"),
             dir: sub("Programs"),
+            builtin: true,
         },
         CategoryDef {
             name: "Video".into(),
             exts: e("avi mp4 mkv mov mpg mpeg wmv flv m4v webm rm rmvb ogv 3gp asf qt ts"),
             dir: sub("Video"),
+            builtin: true,
         },
     ]
 }
@@ -433,6 +465,71 @@ pub fn categorize(file: &str, cats: &[CategoryDef]) -> Option<String> {
                 .find(|c| c.exts.contains(&ext))
                 .map(|c| c.name.clone())
         }
+    }
+}
+
+/// Whether `name` is usable as a category name.
+///
+/// Printable ASCII only. The name is also a folder name and the key every
+/// download is filed under, and duplicates are rejected case-insensitively
+/// — which only ASCII case folding can do correctly here, so a non-ASCII
+/// name would let two categories that a case-insensitive filesystem maps to
+/// one folder both exist.
+///
+/// A separator, a drive letter or a `..` is refused rather than quietly
+/// sanitised: a category must not be able to file downloads outside the
+/// folder its name describes. The Windows-reserved characters are refused
+/// everywhere, because a config written on one platform is opened on
+/// another.
+pub fn valid_category_name(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty()
+        && n.len() <= 64
+        && n != "."
+        && n != ".."
+        && !n.contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*'])
+        && n.chars().all(|c| c.is_ascii() && !c.is_ascii_control())
+}
+
+/// One category's file types as typed in Options: whitespace or commas
+/// separate them, a leading dot is optional, case is not significant.
+pub fn parse_exts(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for token in text.split([' ', '\t', '\n', '\r', ',', ';']) {
+        let ext = token.trim().trim_start_matches('.').to_ascii_lowercase();
+        if !ext.is_empty() && !out.contains(&ext) {
+            out.push(ext);
+        }
+    }
+    out
+}
+
+/// Split the Save-to tab's name box into a category name and the file types
+/// to create it with: `Pictures: .png .jpg`.
+///
+/// A colon can never be part of a category name — [`valid_category_name`]
+/// refuses it, because the name is also a folder name — so the split is
+/// unambiguous, and a name may still contain spaces ("My Games").
+pub fn parse_category_entry(text: &str) -> (&str, Vec<String>) {
+    match text.split_once(':') {
+        Some((name, exts)) => (name.trim(), parse_exts(exts)),
+        None => (text.trim(), vec![]),
+    }
+}
+
+/// Give `exts` to the category called `name`, taking each one away from the
+/// other categories.
+///
+/// An extension belongs to exactly one category: [`categorize`] stops at the
+/// first list that matches, so the same extension in two lists files by
+/// whichever category happens to come first — adding `msix` to Programs
+/// would look like it did nothing at all if another list already had it.
+pub fn set_category_exts(cats: &mut [CategoryDef], name: &str, exts: Vec<String>) {
+    for c in cats.iter_mut().filter(|c| c.name != name) {
+        c.exts.retain(|e| !exts.contains(e));
+    }
+    if let Some(c) = cats.iter_mut().find(|c| c.name == name) {
+        c.exts = exts;
     }
 }
 
@@ -631,6 +728,161 @@ pub struct SoundRow {
     pub file: String,
 }
 
+/// A column of the download table, and with it the key the list sorts by:
+/// every column orders the list by its own value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Column {
+    Name,
+    Queue,
+    Size,
+    Status,
+    TimeLeft,
+    Rate,
+    LastTry,
+    Description,
+}
+
+impl Column {
+    /// Every column, in the order a fresh install shows them.
+    pub const ALL: [Column; 8] = [
+        Column::Name,
+        Column::Queue,
+        Column::Size,
+        Column::Status,
+        Column::TimeLeft,
+        Column::Rate,
+        Column::LastTry,
+        Column::Description,
+    ];
+
+    /// The header label, which is also the `tr` key the catalogues carry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Column::Name => "File Name",
+            Column::Queue => "Q",
+            Column::Size => "Size",
+            Column::Status => "Status",
+            Column::TimeLeft => "Time left",
+            Column::Rate => "Transfer rate",
+            Column::LastTry => "Last Try Date",
+            Column::Description => "Description",
+        }
+    }
+
+    pub fn default_width(self) -> f32 {
+        match self {
+            Column::Name => 300.0,
+            // Icon-only queue-membership strip: the resize minimum is enough.
+            Column::Queue => 40.0,
+            Column::Size => 110.0,
+            Column::Status => 120.0,
+            Column::TimeLeft => 130.0,
+            Column::Rate => 150.0,
+            Column::LastTry => 175.0,
+            Column::Description => 200.0,
+        }
+    }
+
+    /// Stable id for the native menu integrations, which address a menu
+    /// entry by string ([`crate::app::MenuAction::id`]).
+    pub fn id(self) -> &'static str {
+        match self {
+            Column::Name => "Name",
+            Column::Queue => "Queue",
+            Column::Size => "Size",
+            Column::Status => "Status",
+            Column::TimeLeft => "TimeLeft",
+            Column::Rate => "Rate",
+            Column::LastTry => "LastTry",
+            Column::Description => "Description",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Column> {
+        Column::ALL.into_iter().find(|c| c.id() == id)
+    }
+}
+
+/// How one column is presented: its place in [`Settings::columns`] is its
+/// place in the header, left to right.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ColumnPref {
+    pub id: Column,
+    pub width: f32,
+    pub visible: bool,
+}
+
+impl ColumnPref {
+    pub fn new(id: Column) -> Self {
+        ColumnPref {
+            id,
+            width: id.default_width(),
+            visible: true,
+        }
+    }
+}
+
+/// Move `col` one place towards `left`, past the neighbour the caller can
+/// see: the header skips hidden columns (`visible_only`), while the manage
+/// dialog lists every column and moves within that list.
+///
+/// Returns whether the order actually changed — the outermost column on that
+/// side has nowhere to go.
+pub fn move_column(cols: &mut [ColumnPref], col: Column, left: bool, visible_only: bool) -> bool {
+    let Some(i) = cols.iter().position(|p| p.id == col) else {
+        return false;
+    };
+    let movable = |j: &usize| !visible_only || cols[*j].visible;
+    let j = if left {
+        (0..i).rev().find(movable)
+    } else {
+        (i + 1..cols.len()).find(movable)
+    };
+    match j {
+        Some(j) => {
+            cols.swap(i, j);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Carry a drag of `col` to pointer x, reordering as it passes a neighbour,
+/// and answer with the reference x the next step measures from.
+///
+/// The drop target is derived from the distance dragged, never from an
+/// absolute position: the table's left edge moves with the sidebar and the
+/// sideways scroll, and neither is known here. A column changes places once
+/// the drag has covered MORE than half the neighbour it is passing, and the
+/// reference then moves with it — so the swap-back threshold is that same
+/// line. The comparison is strict on purpose: `>=` would both swap and swap
+/// back at exactly half a width, and the loop would never end.
+pub fn drag_column(cols: &mut [ColumnPref], col: Column, from_x: f32, x: f32) -> f32 {
+    let mut from_x = from_x;
+    loop {
+        let Some(i) = cols.iter().position(|p| p.id == col) else {
+            return from_x;
+        };
+        let dx = x - from_x;
+        let next = if dx > 0.0 {
+            (i + 1..cols.len()).find(|&j| cols[j].visible)
+        } else {
+            (0..i).rev().find(|&j| cols[j].visible)
+        };
+        let Some(j) = next.filter(|&j| dx.abs() > cols[j].width / 2.0) else {
+            return from_x;
+        };
+        from_x += cols[j].width * dx.signum();
+        cols.swap(i, j);
+    }
+}
+
+/// Narrowest and widest a column may be dragged, and the bounds a stored
+/// width is held to — a config claiming a 20 000 px column would push every
+/// other one off the window with no way back.
+pub const COL_MIN_W: f32 = 40.0;
+pub const COL_MAX_W: f32 = 800.0;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -753,7 +1005,13 @@ pub struct Settings {
     /// Global cap from Downloads > Speed Limiter, bytes/sec.
     pub global_speed_limit: Option<u64>,
     pub speed_limiter_on: bool,
-    /// Download-table column widths (drag the header dividers).
+    /// Download-table columns, left to right: width, and whether the header
+    /// shows them at all. [`load_config`] normalizes the list, so the rest of
+    /// the program can rely on it naming every [`Column`] exactly once.
+    pub columns: Vec<ColumnPref>,
+    /// The old per-position width list, from before columns could be
+    /// reordered or hidden. Read once at load, folded into `columns`, and
+    /// dropped from the file on the next save.
     pub column_widths: Vec<f32>,
     /// Last main-window size; restored on start when still sensible.
     pub window_size: Option<(f32, f32)>,
@@ -838,6 +1096,7 @@ impl Default for Settings {
             font_size: 13,
             global_speed_limit: None,
             speed_limiter_on: false,
+            columns: vec![],
             column_widths: vec![],
             window_size: None,
         }
@@ -1135,12 +1394,27 @@ pub fn load_config() -> ConfigFile {
             q.builtin = true;
         }
     }
+    mark_builtin_categories(&mut cfg.categories);
     if cfg.settings.font_size == 0 {
         cfg.settings = Settings::default();
     }
     migrate_theme_mode(&mut cfg.settings);
+    migrate_columns(&mut cfg.settings);
     seed_ai_formats(&mut cfg);
     cfg
+}
+
+/// Flag the stock categories, for a config written before the flag existed.
+///
+/// The stock names are the stock categories, exactly as the two stock queues
+/// are recognised by name above. Re-derived on every load rather than
+/// trusted from the file, so a hand-edited config cannot make Programs
+/// deletable — or lock a user's own category by claiming the flag.
+fn mark_builtin_categories(cats: &mut [CategoryDef]) {
+    let stock: Vec<String> = default_categories().into_iter().map(|c| c.name).collect();
+    for c in cats {
+        c.builtin = stock.contains(&c.name);
+    }
 }
 
 /// Add the model and dataset formats to an install that predates them.
@@ -1189,6 +1463,7 @@ fn seed_ai_formats(cfg: &mut ConfigFile) {
             name: AI_CATEGORY.into(),
             exts: AI_TYPES.iter().map(|e| e.to_ascii_lowercase()).collect(),
             dir: sub(AI_CATEGORY),
+            builtin: true,
         });
     }
     crate::log::info(&format!(
@@ -1210,6 +1485,58 @@ fn migrate_theme_mode(s: &mut Settings) {
         });
     }
     s.dark_mode = None;
+}
+
+/// Bring [`Settings::columns`] to the shape the table relies on: every
+/// [`Column`] present exactly once, with a sane width.
+///
+/// A config written before columns could be reordered carries only
+/// `column_widths`, one width per column in the stock order; those widths are
+/// the user's and are kept. The legacy key is dropped either way, so the next
+/// save writes just `columns`.
+///
+/// Unknown or repeated entries are dropped and missing ones appended, so a
+/// config from another version — or a hand-edited one — cannot leave a column
+/// unreachable: the manage dialog can only show what the list names.
+fn migrate_columns(s: &mut Settings) {
+    let legacy = std::mem::take(&mut s.column_widths);
+    if s.columns.is_empty() {
+        s.columns = Column::ALL.into_iter().map(ColumnPref::new).collect();
+        for (pref, w) in s.columns.iter_mut().zip(legacy) {
+            pref.width = w;
+        }
+        // The Q column shrank from a queue-name text column to an icon-only
+        // strip; configs saved before that still carry the old default, which
+        // would leave a wide empty band next to File Name.
+        if let Some(q) = s.columns.iter_mut().find(|p| p.id == Column::Queue) {
+            if q.width == 110.0 {
+                q.width = Column::Queue.default_width();
+            }
+        }
+    }
+    let mut seen = Vec::with_capacity(Column::ALL.len());
+    s.columns.retain(|p| {
+        let first = !seen.contains(&p.id);
+        seen.push(p.id);
+        first
+    });
+    for c in Column::ALL {
+        if !s.columns.iter().any(|p| p.id == c) {
+            s.columns.push(ColumnPref::new(c));
+        }
+    }
+    for p in &mut s.columns {
+        p.width = if p.width.is_finite() {
+            p.width.clamp(COL_MIN_W, COL_MAX_W)
+        } else {
+            p.id.default_width()
+        };
+    }
+    // File Name is what identifies a row: hiding it would leave a table of
+    // sizes and dates with nothing to read them against.
+    if let Some(p) = s.columns.iter_mut().find(|p| p.id == Column::Name) {
+        p.visible = true;
+    }
 }
 
 pub fn save_config(cfg: &ConfigFile) {
@@ -1565,11 +1892,13 @@ mod tests {
                 name: "General".into(),
                 exts: vec![],
                 dir: "/dl".into(),
+                builtin: true,
             },
             CategoryDef {
                 name: "Video".into(),
                 exts: vec!["mp4".into()],
                 dir: "/dl/Video".into(),
+                builtin: true,
             },
         ]
     }
@@ -1649,5 +1978,256 @@ mod tests {
         })
         .unwrap()
         .contains("shutdown_action = \"Sleep\""));
+    }
+
+    #[test]
+    fn a_category_name_may_not_reach_outside_its_folder() {
+        for ok in ["Pictures", "My Games", "Serie TV", "Games (2026)"] {
+            assert!(valid_category_name(ok), "{ok} should be allowed");
+        }
+        // Non-ASCII is refused: the duplicate check folds case the ASCII
+        // way, so "Bücher" and "BÜCHER" would both be created and then
+        // collide in one folder on macOS and Windows.
+        for bad in [
+            "",
+            "   ",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "C:",
+            "we*ird",
+            "a\nb",
+            "Bücher",
+            "برنامه\u{200c}ها",
+        ] {
+            assert!(!valid_category_name(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn file_types_are_read_however_they_are_typed() {
+        assert_eq!(
+            parse_exts("MSIX, .msixbundle\nappx  APPX ;exe"),
+            ["msix", "msixbundle", "appx", "exe"]
+        );
+        assert!(parse_exts("  , ; \n").is_empty());
+    }
+
+    /// A category is created with its file types in one go
+    /// (`Pictures: .png .jpg`); the colon is safe as the separator because a
+    /// name may never contain one.
+    /// A config written before the flag existed carries none, so the stock
+    /// categories would come back renamable and deletable — and a user
+    /// category that happens to be listed there must not be locked.
+    #[test]
+    fn a_config_written_before_the_builtin_flag_still_knows_its_stock_categories() {
+        let toml = "[[categories]]\nname = \"Programs\"\nexts = [\"exe\"]\ndir = \"/dl/p\"\n\n\
+             [[categories]]\nname = \"Games\"\nexts = [\"nsp\"]\ndir = \"/dl/g\"\n";
+        let mut cfg: ConfigFile = toml::from_str(toml).unwrap();
+        mark_builtin_categories(&mut cfg.categories);
+        assert!(cfg.categories[0].builtin, "Programs is stock");
+        assert!(!cfg.categories[1].builtin, "Games is the user's");
+    }
+
+    #[test]
+    fn a_category_entry_carries_its_file_types() {
+        assert_eq!(parse_category_entry("Pictures"), ("Pictures", vec![]));
+        assert_eq!(
+            parse_category_entry("  My Games : .exe, ISO "),
+            ("My Games", vec!["exe".into(), "iso".into()])
+        );
+        assert_eq!(parse_category_entry("Pictures:").1, Vec::<String>::new());
+        assert!(!valid_category_name(parse_category_entry(":png").0));
+    }
+
+    #[test]
+    fn an_extension_moves_to_the_category_that_claims_it() {
+        let mut cats = default_categories();
+        cats.push(CategoryDef::new("Pictures"));
+        set_category_exts(&mut cats, "Pictures", parse_exts("png jpg iso"));
+        // Programs listed iso; it belongs to Pictures now, and the rest of
+        // the Programs list is untouched.
+        let programs = cats.iter().find(|c| c.name == "Programs").unwrap();
+        assert!(!programs.exts.contains(&"iso".to_string()));
+        assert!(programs.exts.contains(&"exe".to_string()));
+        assert_eq!(categorize("disk.iso", &cats).as_deref(), Some("Pictures"));
+        assert_eq!(categorize("setup.exe", &cats).as_deref(), Some("Programs"));
+    }
+
+    #[test]
+    fn a_new_file_type_files_the_next_download_with_it() {
+        let mut cats = default_categories();
+        let mut exts = cats
+            .iter()
+            .find(|c| c.name == "Programs")
+            .unwrap()
+            .exts
+            .clone();
+        exts.extend(parse_exts("msix msixbundle"));
+        set_category_exts(&mut cats, "Programs", exts);
+        assert_eq!(
+            categorize("VSCode.msixbundle", &cats).as_deref(),
+            Some("Programs")
+        );
+    }
+
+    /// Order of the columns, as their ids, for readable assertions.
+    fn order(cols: &[ColumnPref]) -> Vec<&'static str> {
+        cols.iter().map(|p| p.id.id()).collect()
+    }
+
+    fn stock() -> Vec<ColumnPref> {
+        Column::ALL.into_iter().map(ColumnPref::new).collect()
+    }
+
+    #[test]
+    fn the_header_moves_a_column_past_the_one_next_to_it() {
+        let mut cols = stock();
+        assert!(move_column(&mut cols, Column::Size, true, true));
+        assert_eq!(order(&cols)[..3], ["Name", "Size", "Queue"]);
+    }
+
+    /// A hidden column is not on screen, so moving left has to land where the
+    /// user can see it land — one place left of where it was drawn.
+    #[test]
+    fn the_header_skips_a_hidden_column_the_user_cannot_see() {
+        let mut cols = stock();
+        cols[1].visible = false;
+        assert!(move_column(&mut cols, Column::Size, true, true));
+        assert_eq!(order(&cols)[..3], ["Size", "Queue", "Name"]);
+    }
+
+    /// The manage dialog lists every column, hidden ones included, so there
+    /// the neighbour is simply the row above.
+    #[test]
+    fn the_dialog_moves_a_column_past_the_row_above_it() {
+        let mut cols = stock();
+        cols[1].visible = false;
+        assert!(move_column(&mut cols, Column::Size, true, false));
+        assert_eq!(order(&cols)[..3], ["Name", "Size", "Queue"]);
+    }
+
+    #[test]
+    fn the_outermost_column_has_nowhere_left_to_go() {
+        let mut cols = stock();
+        assert!(!move_column(&mut cols, Column::Name, true, false));
+        assert!(!move_column(&mut cols, Column::Description, false, false));
+        assert_eq!(order(&cols), order(&stock()));
+    }
+
+    #[test]
+    fn a_drag_past_half_the_neighbour_swaps_and_a_shorter_one_does_not() {
+        let mut cols = stock();
+        let half = Column::Queue.default_width() / 2.0;
+        // Exactly half is the line itself: the column that swapped there
+        // would immediately meet the swap-back threshold as well.
+        assert_eq!(drag_column(&mut cols, Column::Name, 0.0, half), 0.0);
+        assert_eq!(order(&cols), order(&stock()));
+
+        let from = drag_column(&mut cols, Column::Name, 0.0, half + 1.0);
+        assert_eq!(order(&cols)[..2], ["Queue", "Name"]);
+        assert_eq!(from, Column::Queue.default_width());
+    }
+
+    /// The reference x moves with the column, so dragging back to where the
+    /// press started leaves the order exactly as it was found — a pointer
+    /// resting on the threshold must not flip the column back and forth.
+    #[test]
+    fn a_drag_returned_to_its_start_leaves_the_order_alone() {
+        let mut cols = stock();
+        let mut from = 0.0;
+        for x in [30.0, 60.0, 200.0, 120.0, 40.0, 0.0] {
+            from = drag_column(&mut cols, Column::Name, from, x);
+        }
+        assert_eq!(order(&cols), order(&stock()));
+        assert_eq!(from, 0.0);
+    }
+
+    #[test]
+    fn a_drag_carries_a_column_past_every_neighbour_it_covers() {
+        let mut cols = stock();
+        let far: f32 = cols.iter().map(|p| p.width).sum();
+        drag_column(&mut cols, Column::Name, 0.0, far);
+        assert_eq!(*order(&cols).last().unwrap(), "Name");
+    }
+
+    /// A drag only reorders what the header draws: a hidden column keeps its
+    /// slot and is stepped over, not landed on.
+    #[test]
+    fn a_drag_steps_over_a_hidden_column() {
+        let mut cols = stock();
+        cols[1].visible = false;
+        let past = Column::Size.default_width();
+        // Past Size, which is what the header draws next to File Name here.
+        drag_column(&mut cols, Column::Name, 0.0, past);
+        assert_eq!(order(&cols)[..3], ["Size", "Queue", "Name"]);
+    }
+
+    #[test]
+    fn widths_saved_before_columns_could_be_reordered_are_kept() {
+        let mut s = Settings {
+            column_widths: vec![420.0, 110.0, 111.0, 120.0, 130.0, 150.0, 175.0, 200.0],
+            ..Settings::default()
+        };
+        migrate_columns(&mut s);
+        assert_eq!(order(&s.columns), order(&stock()));
+        assert_eq!(s.columns[0].width, 420.0);
+        assert_eq!(s.columns[2].width, 111.0);
+        // The Q column's old text-column default is not a width the user
+        // chose: it would leave a wide empty band next to File Name.
+        assert_eq!(s.columns[1].width, Column::Queue.default_width());
+        assert!(s.columns.iter().all(|p| p.visible));
+        assert!(
+            s.column_widths.is_empty(),
+            "the legacy key is folded in and dropped"
+        );
+    }
+
+    /// The table draws whatever the list names, so a config from another
+    /// version — or a hand-edited one — must not be able to leave a column
+    /// unreachable, twice over, or wide enough to push the rest off screen.
+    #[test]
+    fn a_damaged_column_list_is_repaired_at_load() {
+        let mut s = Settings {
+            columns: vec![
+                ColumnPref {
+                    id: Column::Size,
+                    width: 90.0,
+                    visible: false,
+                },
+                ColumnPref {
+                    id: Column::Size,
+                    width: 500.0,
+                    visible: true,
+                },
+                ColumnPref {
+                    id: Column::Name,
+                    width: 9_000.0,
+                    visible: false,
+                },
+            ],
+            ..Settings::default()
+        };
+        migrate_columns(&mut s);
+        assert_eq!(s.columns.len(), Column::ALL.len());
+        assert_eq!(order(&s.columns)[..2], ["Size", "Name"]);
+        assert_eq!(s.columns[0].width, 90.0, "the repeat is dropped, not kept");
+        assert_eq!(s.columns[1].width, COL_MAX_W);
+        assert!(
+            s.columns[1].visible,
+            "File Name names the row and cannot be hidden"
+        );
+        for c in Column::ALL {
+            assert_eq!(s.columns.iter().filter(|p| p.id == c).count(), 1, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_fresh_config_starts_with_every_column_in_the_stock_order() {
+        let mut s = Settings::default();
+        migrate_columns(&mut s);
+        assert_eq!(order(&s.columns), order(&stock()));
+        assert!(s.columns.iter().all(|p| p.visible));
     }
 }

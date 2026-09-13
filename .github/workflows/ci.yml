@@ -41,7 +41,10 @@ jobs:
           grep -q "^%global _version ${VERSION}$" "$RPM_TOP/SPECS/hydra.spec"
 
           rpmbuild -bs --define "_topdir $RPM_TOP" "$RPM_TOP/SPECS/hydra.spec"
-          ls "$RPM_TOP"/SRPMS/hydra-${VERSION}-*.src.rpm
+          # The tarball keeps the upstream name (hydra-<version>), but the
+          # package this spec builds is hydra-download-manager: plain "hydra"
+          # is THC-Hydra in the distro repos.
+          ls "$RPM_TOP"/SRPMS/hydra-download-manager-${VERSION}-*.src.rpm
 
   flatpak-validate:
     name: Flatpak Metadata Validation
