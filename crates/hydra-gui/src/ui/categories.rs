@@ -17,7 +17,7 @@ pub fn cat_icon(name: &str) -> svg::Handle {
         "Music" => icons::folder_music(),
         "Programs" => icons::folder_programs(),
         "Video" => icons::folder_video(),
-        _ => icons::file_generic(),
+        _ => icons::folder_custom(),
     }
 }
 
@@ -142,7 +142,12 @@ pub fn view(app: &App) -> El<'_> {
         TreeSel::All,
     ));
     if app.tree_open[0] {
-        for c in app.cfg.categories.iter().filter(|c| c.name != "General") {
+        for c in app
+            .cfg
+            .categories
+            .iter()
+            .filter(|c| c.name != crate::model::DEFAULT_CATEGORY)
+        {
             col = col.push(node(
                 app,
                 2,
@@ -162,7 +167,12 @@ pub fn view(app: &App) -> El<'_> {
         TreeSel::Unfinished,
     ));
     if app.tree_open[1] {
-        for c in app.cfg.categories.iter().filter(|c| c.name != "General") {
+        for c in app
+            .cfg
+            .categories
+            .iter()
+            .filter(|c| c.name != crate::model::DEFAULT_CATEGORY)
+        {
             col = col.push(node(
                 app,
                 2,
@@ -182,7 +192,12 @@ pub fn view(app: &App) -> El<'_> {
         TreeSel::Finished,
     ));
     if app.tree_open[2] {
-        for c in app.cfg.categories.iter().filter(|c| c.name != "General") {
+        for c in app
+            .cfg
+            .categories
+            .iter()
+            .filter(|c| c.name != crate::model::DEFAULT_CATEGORY)
+        {
             col = col.push(node(
                 app,
                 2,
@@ -213,4 +228,32 @@ pub fn view(app: &App) -> El<'_> {
         .padding(2)
         .style(theme::panel)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// At 17px the tree is read by glyph before label, so every stock
+    /// category has to keep its own — and a category the user made must
+    /// still look like a category, not like the generic file page the
+    /// fallback used to draw.
+    #[test]
+    fn every_stock_category_keeps_its_own_icon_and_a_custom_one_gets_a_folder() {
+        let stock = [
+            crate::model::AI_CATEGORY,
+            "Compressed",
+            "Documents",
+            "Music",
+            "Programs",
+            "Video",
+        ];
+        for (i, a) in stock.iter().enumerate() {
+            for b in &stock[i + 1..] {
+                assert_ne!(cat_icon(a), cat_icon(b), "{a} and {b} share a glyph");
+            }
+        }
+        assert_eq!(cat_icon("Pictures"), icons::folder_custom());
+        assert_ne!(cat_icon("Pictures"), icons::file_generic());
+    }
 }

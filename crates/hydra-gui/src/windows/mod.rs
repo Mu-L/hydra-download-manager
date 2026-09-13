@@ -4,6 +4,7 @@
 pub mod about;
 pub mod add_url;
 pub mod batch;
+pub mod columns;
 pub mod complete;
 pub mod confirm;
 pub mod file_info;

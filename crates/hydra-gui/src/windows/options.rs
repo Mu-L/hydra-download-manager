@@ -256,10 +256,35 @@ fn save_to(app: &App) -> El<'_> {
         .find(|c| c.name == st.sel_category)
         .cloned()
         .unwrap_or_else(|| st.draft_cats[0].clone());
-    let exts = if cur.exts.is_empty() {
-        tr("The file types that are not listed in any other category")
+    // General is the catch-all: its list is "whatever nothing else claimed",
+    // so it is described rather than edited. Rename and Remove answer to a
+    // different question — the stock categories keep their names.
+    let editable = st.cat_types_editable();
+    let free_name = st.can_name_category();
+    let types: El<'_> = if editable {
+        column![
+            text_editor(&st.cat_exts_edit)
+                .placeholder("PNG JPG WEBP")
+                .on_action(|a| o(OptField::CatExtsEdit(a)))
+                .size(theme::FONT_SIZE)
+                .height(90.0),
+            text(tr("(separate names by spaces)"))
+                .size(theme::FONT_SIZE - 1.0)
+                .color(theme::dim_text(&iced::Theme::Light)),
+        ]
+        .spacing(4)
+        .into()
     } else {
-        cur.exts.join(" ").to_uppercase()
+        container(
+            text(tr(
+                "The file types that are not listed in any other category",
+            ))
+            .size(theme::FONT_SIZE),
+        )
+        .padding(8)
+        .width(Length::Fill)
+        .style(theme::panel)
+        .into()
     };
     column![
         section(tr("Categories, file types, folders")),
@@ -268,6 +293,24 @@ fn save_to(app: &App) -> El<'_> {
             .text_size(theme::FONT_SIZE)
             .style(theme::picker)
             .width(300.0),
+        row![
+            text_input(&format!("{}: .ext .ext", tr("Category name")), &st.cat_name)
+                .on_input(|v| o(OptField::CatName(v)))
+                .on_submit(o(OptField::CatAdd))
+                .size(theme::FONT_SIZE)
+                .style(theme::input)
+                .width(Length::Fill),
+            dlg_btn_auto(tr("New"), free_name.then(|| o(OptField::CatAdd))),
+            dlg_btn_auto(
+                tr("Rename"),
+                st.can_rename_category().then(|| o(OptField::CatRename))
+            ),
+            dlg_btn_auto(
+                tr("Remove"),
+                st.cat_is_removable().then(|| o(OptField::CatRemove))
+            ),
+        ]
+        .spacing(8),
         text(format!(
             "{} \"{}\" {}:",
             tr("Automatically put in"),
@@ -275,7 +318,7 @@ fn save_to(app: &App) -> El<'_> {
             tr("category the following file types")
         ))
         .size(theme::FONT_SIZE),
-        container(text(exts).size(theme::FONT_SIZE)).padding(8).width(Length::Fill).style(theme::panel),
+        types,
         text(format!(
             "{} \"{}\" {}",
             tr("Default download directory for"),

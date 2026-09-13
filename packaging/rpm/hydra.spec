@@ -9,7 +9,12 @@
 #   scripts/render-rpm-spec.sh > /tmp/rpmbuild/SPECS/hydra.spec
 %global _version @HYDRA_VERSION@
 
-Name:           hydra
+# Not "hydra": Fedora already ships a binary package by that name (THC-Hydra,
+# the login cracker) at version 9.x, so a Copr package of the same name loses
+# every version comparison and `dnf install hydra` silently installs the
+# cracker instead. Source0 and %%autosetup stay on the upstream tarball name,
+# hydra-%%{version}.tar.gz, which is what the release workflow produces.
+Name:           hydra-download-manager
 Version:        %{_version}
 Release:        1%{?dist}
 Summary:        Multi-connection download manager (GUI, CLI, browser integration)
@@ -17,6 +22,9 @@ Summary:        Multi-connection download manager (GUI, CLI, browser integration
 License:        GPL-3.0-or-later
 URL:            https://github.com/ja7ad/hydra
 Source0:        https://github.com/ja7ad/hydra/archive/v%{version}/hydra-%{version}.tar.gz
+
+# Both ship /usr/bin/hydra.
+Conflicts:      hydra
 
 Recommends:     gnome-shell-extension-appindicator
 
@@ -36,7 +44,7 @@ Hydra downloads files over many parallel connections with integrity
 verification. This package installs the hydra CLI, the hydra-gui desktop
 app (with menu entry and login autostart), the hydra-host
 native-messaging bridge plus browser manifests for extension capture, and
-the browser extensions under /usr/share/hydra/extensions.
+the browser extensions under /usr/share/hydra-download-manager/extensions.
 
 %prep
 %autosetup -n hydra-%{version}

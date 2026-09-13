@@ -442,6 +442,17 @@ pub fn queues() -> svg::Handle {
     .clone()
 }
 
+/// A user-made category. The stock folder shape in a neutral slate: it has
+/// to read as a category without borrowing one of the built-in glyphs, which
+/// say what is inside them.
+pub fn folder_custom() -> svg::Handle {
+    static C: OnceLock<svg::Handle> = OnceLock::new();
+    C.get_or_init(|| flat_icon(
+        r##"<path d="M2 5 A1 1 0 0 1 3 4 h2.8 l1.2 1.3 h5 A1 1 0 0 1 13 6.3 v1 h-11 z" fill="#9FB4C7" stroke="#6B8299" stroke-width="0.7"/><path d="M2 8 h11 v4.5 a1 1 0 0 1 -1 1 h-9 a1 1 0 0 1 -1 -1 z" fill="#C8D6E2" stroke="#6B8299" stroke-width="0.7"/>"##,
+    ))
+    .clone()
+}
+
 /// The queues folder in a queue's own colour; `None` is the stock yellow
 /// [`queues`] icon. One handle per colour is kept, for the same reason the
 /// toolbar icons are: a rebuilt SVG re-hashes every frame for the same
