@@ -512,6 +512,10 @@ pub struct OptionsState {
     pub login_site: String,
     pub login_user: String,
     pub login_pass: String,
+    /// Row picked in the Connection tab's exception list, so it can be edited
+    /// or removed. `None` is "nothing picked", which is what Remove needs to
+    /// distinguish from "row 0".
+    pub sel_exc: Option<usize>,
     pub conn_exc_server: String,
     pub conn_exc_n: String,
     /// Text buffers for the Download-limit numbers. The draft holds `u64`,
@@ -537,6 +541,7 @@ impl Default for OptionsState {
             login_site: String::new(),
             login_user: String::new(),
             login_pass: String::new(),
+            sel_exc: None,
             conn_exc_server: String::new(),
             conn_exc_n: String::new(),
             dl_limit_mb_txt: String::new(),
@@ -1119,9 +1124,11 @@ pub enum OptField {
     VirusPicked(Option<String>),
     DefaultConns(usize),
     AdaptiveConns(bool),
+    ExcSel(usize),
     ExcServer(String),
     ExcConns(String),
     ExcAdd,
+    ExcRemove,
     DlLimit(bool),
     DlLimitMb(String),
     DlLimitHours(String),
@@ -1323,6 +1330,30 @@ pub struct PowerPrompt {
 /// How long the cancel window lasts. Long enough to catch the dialog on the
 /// way past, short enough not to sit in front of a finished queue.
 pub const POWER_COUNTDOWN_SECS: u8 = 10;
+
+/// The connection count Options > Connection sets aside for `host`, if any.
+///
+/// A `*.` prefix is accepted and means the same thing the bare suffix does; the
+/// match is on the suffix either way, so `example.com` also covers
+/// `cdn.example.com`. FIRST match wins — see [`upsert_exception`] for why that
+/// makes one entry per server an invariant rather than a nicety.
+fn exception_for(list: &[(String, usize)], host: &str) -> Option<usize> {
+    list.iter()
+        .find(|(server, _)| !server.is_empty() && host.ends_with(server.trim_start_matches("*.")))
+        .map(|(_, n)| *n)
+}
+
+/// Set `server`'s exception to `n`, replacing any entry it already has.
+///
+/// Appending instead would leave the older entry in front of the newer one, and
+/// [`exception_for`] reads the first: the number the user just typed would be
+/// stored, displayed, and never used.
+fn upsert_exception(list: &mut Vec<(String, usize)>, server: String, n: usize) {
+    match list.iter_mut().find(|(s, _)| *s == server) {
+        Some(row) => row.1 = n,
+        None => list.push((server, n)),
+    }
+}
 
 impl App {
     pub fn item(&self, id: DlId) -> Option<&DownloadItem> {
@@ -1680,6 +1711,11 @@ impl App {
         self.options.draft = self.cfg.settings.clone();
         self.options.draft_cats = self.cfg.categories.clone();
         self.options.sel_category = "General".into();
+        // Selections are indexes into lists this line has just replaced, so a
+        // selection held from the previous visit points at whatever now happens
+        // to sit at that position — and Remove would take that row instead.
+        self.options.sel_exc = None;
+        self.options.sel_login = None;
         self.options.dl_limit_mb_txt = self.cfg.settings.dl_limit_mb.to_string();
         self.options.dl_limit_hours_txt = self.cfg.settings.dl_limit_hours.to_string();
         self.options.auto_types_edit =
@@ -1971,14 +2007,7 @@ impl App {
     /// Effective connection count for a URL (Connection tab exceptions).
     fn conns_for(&self, url: &str) -> usize {
         let host = engine::parse_url(url).map(|u| u.host).unwrap_or_default();
-        self.cfg
-            .settings
-            .conn_exceptions
-            .iter()
-            .find(|(server, _)| {
-                !server.is_empty() && host.ends_with(server.trim_start_matches("*."))
-            })
-            .map(|(_, n)| *n)
+        exception_for(&self.cfg.settings.conn_exceptions, &host)
             .unwrap_or(self.cfg.settings.default_conns)
             .clamp(1, 32)
     }
@@ -3527,6 +3556,10 @@ impl App {
             Message::NativeMenu(id) => {
                 if id == "show_main" {
                     return self.open_window(WinKind::Main);
+                }
+                if id == crate::tray::THEME_CHANGED {
+                    crate::tray::refresh_icon();
+                    return Task::none();
                 }
                 match MenuAction::from_id(&id) {
                     Some(a) => self.update(Message::Menu(a)),
@@ -6282,16 +6315,34 @@ impl App {
             OptField::VirusPicked(None) => {}
             OptField::DefaultConns(n) => s.default_conns = n,
             OptField::AdaptiveConns(b) => s.adaptive_conns = b,
+            OptField::ExcSel(i) => {
+                self.options.sel_exc = Some(i);
+                if let Some((server, n)) = self.options.draft.conn_exceptions.get(i) {
+                    self.options.conn_exc_server = server.clone();
+                    self.options.conn_exc_n = n.to_string();
+                }
+            }
             OptField::ExcServer(v) => self.options.conn_exc_server = v,
             OptField::ExcConns(v) => self.options.conn_exc_n = v,
             OptField::ExcAdd => {
                 let server = self.options.conn_exc_server.trim().to_string();
                 let n: usize = self.options.conn_exc_n.trim().parse().unwrap_or(0);
                 if !server.is_empty() && n > 0 {
-                    self.options
-                        .draft
-                        .conn_exceptions
-                        .push((server, n.clamp(1, 32)));
+                    upsert_exception(
+                        &mut self.options.draft.conn_exceptions,
+                        server,
+                        n.clamp(1, 32),
+                    );
+                    self.options.sel_exc = None;
+                    self.options.conn_exc_server.clear();
+                    self.options.conn_exc_n.clear();
+                }
+            }
+            OptField::ExcRemove => {
+                if let Some(i) = self.options.sel_exc.take() {
+                    if i < self.options.draft.conn_exceptions.len() {
+                        self.options.draft.conn_exceptions.remove(i);
+                    }
                     self.options.conn_exc_server.clear();
                     self.options.conn_exc_n.clear();
                 }
@@ -7212,6 +7263,55 @@ mod tests {
                 "'{id}' ships a combo no key press normalizes to"
             );
         }
+    }
+
+    /// The Connection tab's list is only as good as the entry the transfer
+    /// actually reads. Re-typing a server has to REPLACE its number, because
+    /// the lookup stops at the first match and a shadowed second entry is a
+    /// setting the user can see, edit and never use.
+    #[test]
+    fn a_re_entered_server_replaces_its_exception_instead_of_shadowing_it() {
+        use super::{exception_for, upsert_exception};
+        let mut list = vec![];
+        upsert_exception(&mut list, "cdn.example.com".into(), 4);
+        upsert_exception(&mut list, "slow.example.org".into(), 1);
+        upsert_exception(&mut list, "cdn.example.com".into(), 16);
+
+        assert_eq!(list.len(), 2, "a repeat is an edit, not a second rule");
+        assert_eq!(exception_for(&list, "cdn.example.com"), Some(16));
+        assert_eq!(exception_for(&list, "slow.example.org"), Some(1));
+    }
+
+    /// Removing the row the user picked must leave the others alone — and must
+    /// take the rule out of force, not merely off the screen.
+    #[test]
+    fn removing_an_exception_takes_its_rule_out_of_force() {
+        use super::{exception_for, upsert_exception};
+        let mut list = vec![];
+        upsert_exception(&mut list, "a.example.com".into(), 2);
+        upsert_exception(&mut list, "b.example.com".into(), 8);
+
+        list.remove(0);
+
+        assert_eq!(exception_for(&list, "a.example.com"), None);
+        assert_eq!(exception_for(&list, "b.example.com"), Some(8));
+    }
+
+    /// A `*.` prefix is how the field is usually filled in, and a bare suffix
+    /// has to mean the same thing. An empty server would match every host, so
+    /// it must match none.
+    #[test]
+    fn an_exception_matches_subdomains_and_never_matches_on_an_empty_server() {
+        use super::exception_for;
+        let list = vec![
+            (String::new(), 32),
+            ("*.example.com".to_string(), 4),
+            ("uplod.ir".to_string(), 1),
+        ];
+        assert_eq!(exception_for(&list, "cdn.example.com"), Some(4));
+        assert_eq!(exception_for(&list, "example.com"), Some(4));
+        assert_eq!(exception_for(&list, "s7.uplod.ir"), Some(1));
+        assert_eq!(exception_for(&list, "other.net"), None);
     }
 
     #[test]
