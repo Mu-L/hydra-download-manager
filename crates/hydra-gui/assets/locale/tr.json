@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "Tamamlanan indirme listeden kendiliğinden kalkar — tamamlanma penceresi gösteriliyorsa o pencere kapatıldıktan sonra. İndirilen dosya korunur.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "Bir ana makine adı ya da adres, veya socks5://127.0.0.1:10808 gibi tam bir belirtim — burada yazılan şema Tür alanına baskın gelir.",
   "A new version of Hydra is available": "Hydra'nın yeni bir sürümü mevcut",
+  "AI & Datasets": "Yapay Zekâ ve Veri Kümeleri",
   "About Hydra": "Hydra Hakkında",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "İndirme klasörüne erişim reddedildi. Hydra'ya Sistem Ayarları > Gizlilik ve Güvenlik > Dosyalar ve Klasörler altında izin verin veya başka bir klasör seçin.",
   "Add URL": "URL Ekle",

@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "يختفي التنزيل المنتهي من القائمة تلقائيًا — بعد إغلاق مربع حوار الاكتمال إذا كان معروضًا. يبقى الملف المنزَّل كما هو.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "اسم مضيف أو عنوان، أو مواصفة كاملة مثل socks5://127.0.0.1:10808 — والمخطط المكتوب هنا يتقدّم على «النوع».",
   "A new version of Hydra is available": "يتوفر إصدار جديد من Hydra",
+  "AI & Datasets": "الذكاء الاصطناعي ومجموعات البيانات",
   "About Hydra": "حول Hydra",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "تم رفض الوصول إلى مجلد التنزيل. اسمح لـ Hydra في إعدادات النظام > الخصوصية والأمان > الملفات والمجلدات، أو اختر مجلدًا آخر.",
   "Add URL": "إضافة رابط",

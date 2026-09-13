@@ -148,9 +148,11 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 dark-light = "3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# Owning dialogs to the main window (dialog_parent.rs). The version winit
-# 0.30 links, so this adds no second copy.
-windows-sys = { version = "0.52", features = ["Win32_UI_WindowsAndMessaging"] }
+
+windows-sys = { version = "0.61", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+] }
 # "Launch on startup" is an HKCU\...\CurrentVersion\Run value:
 # no console flash at logon, and Task Manager's Startup page
 # shows the exe's embedded name and icon. See autostart.rs.
