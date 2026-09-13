@@ -25,6 +25,8 @@ pub struct MenuState {
     pub font_size: u16,
     pub language: String,
     pub speed_limiter: bool,
+    /// Index of the ticked speed profile, if the cap in force matches one.
+    pub speed_profile: Option<usize>,
 }
 
 /// The installed menu, plus the check items whose tick has to track the
@@ -35,6 +37,7 @@ struct Installed {
     _menu: Menu,
     hide_categories: CheckMenuItem,
     speed_limiter: CheckMenuItem,
+    speed_profiles: Vec<CheckMenuItem>,
     themes: Vec<(crate::model::ThemeMode, CheckMenuItem)>,
     fonts: Vec<(u16, CheckMenuItem)>,
     languages: Vec<(String, CheckMenuItem)>,
@@ -61,17 +64,27 @@ fn check(label: &str, action: MenuAction, on: bool) -> CheckMenuItem {
 
 /// Install the menu bar. Must run on the main thread with NSApp up (called
 /// from the first `WindowOpened`); later calls are no-ops.
-pub fn install(state: &MenuState, queues: &[String], languages: &[String]) {
+pub fn install(
+    state: &MenuState,
+    queues: &[String],
+    profiles: &[crate::model::SpeedProfile],
+    languages: &[String],
+) {
     let installed = CURRENT.with(|c| c.borrow().is_some());
     if installed {
         return;
     }
-    reinstall(state, queues, languages);
+    reinstall(state, queues, profiles, languages);
 }
 
 /// Rebuild with the current locale/state and swap it in — called after any
 /// toggle the menu displays (language, dark mode, categories, font, limiter).
-pub fn reinstall(state: &MenuState, queues: &[String], languages: &[String]) {
+pub fn reinstall(
+    state: &MenuState,
+    queues: &[String],
+    profiles: &[crate::model::SpeedProfile],
+    languages: &[String],
+) {
     crate::menubus::ensure_menu_handler();
 
     let menu = Menu::new();
@@ -140,8 +153,31 @@ pub fn reinstall(state: &MenuState, queues: &[String], languages: &[String]) {
         MenuAction::SpeedLimiterToggle,
         state.speed_limiter,
     );
+    let _ = downloads.append(&speed_limiter);
+    let speed_m = Submenu::new(tr("Speed limit profiles"), true);
+    let mut speed_profiles = Vec::new();
+    for (i, p) in profiles.iter().enumerate() {
+        let label = match p.limit {
+            Some(_) => format!("{} \u{2014} {}", tr(&p.name), crate::fmt::limit(p.limit)),
+            None => tr(&p.name),
+        };
+        let it = CheckMenuItem::with_id(
+            MenuAction::SpeedProfile(p.name.clone()).id(),
+            label,
+            true,
+            state.speed_profile == Some(i),
+            None,
+        );
+        let _ = speed_m.append(&it);
+        speed_profiles.push(it);
+    }
+    let _ = speed_m.append(&PredefinedMenuItem::separator());
+    let _ = speed_m.append(&item(
+        "Speed limit settings",
+        MenuAction::SpeedLimitSettings,
+    ));
+    let _ = downloads.append(&speed_m);
     let _ = downloads.append_items(&[
-        &speed_limiter,
         &PredefinedMenuItem::separator(),
         &item("Options", MenuAction::Options),
     ]);
@@ -219,6 +255,7 @@ pub fn reinstall(state: &MenuState, queues: &[String], languages: &[String]) {
             _menu: menu,
             hide_categories,
             speed_limiter,
+            speed_profiles,
             themes,
             fonts,
             languages: langs,
@@ -246,6 +283,9 @@ pub fn sync(state: &MenuState) -> bool {
             .hide_categories
             .set_checked(!state.show_categories);
         installed.speed_limiter.set_checked(state.speed_limiter);
+        for (i, item) in installed.speed_profiles.iter().enumerate() {
+            item.set_checked(state.speed_profile == Some(i));
+        }
         for (mode, item) in &installed.themes {
             item.set_checked(*mode == state.theme_mode);
         }

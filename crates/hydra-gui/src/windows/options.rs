@@ -501,6 +501,16 @@ fn quota_line(app: &App) -> String {
     )
 }
 
+/// Height of the Connection tab's two row lists.
+///
+/// The tab is long enough that its height is a budget, not a free choice: at
+/// the stock font the whole page has to fit the Configuration window without
+/// the body scrolling. This is what is left for each list once the rest of
+/// the page has taken its share — three rows plus the 3pt inset, which shows
+/// the stock speed profiles in full and still hints at a fourth row when a
+/// list has one.
+const LIST_H: f32 = 70.0;
+
 fn connection(app: &App) -> El<'_> {
     let s = &app.options.draft;
     let st = &app.options;
@@ -519,6 +529,22 @@ fn connection(app: &App) -> El<'_> {
             .width(Length::Fill)
             .style(theme::btn_row(st.sel_exc == Some(i)))
             .on_press(o(OptField::ExcSel(i))),
+        );
+    }
+    let mut profiles = column![].spacing(2);
+    for (i, p) in s.speed_profiles.iter().enumerate() {
+        profiles = profiles.push(
+            button(
+                row![
+                    container(text(tr(&p.name)).size(theme::FONT_SIZE)).width(Length::Fill),
+                    container(text(crate::fmt::limit(p.limit)).size(theme::FONT_SIZE)).width(90.0),
+                ]
+                .spacing(6),
+            )
+            .padding([1, 2])
+            .width(Length::Fill)
+            .style(theme::btn_row(st.sel_profile == Some(i)))
+            .on_press(o(OptField::ProfileSel(i))),
         );
     }
     column![
@@ -545,9 +571,9 @@ fn connection(app: &App) -> El<'_> {
         ),
         text(tr("Exceptions:")).size(theme::FONT_SIZE),
         container(scrollable(exc).height(Length::Fill))
-            .padding(8)
+            .padding(3)
             .width(Length::Fill)
-            .height(120.0)
+            .height(LIST_H)
             .style(theme::panel),
         row![
             text_input(&tr("Server"), &st.conn_exc_server)
@@ -564,6 +590,57 @@ fn connection(app: &App) -> El<'_> {
             dlg_btn(
                 tr("Remove"),
                 st.sel_exc.map(|_| o(OptField::ExcRemove)),
+            ),
+        ]
+        .spacing(8),
+        section(tr("Speed limiter")),
+        // Switch and value share a row. Two rows read no better and this tab
+        // has to fit its window without scrolling.
+        row![
+            hinted(
+                checkbox(s.speed_limiter_on)
+                    .label(tr("Limit download speed"))
+                    .on_toggle(|b| o(OptField::SpeedLimiter(b)))
+                    .size(15.0)
+                    .text_size(theme::FONT_SIZE)
+                    .style(theme::check),
+                tr("Caps the combined speed of every download that has no limit of its own. The toolbar's Speed Limit button switches the same cap on and off while downloads run."),
+            ),
+            text_input("500", &st.speed_limit_kb_txt)
+                .on_input(|v| o(OptField::SpeedLimitKb(v)))
+                .size(theme::FONT_SIZE)
+                .style(theme::input)
+                .width(80.0),
+            text(tr("KB/sec")).size(theme::FONT_SIZE),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+        // The hint rides the label, not the row below it: a tooltip over the
+        // name and speed boxes would pop up while they are being typed into.
+        hinted(
+            text(tr("Profiles:")).size(theme::FONT_SIZE),
+            tr("Named caps the toolbar's Speed Limit arrow switches between in one click. Leave the speed empty for a profile that turns the limiter off; saving a name that is already in the list retunes it."),
+        ),
+        container(scrollable(profiles).height(Length::Fill))
+            .padding(3)
+            .width(Length::Fill)
+            .height(LIST_H)
+            .style(theme::panel),
+        row![
+            text_input(&tr("Name"), &st.profile_name)
+                .on_input(|v| o(OptField::ProfileName(v)))
+                .size(theme::FONT_SIZE)
+                .style(theme::input)
+                .width(Length::Fill),
+            text_input(&tr("KB/sec"), &st.profile_kb)
+                .on_input(|v| o(OptField::ProfileKb(v)))
+                .size(theme::FONT_SIZE)
+                .style(theme::input)
+                .width(90.0),
+            dlg_btn(tr("New"), Some(o(OptField::ProfileAdd))),
+            dlg_btn(
+                tr("Remove"),
+                st.sel_profile.map(|_| o(OptField::ProfileRemove)),
             ),
         ]
         .spacing(8),

@@ -207,6 +207,7 @@ fn boot() -> (App, Task<Message>) {
         pending_add: None,
         capture_raise: false,
         queue_menu: None,
+        speed_menu: false,
         list_press: None,
         list_drag: false,
         band: None,
