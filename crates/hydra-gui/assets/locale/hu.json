@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "A befejezett letöltés magától lekerül a listáról — a befejezési ablak bezárása után, ha az megjelenik. A letöltött fájl megmarad.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "Gépnév vagy cím, illetve teljes megadás, például socks5://127.0.0.1:10808 — az itt megadott séma erősebb a Típus mezőnél.",
   "A new version of Hydra is available": "Új Hydra verzió érhető el",
+  "AI & Datasets": "MI és adathalmazok",
   "About Hydra": "A Hydra névjegye",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "A letöltési mappához való hozzáférés megtagadva. Engedélyezze a Hydrát a Rendszerbeállítások > Adatvédelem és biztonság > Fájlok és mappák alatt, vagy válasszon másik mappát.",
   "Add URL": "URL hozzáadása",

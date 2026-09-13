@@ -2101,7 +2101,7 @@ dependencies = [
  "tokio",
  "toml",
  "tray-icon",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "winreg 0.56.0",
  "x11rb",
  "zip",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "hya-net"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "blake3",
  "criterion",

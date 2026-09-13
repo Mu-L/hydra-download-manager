@@ -72,6 +72,14 @@ async fn spawn_origin() -> u16 {
                     let _ = s.write_all(reply).await;
                     return;
                 }
+                if path.ends_with("/silent") && method == "HEAD" {
+                    // Worse than hanging up: the socket stays open and nothing
+                    // ever arrives on it, so the read loop has neither an answer
+                    // nor an EOF to end on. `s7.uplod.ir:182` does exactly this.
+                    // Outlives the probe's patience by a wide margin.
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    return;
+                }
                 if method == "HEAD" {
                     // No status line, no headers, no close_notify: just a socket
                     // that goes away. This is the whole bug.
@@ -135,6 +143,31 @@ async fn a_head_refusing_origin_still_yields_size_and_range_support() {
         "a 206 proves range support, so the transfer must be resumable and parallel"
     );
     assert!(p.validator.is_some(), "the ETag must survive the fallback");
+}
+
+/// An origin that never answers HEAD at all — no reply, no close — must not hold
+/// the download open forever.
+///
+/// The hetzner shape above at least hangs up, which ends the read loop. This one
+/// does not, and `probe` has no deadline of its own, so the transfer sat in
+/// "Connecting..." with Stop unable to reach it. Silence has to become a fallback
+/// to the ranged GET, the same as any other unusable HEAD.
+///
+/// Slow by construction: the whole point is that the probe's patience runs out,
+/// and there is no answer to wait for until it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_head_that_is_never_answered_falls_back_to_the_ranged_get() {
+    let port = spawn_origin().await;
+    let conn = Arc::new(hya_net::TlsCapableConnector::new().expect("client must build"));
+    let t = Target::direct("127.0.0.1", port, "/silent");
+
+    let p = tokio::time::timeout(Duration::from_secs(60), probe_resilient(conn.as_ref(), &t))
+        .await
+        .expect("a silent HEAD must not hang the probe")
+        .expect("the ranged GET must answer where HEAD says nothing");
+
+    assert_eq!(p.size, TOTAL, "the ranged GET carries the object's length");
+    assert!(p.ranges, "a 206 proves range support");
 }
 
 /// The fallback must not turn an empty object into a failed download.

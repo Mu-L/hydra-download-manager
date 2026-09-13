@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "完了したダウンロードはリストから自動的に消えます — 完了ダイアログを表示している場合は、それを閉じた後に消えます。ダウンロードしたファイルは残ります。",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "ホスト名かアドレス、または socks5://127.0.0.1:10808 のような完全な指定 — ここに書いたスキームは「種類」より優先されます。",
   "A new version of Hydra is available": "Hydra の新しいバージョンが利用可能です",
+  "AI & Datasets": "AI・データセット",
   "About Hydra": "Hydra について",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "ダウンロードフォルダへのアクセスが拒否されました。「システム設定 > プライバシーとセキュリティ > ファイルとフォルダ」でHydraを許可するか、別のフォルダを選択してください。",
   "Add URL": "URLを追加",
