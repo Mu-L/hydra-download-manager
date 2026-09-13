@@ -55,6 +55,12 @@ xcrun safari-web-extension-converter "$OUT/Resources" \
 
 PROJ_DIR="$GEN/$APP_NAME"
 
+# Ensure parent app bundle identifier matches extension prefix (io.github.ja7ad.hydra.safari)
+# so Xcode ValidateEmbeddedBinary passes.
+find "$PROJ_DIR" -name "project.pbxproj" -exec sed -i '' \
+  -e 's/io\.github\.ja7ad\.hydra\.Hydra-Safari-Extension/io.github.ja7ad.hydra.safari/g' \
+  {} + 2>/dev/null || true
+
 # Our handler instead of the generated echo stub.
 HANDLER=$(find "$PROJ_DIR" -name "SafariWebExtensionHandler.swift" | head -1)
 [ -n "$HANDLER" ] || { echo "handler not found in generated project" >&2; exit 1; }
