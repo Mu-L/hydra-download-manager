@@ -951,6 +951,10 @@ pub struct Settings {
     pub show_speed_tab: bool,
     pub show_completion_tab: bool,
     pub show_hide_buttons: bool,
+    /// Whether a progress window opens with the per-connection panel already
+    /// expanded. Only the state a window starts in — the Show/Hide details
+    /// button still governs it once the window is up.
+    pub show_conn_details: bool,
     pub show_complete_dialog: bool,
     /// Take a download off the list once it has finished — after the
     /// complete dialog is closed, when that dialog is enabled. Only the row
@@ -1054,6 +1058,7 @@ impl Default for Settings {
             show_speed_tab: true,
             show_completion_tab: true,
             show_hide_buttons: true,
+            show_conn_details: true,
             show_complete_dialog: true,
             remove_completed: false,
             user_agent: format!("hydra-gui/{}", env!("CARGO_PKG_VERSION")),
