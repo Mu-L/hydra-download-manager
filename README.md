@@ -186,8 +186,12 @@ brew install --cask ja7ad/tap/hydra
 ```bash
 sudo add-apt-repository ppa:sonycore/hydra
 sudo apt update
-sudo apt install hydra
+sudo apt install hydra-download-manager
 ```
+
+> The package is `hydra-download-manager`, not `hydra` — `hydra` in the
+> Ubuntu archive is THC-Hydra, the login cracker, and it is what
+> `apt install hydra` gives you.
 
 > PPA Repository: [launchpad.net/~sonycore/+archive/ubuntu/hydra](https://launchpad.net/~sonycore/+archive/ubuntu/hydra)
 
@@ -195,7 +199,7 @@ sudo apt install hydra
 
 ```bash
 sudo dnf copr enable sonycore/hydra
-sudo dnf install hydra
+sudo dnf install hydra-download-manager
 ```
 
 > COPR Repository: [copr.fedorainfracloud.org/coprs/sonycore/hydra](https://copr.fedorainfracloud.org/coprs/sonycore/hydra/)
