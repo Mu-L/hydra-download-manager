@@ -255,6 +255,23 @@ pub fn stop_queue(enabled: bool) -> svg::Handle {
         .clone()
 }
 
+/// Speedometer: a dial arc with a needle, for the Speed Limiter.
+pub fn speed_limit(enabled: bool) -> svg::Handle {
+    // Rasterized-icon handles are cached: rebuilding the SVG string every
+    // frame re-hashed kilobytes per icon per redraw for identical pixels.
+    static C: OnceLock<[svg::Handle; 2]> = OnceLock::new();
+    C.get_or_init(|| {
+        let make = |enabled| gradient_icon(
+        r#"<path d="M5.5 22 a11.5 11.5 0 1 1 21 0"/><path d="M16 20.5 L22 12.5"/><circle cx="16" cy="21.5" r="1.8"/><path d="M7.5 14.5 l1.8 1 M16 8 v2 M24.5 14.5 l-1.8 1"/>"#,
+        "#E8A33D",
+        "#4F8FE8",
+            enabled,
+        );
+        [make(false), make(true)]
+    })[enabled as usize]
+        .clone()
+}
+
 pub fn extensions(enabled: bool) -> svg::Handle {
     // Rasterized-icon handles are cached: rebuilding the SVG string every
     // frame re-hashed kilobytes per icon per redraw for identical pixels.
