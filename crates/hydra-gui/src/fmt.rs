@@ -96,6 +96,30 @@ pub fn rate_capped(bytes_per_sec: f64, cap: Option<u64>) -> String {
     )
 }
 
+/// `500 KB/s`, `1.5 MB/s`, `Unlimited` — the Speed Limiter's spelling.
+///
+/// Separate from [`rate`] because this one labels a button rather than
+/// reports a measurement: three decimals are noise on a figure the user
+/// typed, and a toolbar label has no room for them.
+pub fn limit(cap: Option<u64>) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let Some(b) = cap.filter(|c| *c > 0) else {
+        return crate::i18n::tr("Unlimited");
+    };
+    let b = b as f64;
+    let (v, unit) = if b >= MB {
+        (b / MB, "MB/s")
+    } else {
+        (b / KB, "KB/s")
+    };
+    if v.fract() < 0.05 {
+        format!("{v:.0} {unit}")
+    } else {
+        format!("{v:.1} {unit}")
+    }
+}
+
 /// `3 min 32 sec`, `1 hr 12 min`, `45 sec`.
 pub fn eta(secs: u64) -> String {
     if secs >= 3600 {
@@ -163,5 +187,21 @@ mod tests {
         // An idle transfer has no rate to report, capped or not.
         assert!(rate_capped(0.0, cap).is_empty());
         assert_eq!(rate_capped(102_400.0, None), "100.000 KB/sec");
+    }
+
+    /// The Speed Limit button's label: a figure the user typed, spelled back
+    /// the way they typed it, short enough to sit under a toolbar icon.
+    #[test]
+    fn a_cap_reads_back_as_the_round_number_it_was_set_to() {
+        assert_eq!(limit(Some(500 * 1024)), "500 KB/s");
+        assert_eq!(limit(Some(1024 * 1024)), "1 MB/s");
+        assert_eq!(limit(Some(5 * 1024 * 1024)), "5 MB/s");
+        // A cap between the two units keeps one decimal rather than rounding
+        // to a figure the user never asked for.
+        assert_eq!(limit(Some(1536 * 1024)), "1.5 MB/s");
+        assert_eq!(limit(Some(1)), "0 KB/s");
+        // No cap, and the degenerate zero one, both read as no limit.
+        assert_eq!(limit(None), "Unlimited");
+        assert_eq!(limit(Some(0)), "Unlimited");
     }
 }

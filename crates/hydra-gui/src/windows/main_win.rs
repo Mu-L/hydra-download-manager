@@ -77,6 +77,8 @@ pub fn view(app: &App) -> El<'_> {
             })
             .collect();
         Some(menu::overlay(app, items, at))
+    } else if let (true, Some(at)) = (app.speed_menu, app.ctx_at) {
+        Some(menu::overlay(app, menu::speed_entries(app), at))
     } else if let Some((at, items)) = app
         .ctx_at
         .map(|at| (at, menu::context_entries(app)))

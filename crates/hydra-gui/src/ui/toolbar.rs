@@ -40,6 +40,7 @@ pub fn view(app: &App) -> El<'_> {
         .any(|d| matches!(d.state, DlState::Paused | DlState::Error | DlState::Queued));
     let any_active = app.state.downloads.iter().any(|d| d.state.is_active());
     let any_queue_running = app.cfg.queues.iter().any(|q| q.running);
+    let limit = app.cfg.settings.global_limit();
     let main_q = app
         .cfg
         .queues
@@ -115,6 +116,22 @@ pub fn view(app: &App) -> El<'_> {
             .padding([4, 3])
             .style(theme::btn_toolbar)
             .on_press(Message::QueueMenuOpen(false)),
+        // Speed Limiter, one click from the queue it is throttling: the big
+        // button switches the cap on and off, the arrow picks a profile.
+        // Its label is the cap in force rather than a fixed word — a limit
+        // left on by mistake is the failure mode worth making visible.
+        tool(
+            icons::speed_limit(limit.is_some()),
+            match limit {
+                Some(_) => crate::fmt::limit(limit),
+                None => tr("Speed Limit"),
+            },
+            Some(Message::Menu(MenuAction::SpeedLimiterToggle)),
+        ),
+        button(text("▾").size(theme::FONT_SIZE))
+            .padding([4, 3])
+            .style(theme::btn_toolbar)
+            .on_press(Message::SpeedMenuOpen),
     ]
     .spacing(4)
     .padding([4, 8])
