@@ -1277,6 +1277,7 @@ pub enum OptField {
     SpeedTab(bool),
     CompletionTab(bool),
     HideButtons(bool),
+    ConnDetails(bool),
     CompleteDialog(bool),
     RemoveCompleted(bool),
     UserAgent(String),
@@ -2095,7 +2096,11 @@ impl App {
             // Matches ProgToggleDetails: a box whose details are hidden
             // must not spring back open when the font ratio resizes it.
             WinKind::Progress(id) => {
-                let details = self.prog.get(&id).map(|p| p.details).unwrap_or(true);
+                let details = self
+                    .prog
+                    .get(&id)
+                    .map(|p| p.details)
+                    .unwrap_or(self.cfg.settings.show_conn_details);
                 (680.0, if details { 582.0 } else { 352.0 })
             }
             WinKind::Complete(_) => (600.0, 180.0),
@@ -2679,10 +2684,11 @@ impl App {
     /// the window's own — it survives unless the item names an address.
     fn sync_prog_state(&mut self, id: DlId) {
         let (seed, proxy) = self.prog_seed_of(id);
+        let details = self.cfg.settings.show_conn_details;
         let p = self
             .prog
             .entry(id)
-            .or_insert_with(|| prog_state_seed(seed, &proxy));
+            .or_insert_with(|| prog_state_seed(seed, &proxy, details));
         p.proxy_pick = proxy.pick();
         if !proxy.spec().is_empty() {
             p.proxy_spec = proxy.spec().to_string();
@@ -5287,6 +5293,8 @@ impl App {
             Message::OptCopy(value) => iced::clipboard::write(value),
             Message::OptOk => {
                 self.options.commit_cat_exts();
+                let details = self.options.draft.show_conn_details;
+                let details_changed = details != self.cfg.settings.show_conn_details;
                 self.cfg.settings = self.options.draft.clone();
                 self.cfg.categories = self.options.draft_cats.clone();
                 self.apply_category_edits();
@@ -5315,7 +5323,28 @@ impl App {
                         .map(|id| self.skip_taskbar_task(id))
                         .collect::<Vec<_>>(),
                 );
-                Task::batch([skip_taskbar, self.close_window(WinKind::Options)])
+                // A progress box keeps its own Show/Hide details state for
+                // the session, so without this the new default would not
+                // reach a download whose box has already been opened once —
+                // the very boxes the person changing it is looking at.
+                let details_task = if details_changed {
+                    for p in self.prog.values_mut() {
+                        p.details = details;
+                    }
+                    Task::batch(
+                        self.prog
+                            .keys()
+                            .map(|id| self.resize_open(WinKind::Progress(*id)))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    skip_taskbar,
+                    details_task,
+                    self.close_window(WinKind::Options),
+                ])
             }
             Message::OptDraft(f) => self.on_opt_field(f),
 
@@ -6646,6 +6675,7 @@ impl App {
             OptField::SpeedTab(b) => s.show_speed_tab = b,
             OptField::CompletionTab(b) => s.show_completion_tab = b,
             OptField::HideButtons(b) => s.show_hide_buttons = b,
+            OptField::ConnDetails(b) => s.show_conn_details = b,
             OptField::CompleteDialog(b) => s.show_complete_dialog = b,
             OptField::RemoveCompleted(b) => s.remove_completed = b,
             OptField::UserAgent(v) => s.user_agent = v,
@@ -7541,10 +7571,12 @@ pub fn promote_queue_members(downloads: &mut [DownloadItem], queue: &str) {
 
 /// Progress-dialog state seeded from the item's live cap, so the Speed
 /// Limiter tab tells the truth about a persisted per-download limit instead
-/// of showing an unchecked box while the cap is active.
-fn prog_state_seed(speed_limit: Option<u64>, proxy: &ProxyChoice) -> ProgState {
+/// of showing an unchecked box while the cap is active. `details` is the
+/// Downloads-tab default for the connections panel; the window's own
+/// Show/Hide details button takes over from there.
+fn prog_state_seed(speed_limit: Option<u64>, proxy: &ProxyChoice, details: bool) -> ProgState {
     ProgState {
-        details: true,
+        details,
         limit_on: speed_limit.is_some(),
         limit_kb: (speed_limit.unwrap_or(10 * 1024) / 1024).to_string(),
         remember_limit: speed_limit.is_some(),
@@ -8676,14 +8708,29 @@ mod tests {
 
     #[test]
     fn prog_state_seed_reflects_persisted_limit() {
-        let p = prog_state_seed(Some(512 * 1024), &ProxyChoice::Default);
+        let p = prog_state_seed(Some(512 * 1024), &ProxyChoice::Default, true);
         assert!(p.limit_on);
         assert!(p.remember_limit);
         assert_eq!(p.limit_kb, "512");
-        let p = prog_state_seed(None, &ProxyChoice::Default);
+        let p = prog_state_seed(None, &ProxyChoice::Default, true);
         assert!(!p.limit_on);
         assert!(!p.remember_limit);
         assert_eq!(p.limit_kb, "10");
+    }
+
+    /// Downloads > "Show connection details" decides the state a progress
+    /// box opens in. Off means collapsed from the first frame — not a panel
+    /// that appears and then folds away.
+    #[test]
+    fn the_connection_details_setting_seeds_a_new_progress_box() {
+        for details in [true, false] {
+            let p = prog_state_seed(None, &ProxyChoice::Default, details);
+            assert_eq!(p.details, details);
+        }
+        assert!(
+            crate::model::Settings::default().show_conn_details,
+            "the panel stays on out of the box"
+        );
     }
 
     /// Editing the category list must not strand the downloads already filed
