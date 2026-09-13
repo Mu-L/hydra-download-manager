@@ -83,7 +83,7 @@ impl Entry {
         self
     }
 
-    fn check(mut self, on: bool) -> Self {
+    pub fn check(mut self, on: bool) -> Self {
         self.checked = on;
         self
     }
@@ -96,6 +96,32 @@ pub const BAR: [(MenuBarKind, &str); 5] = [
     (MenuBarKind::View, "View"),
     (MenuBarKind::Help, "Help"),
 ];
+
+/// The Speed Limiter's profile list: every profile with the cap it sets,
+/// ticked on the one in force, and a way through to where they are edited.
+///
+/// Shared by the toolbar's split button and Downloads > Speed limit profiles,
+/// so the quick control and the menu bar can never drift apart.
+pub fn speed_entries(app: &App) -> Vec<Entry> {
+    let active = app.cfg.settings.active_profile();
+    let mut items: Vec<Entry> = app
+        .cfg
+        .settings
+        .speed_profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let label = match p.limit {
+                Some(_) => format!("{} \u{2014} {}", tr(&p.name), crate::fmt::limit(p.limit)),
+                None => tr(&p.name),
+            };
+            Entry::plain(label, MenuAction::SpeedProfile(p.name.clone()), true)
+                .check(active == Some(i))
+        })
+        .collect();
+    items.push(Entry::item(tr("Speed limit settings"), MenuAction::SpeedLimitSettings).sep());
+    items
+}
 
 /// Entries of one top-level menu, with enabled state derived from `app`.
 pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
@@ -171,6 +197,7 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
                 Entry::item(tr("Speed Limiter"), MenuAction::SpeedLimiterToggle)
                     .check(app.cfg.settings.speed_limiter_on)
                     .sep(),
+                Entry::sub(tr("Speed limit profiles"), speed_entries(app)),
                 Entry::item(tr("Options"), MenuAction::Options).sep(),
             ]
         }

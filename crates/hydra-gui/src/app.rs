@@ -94,6 +94,10 @@ pub enum MenuAction {
     StartQueue(String),
     StopQueue(String),
     SpeedLimiterToggle,
+    /// Switch the Speed Limiter to the named profile, cap and all.
+    SpeedProfile(String),
+    /// Options, opened on the Connection page where the profiles are edited.
+    SpeedLimitSettings,
     Options,
     /// Options, opened straight on the Extensions page (toolbar shortcut).
     Extensions,
@@ -154,6 +158,8 @@ impl MenuAction {
             MenuAction::StartQueue(q) => format!("start_queue:{q}"),
             MenuAction::StopQueue(q) => format!("stop_queue:{q}"),
             MenuAction::SpeedLimiterToggle => "speed_limiter".into(),
+            MenuAction::SpeedProfile(p) => format!("speed_profile:{p}"),
+            MenuAction::SpeedLimitSettings => "speed_limit_settings".into(),
             MenuAction::Options => "options".into(),
             MenuAction::Extensions => "extensions".into(),
             MenuAction::HideCategories => "hide_cats".into(),
@@ -189,6 +195,9 @@ impl MenuAction {
         }
         if let Some(q) = id.strip_prefix("stop_queue:") {
             return Some(MenuAction::StopQueue(q.into()));
+        }
+        if let Some(p) = id.strip_prefix("speed_profile:") {
+            return Some(MenuAction::SpeedProfile(p.into()));
         }
         if let Some(k) = id.strip_prefix("arrange:") {
             return Some(MenuAction::ArrangeBy(
@@ -243,6 +252,7 @@ impl MenuAction {
             "find" => MenuAction::Find,
             "scheduler" => MenuAction::Scheduler,
             "speed_limiter" => MenuAction::SpeedLimiterToggle,
+            "speed_limit_settings" => MenuAction::SpeedLimitSettings,
             "options" => MenuAction::Options,
             "extensions" => MenuAction::Extensions,
             "hide_cats" => MenuAction::HideCategories,
@@ -545,6 +555,15 @@ pub struct OptionsState {
     /// typed; the draft takes it whenever it parses.
     pub dl_limit_mb_txt: String,
     pub dl_limit_hours_txt: String,
+    /// Text buffer for the global speed cap, in KB/sec — same reason as the
+    /// download-limit buffers above.
+    pub speed_limit_kb_txt: String,
+    /// Row picked in the speed-profile list, and the name/speed boxes that
+    /// edit it. `None` is "nothing picked", which is what Remove needs to
+    /// tell apart from "row 0".
+    pub sel_profile: Option<usize>,
+    pub profile_name: String,
+    pub profile_kb: String,
 }
 
 impl Default for OptionsState {
@@ -568,6 +587,10 @@ impl Default for OptionsState {
             conn_exc_n: String::new(),
             dl_limit_mb_txt: String::new(),
             dl_limit_hours_txt: String::new(),
+            speed_limit_kb_txt: String::new(),
+            sel_profile: None,
+            profile_name: String::new(),
+            profile_kb: String::new(),
         }
     }
 }
@@ -1095,6 +1118,8 @@ pub enum Message {
     HeaderEnter(Column),
     HeaderExit(Column),
     QueueMenuOpen(bool),
+    /// The Speed Limit split button's arrow: open the profile list.
+    SpeedMenuOpen,
     ClipboardAddStart(Option<String>),
     ShortcutEdit(String, String),
     MouseUp,
@@ -1295,6 +1320,13 @@ pub enum OptField {
     DlLimit(bool),
     DlLimitMb(String),
     DlLimitHours(String),
+    SpeedLimiter(bool),
+    SpeedLimitKb(String),
+    ProfileSel(usize),
+    ProfileName(String),
+    ProfileKb(String),
+    ProfileAdd,
+    ProfileRemove,
     WarnStop(bool),
     ProxyMode(ProxyMode),
     ProxyScript(String),
@@ -1426,6 +1458,8 @@ pub struct App {
     /// Open split-button dropdown on the toolbar: Some(true)=Start queue,
     /// Some(false)=Stop queue.
     pub queue_menu: Option<bool>,
+    /// The Speed Limit split button's profile dropdown is open.
+    pub speed_menu: bool,
     /// Anchor row of an in-progress drag-selection: the first row the sweep
     /// touched. `None` while a drag that started on empty space has not
     /// reached a row yet.
@@ -1527,6 +1561,18 @@ fn upsert_exception(list: &mut Vec<(String, usize)>, server: String, n: usize) {
     match list.iter_mut().find(|(s, _)| *s == server) {
         Some(row) => row.1 = n,
         None => list.push((server, n)),
+    }
+}
+
+/// Retune `name`'s profile, or add it when the list has no such name.
+///
+/// Names are what the menus address a profile by ([`MenuAction::SpeedProfile`]),
+/// so a second profile under a name already taken would be unreachable — the
+/// menu entry would always resolve to the first.
+fn upsert_profile(list: &mut Vec<crate::model::SpeedProfile>, name: String, limit: Option<u64>) {
+    match list.iter_mut().find(|p| p.name == name) {
+        Some(row) => row.limit = limit,
+        None => list.push(crate::model::SpeedProfile { name, limit }),
     }
 }
 
@@ -1690,7 +1736,12 @@ impl App {
     pub fn refresh_native_menu(&self) {
         let state = self.native_menu_state();
         let queues: Vec<String> = self.cfg.queues.iter().map(|q| q.name.clone()).collect();
-        crate::macos_menu::reinstall(&state, &queues, &i18n::available());
+        crate::macos_menu::reinstall(
+            &state,
+            &queues,
+            &self.cfg.settings.speed_profiles,
+            &i18n::available(),
+        );
     }
 
     /// Re-tick the menu bar for a setting it displays, without rebuilding it.
@@ -1725,6 +1776,7 @@ impl App {
                 }
             },
             speed_limiter: self.cfg.settings.speed_limiter_on,
+            speed_profile: self.cfg.settings.active_profile(),
         }
     }
 
@@ -1979,6 +2031,15 @@ impl App {
         // to sit at that position — and Remove would take that row instead.
         self.options.sel_exc = None;
         self.options.sel_login = None;
+        self.options.sel_profile = None;
+        self.options.profile_name.clear();
+        self.options.profile_kb.clear();
+        self.options.speed_limit_kb_txt = self
+            .cfg
+            .settings
+            .global_speed_limit
+            .map(|b| (b / 1024).to_string())
+            .unwrap_or_default();
         self.options.dl_limit_mb_txt = self.cfg.settings.dl_limit_mb.to_string();
         self.options.dl_limit_hours_txt = self.cfg.settings.dl_limit_hours.to_string();
         self.options.auto_types_edit =
@@ -2206,7 +2267,7 @@ impl App {
             // a minimum straight to winit, so this one is in OS points and
             // does carry the font ratio.
             min_size: (kind == WinKind::Main)
-                .then(|| iced::Size::new(900.0 * scale, 600.0 * scale)),
+                .then(|| iced::Size::new(MAIN_MIN_W * scale, MAIN_MIN_H * scale)),
             resizable,
             minimizable,
             position,
@@ -2300,11 +2361,19 @@ impl App {
     /// the figure the engine was handed, so it is also the one the views may
     /// present as the transfer's ceiling.
     pub(crate) fn effective_limit(&self, d: &DownloadItem) -> Option<u64> {
-        d.speed_limit.or(if self.cfg.settings.speed_limiter_on {
-            self.cfg.settings.global_speed_limit
-        } else {
-            None
-        })
+        d.speed_limit.or_else(|| self.cfg.settings.global_limit())
+    }
+
+    /// Hand every running transfer the cap it should now be under.
+    ///
+    /// A download without a cap of its own inherits the global one, so a
+    /// change to the Speed Limiter has to reach the transfers already in
+    /// flight: a limit that only applied to the next download would miss the
+    /// case it exists for — freeing bandwidth while something large runs.
+    fn push_speed_limits(&self) {
+        for d in self.state.downloads.iter().filter(|d| d.state.is_active()) {
+            engine::send(Cmd::SetLimit(d.id, self.effective_limit(d)));
+        }
     }
 
     // ------------------------------------------------- download limit
@@ -3592,10 +3661,16 @@ impl App {
                         font_size: self.cfg.settings.font_size,
                         language: self.cfg.language.clone().unwrap_or_else(|| "en".into()),
                         speed_limiter: self.cfg.settings.speed_limiter_on,
+                        speed_profile: self.cfg.settings.active_profile(),
                     };
                     let queues: Vec<String> =
                         self.cfg.queues.iter().map(|q| q.name.clone()).collect();
-                    crate::macos_menu::install(&state, &queues, &crate::i18n::available());
+                    crate::macos_menu::install(
+                        &state,
+                        &queues,
+                        &self.cfg.settings.speed_profiles,
+                        &crate::i18n::available(),
+                    );
                 }
                 {
                     let queues: Vec<String> =
@@ -3742,8 +3817,8 @@ impl App {
                     // arrives in: below it the size is not one the user
                     // could have dragged to.
                     let resized = Some((self.main_size.width, self.main_size.height));
-                    if size.width >= 900.0
-                        && size.height >= 600.0
+                    if size.width >= MAIN_MIN_W
+                        && size.height >= MAIN_MIN_H
                         && self.cfg.settings.window_size != resized
                     {
                         self.cfg.settings.window_size = resized;
@@ -3877,6 +3952,7 @@ impl App {
                 self.open_submenu = None;
                 self.ctx_at = None;
                 self.queue_menu = None;
+                self.speed_menu = false;
                 self.header_ctx = None;
                 Task::none()
             }
@@ -3889,6 +3965,7 @@ impl App {
                 self.open_submenu = None;
                 self.ctx_at = None;
                 self.queue_menu = None;
+                self.speed_menu = false;
                 self.header_ctx = None;
                 self.on_menu(action)
             }
@@ -4244,6 +4321,11 @@ impl App {
             }
             Message::QueueMenuOpen(start) => {
                 self.queue_menu = Some(start);
+                self.ctx_at = Some(self.cursor_now());
+                Task::none()
+            }
+            Message::SpeedMenuOpen => {
+                self.speed_menu = true;
                 self.ctx_at = Some(self.cursor_now());
                 Task::none()
             }
@@ -5299,6 +5381,13 @@ impl App {
                 self.cfg.categories = self.options.draft_cats.clone();
                 self.apply_category_edits();
                 self.save_config();
+                // The Speed Limiter is editable here as well as from the
+                // toolbar, and the transfers it applies to are running while
+                // this window is open.
+                self.push_speed_limits();
+                // The profile list feeds the native menu's Speed limit
+                // submenu, so a renamed or deleted profile has to rebuild it.
+                self.refresh_native_menu();
                 // Re-resolve the proxy here rather than at the next transfer:
                 // a route the app cannot take must be reported while the user
                 // is still looking at the tab they set it on.
@@ -6376,20 +6465,35 @@ impl App {
                 if self.cfg.settings.global_speed_limit.is_none() {
                     self.cfg.settings.global_speed_limit = Some(128 * 1024);
                 }
-                let updates: Vec<(DlId, Option<u64>)> = self
-                    .state
-                    .downloads
-                    .iter()
-                    .filter(|d| d.state.is_active())
-                    .map(|d| (d.id, self.effective_limit(d)))
-                    .collect();
-                for (id, lim) in updates {
-                    engine::send(Cmd::SetLimit(id, lim));
-                }
+                self.push_speed_limits();
                 self.save_config();
                 self.sync_native_menu();
                 Task::none()
             }
+            MenuAction::SpeedProfile(name) => {
+                let Some(limit) = self
+                    .cfg
+                    .settings
+                    .speed_profiles
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map(|p| p.limit)
+                else {
+                    return Task::none();
+                };
+                self.cfg.settings.speed_limiter_on = limit.is_some();
+                // An unlimited profile switches the limiter off and leaves
+                // the number alone, so the Speed Limit button can put the
+                // last cap back without a trip through the profile list.
+                if limit.is_some() {
+                    self.cfg.settings.global_speed_limit = limit;
+                }
+                self.push_speed_limits();
+                self.save_config();
+                self.sync_native_menu();
+                Task::none()
+            }
+            MenuAction::SpeedLimitSettings => self.open_options(Some(OptTab::Connection)),
             MenuAction::Options => self.open_options(None),
             MenuAction::Extensions => self.open_options(Some(OptTab::Extensions)),
             MenuAction::CheckUpdates => {
@@ -6638,6 +6742,18 @@ impl App {
                 self.options.dl_limit_hours_txt = v;
                 return Task::none();
             }
+            OptField::SpeedLimitKb(v) => {
+                let v: String = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect();
+                // Blank or zero is "no number yet", not a cap of zero — a
+                // zero cap would stall every transfer under it.
+                self.options.draft.global_speed_limit = v
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|kb| *kb > 0)
+                    .map(|kb| kb * 1024);
+                self.options.speed_limit_kb_txt = v;
+                return Task::none();
+            }
             _ => {}
         }
         let s = &mut self.options.draft;
@@ -6664,7 +6780,8 @@ impl App {
             | OptField::SitesEdit(_)
             | OptField::CatExtsEdit(_)
             | OptField::DlLimitMb(_)
-            | OptField::DlLimitHours(_) => unreachable!(),
+            | OptField::DlLimitHours(_)
+            | OptField::SpeedLimitKb(_) => unreachable!(),
             OptField::ExcDialog(b) => s.show_exception_dialog = b,
             OptField::RememberLast(b) => s.remember_last_dir = b,
             OptField::ServerDate(b) => s.server_file_date = b,
@@ -6724,6 +6841,47 @@ impl App {
                 }
             }
             OptField::DlLimit(b) => s.dl_limit_enabled = b,
+            OptField::SpeedLimiter(b) => s.speed_limiter_on = b,
+            OptField::ProfileSel(i) => {
+                self.options.sel_profile = Some(i);
+                if let Some(p) = self.options.draft.speed_profiles.get(i) {
+                    self.options.profile_name = p.name.clone();
+                    self.options.profile_kb =
+                        p.limit.map(|b| (b / 1024).to_string()).unwrap_or_default();
+                }
+            }
+            OptField::ProfileName(v) => self.options.profile_name = v,
+            OptField::ProfileKb(v) => {
+                self.options.profile_kb = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect()
+            }
+            OptField::ProfileAdd => {
+                let name = self.options.profile_name.trim().to_string();
+                if !name.is_empty() {
+                    // Blank speed makes an unlimited profile — the one that
+                    // clears the cap, which every profile list needs.
+                    let limit = self
+                        .options
+                        .profile_kb
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|kb| *kb > 0)
+                        .map(|kb| kb * 1024);
+                    upsert_profile(&mut self.options.draft.speed_profiles, name, limit);
+                    self.options.sel_profile = None;
+                    self.options.profile_name.clear();
+                    self.options.profile_kb.clear();
+                }
+            }
+            OptField::ProfileRemove => {
+                if let Some(i) = self.options.sel_profile.take() {
+                    if i < self.options.draft.speed_profiles.len() {
+                        self.options.draft.speed_profiles.remove(i);
+                    }
+                    self.options.profile_name.clear();
+                    self.options.profile_kb.clear();
+                }
+            }
             OptField::WarnStop(b) => s.warn_before_stop = b,
             OptField::ProxyMode(m) => s.proxy_mode = m,
             OptField::ProxyScript(v) => s.proxy_script = v,
@@ -6857,7 +7015,8 @@ impl App {
 /// Default main-window size: scaled from the primary display's logical
 /// resolution at the reference ratio (1009x606 on a 1512x982 screen — i.e.
 /// two thirds of the width, ~62% of the height), clamped to the layout's
-/// 900x600 floor. Falls back to 1009x606 when the display cannot be queried.
+/// [`MAIN_MIN_W`]x[`MAIN_MIN_H`] floor. Falls back to 1009x606 when the
+/// display cannot be queried.
 /// Stable sort on a precomputed key, applied in place.
 ///
 /// The equivalent of `sort_by(|a, b| key(a).cmp(&key(b)))` with the key built
@@ -6916,13 +7075,25 @@ fn display_normalized(w: f32, h: f32, scale: f32) -> iced::Size {
     }
 }
 
+/// Narrowest the main window may get, in interface units: enough for the
+/// whole toolbar row, which does not wrap — anything past the right edge is
+/// clipped, and a clipped tool is one the user cannot reach.
+///
+/// Widened when the Speed Limit control joined the row, and sized for that
+/// tool's WIDEST label rather than its narrowest: a squeezed tool wraps its
+/// label onto a second line instead of clipping, which makes the whole
+/// toolbar taller — so a cap being switched on and off visibly moved the
+/// download list up and down.
+pub const MAIN_MIN_W: f32 = 1050.0;
+pub const MAIN_MIN_H: f32 = 600.0;
+
 pub fn main_window_size() -> iced::Size {
     // Proportions of the 1512x982 desktop the layout was drawn on, so the
     // first run fills the same share of a bigger or smaller screen.
     let d = display_points().unwrap_or(iced::Size::new(1512.0, 982.0));
     iced::Size::new(
-        (d.width * (1009.0 / 1512.0)).max(900.0),
-        (d.height * (606.0 / 982.0)).max(600.0),
+        (d.width * (1009.0 / 1512.0)).max(MAIN_MIN_W),
+        (d.height * (606.0 / 982.0)).max(MAIN_MIN_H),
     )
 }
 
@@ -7664,6 +7835,40 @@ mod tests {
         assert_eq!(exception_for(&list, "slow.example.org"), Some(1));
     }
 
+    /// Menus address a profile by name, so a second profile under a name the
+    /// list already carries would be one the user can see, edit and never
+    /// reach — every menu entry resolves to the first match.
+    #[test]
+    fn a_re_saved_profile_is_retuned_rather_than_shadowed() {
+        use super::upsert_profile;
+        let mut list = vec![];
+        upsert_profile(&mut list, "Calls".into(), Some(64 * 1024));
+        upsert_profile(&mut list, "Night".into(), None);
+        upsert_profile(&mut list, "Calls".into(), Some(128 * 1024));
+
+        assert_eq!(list.len(), 2, "a repeat is an edit, not a second profile");
+        let calls = list.iter().find(|p| p.name == "Calls").expect("kept");
+        assert_eq!(calls.limit, Some(128 * 1024));
+        // A profile with no cap is the one that clears the limiter; it must
+        // not be mistaken for a half-filled row and dropped.
+        assert!(list.iter().any(|p| p.name == "Night" && p.limit.is_none()));
+    }
+
+    /// The native macOS menu carries actions as strings, so a profile is only
+    /// clickable there if its name survives the round trip — including the
+    /// separator the ids are built with.
+    #[test]
+    fn a_profile_menu_id_comes_back_naming_the_same_profile() {
+        for name in ["Night", "Background", "500:1000", "Работа"] {
+            let action = MenuAction::SpeedProfile(name.to_string());
+            assert_eq!(MenuAction::from_id(&action.id()), Some(action.clone()));
+        }
+        assert_eq!(
+            MenuAction::from_id(&MenuAction::SpeedLimitSettings.id()),
+            Some(MenuAction::SpeedLimitSettings)
+        );
+    }
+
     /// Removing the row the user picked must leave the others alone — and must
     /// take the rule out of force, not merely off the screen.
     #[test]
@@ -7892,7 +8097,10 @@ mod tests {
         // A saved size no screen could have produced is not restored — it
         // derives from the display instead, which is never this small.
         let (w, _) = main_open_size(Some((80.0, 40.0)), 1.0);
-        assert!(w >= 900.0, "nonsense is replaced, not restored: {w}");
+        assert!(
+            w >= super::MAIN_MIN_W,
+            "nonsense is replaced, not restored: {w}"
+        );
     }
 
     #[test]

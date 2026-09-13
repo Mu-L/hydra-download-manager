@@ -728,6 +728,39 @@ pub struct SoundRow {
     pub file: String,
 }
 
+/// A named cap for the global Speed Limiter, switchable in one click from
+/// the toolbar's Speed Limit button.
+///
+/// `limit` is bytes/sec, and `None` means the profile turns the limiter off
+/// — the stock "Unlimited" entry is how the quick control clears a cap
+/// without the user having to find the toggle again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpeedProfile {
+    pub name: String,
+    pub limit: Option<u64>,
+}
+
+/// The profiles a fresh install starts with: off, a cap that leaves a video
+/// call usable, and a looser overnight one. They are ordinary rows — the
+/// Connection tab renames, retunes and deletes them like any other.
+pub fn default_speed_profiles() -> Vec<SpeedProfile> {
+    vec![
+        SpeedProfile {
+            name: "Unlimited".into(),
+            limit: None,
+        },
+        SpeedProfile {
+            name: "Background".into(),
+            limit: Some(500 * 1024),
+        },
+        SpeedProfile {
+            name: "Night".into(),
+            limit: Some(5 * 1024 * 1024),
+        },
+    ]
+}
+
 /// A column of the download table, and with it the key the list sorts by:
 /// every column orders the list by its own value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -1006,9 +1039,13 @@ pub struct Settings {
     pub dark_mode: Option<bool>,
     pub show_categories: bool,
     pub font_size: u16,
-    /// Global cap from Downloads > Speed Limiter, bytes/sec.
+    /// Global cap from the toolbar's Speed Limit button, bytes/sec. Kept
+    /// across a switch to an unlimited profile so turning the limiter back
+    /// on restores the number that was last in force.
     pub global_speed_limit: Option<u64>,
     pub speed_limiter_on: bool,
+    /// Named caps the quick control offers; see [`SpeedProfile`].
+    pub speed_profiles: Vec<SpeedProfile>,
     /// Download-table columns, left to right: width, and whether the header
     /// shows them at all. [`load_config`] normalizes the list, so the rest of
     /// the program can rely on it naming every [`Column`] exactly once.
@@ -1101,6 +1138,7 @@ impl Default for Settings {
             font_size: 13,
             global_speed_limit: None,
             speed_limiter_on: false,
+            speed_profiles: default_speed_profiles(),
             columns: vec![],
             column_widths: vec![],
             window_size: None,
@@ -1114,6 +1152,25 @@ impl Settings {
     /// `dark_mode` flag — [`load_config`] folds that one in first.
     pub fn theme(&self) -> ThemeMode {
         self.theme_mode.unwrap_or_default()
+    }
+
+    /// The cap the Speed Limiter is imposing right now, `None` when it is
+    /// off. The switched-off number is deliberately not readable here: every
+    /// caller wants the limit in force, not the one that would be.
+    pub fn global_limit(&self) -> Option<u64> {
+        self.speed_limiter_on
+            .then_some(self.global_speed_limit)
+            .flatten()
+    }
+
+    /// Which profile the quick control shows as current, by index.
+    ///
+    /// Derived from the cap in force rather than stored alongside it: a limit
+    /// typed straight into Options would otherwise leave a profile ticked
+    /// that no longer describes what the limiter is doing.
+    pub fn active_profile(&self) -> Option<usize> {
+        let cap = self.global_limit();
+        self.speed_profiles.iter().position(|p| p.limit == cap)
     }
 }
 
@@ -1711,6 +1768,84 @@ mod tests {
             Settings::default().ai_formats_seeded,
             "a fresh one must not"
         );
+    }
+
+    /// The limiter has two halves — a switch and a number — and only the
+    /// pair says what is in force. Reading the number alone is how a
+    /// switched-off cap gets applied to a transfer anyway.
+    #[test]
+    fn a_switched_off_limiter_imposes_no_cap_but_keeps_its_number() {
+        let mut s = Settings {
+            global_speed_limit: Some(500 * 1024),
+            speed_limiter_on: false,
+            ..Settings::default()
+        };
+        assert_eq!(s.global_limit(), None);
+        s.speed_limiter_on = true;
+        assert_eq!(s.global_limit(), Some(500 * 1024));
+    }
+
+    /// The tick in the quick control follows the cap, not a stored name:
+    /// a number typed straight into Options must untick the profile it no
+    /// longer matches instead of mislabelling the limiter.
+    #[test]
+    fn the_ticked_profile_is_whichever_one_describes_the_cap_in_force() {
+        let stock = default_speed_profiles();
+        let unlimited = stock
+            .iter()
+            .position(|p| p.limit.is_none())
+            .expect("the stock list offers a way to clear the cap");
+        let background = stock
+            .iter()
+            .position(|p| p.limit == Some(500 * 1024))
+            .expect("the stock list offers a background cap");
+
+        let mut s = Settings::default();
+        assert_eq!(s.active_profile(), Some(unlimited));
+
+        s.speed_limiter_on = true;
+        s.global_speed_limit = Some(500 * 1024);
+        assert_eq!(s.active_profile(), Some(background));
+
+        s.global_speed_limit = Some(777 * 1024);
+        assert_eq!(s.active_profile(), None, "a hand-typed cap is no profile");
+
+        // Switching the limiter off is the unlimited profile again, whatever
+        // number the switch left behind.
+        s.speed_limiter_on = false;
+        assert_eq!(s.active_profile(), Some(unlimited));
+    }
+
+    /// Profiles were added after the config format, so an install that
+    /// predates them has to arrive at the stock list rather than an empty
+    /// dropdown with no way to fill it.
+    #[test]
+    fn a_config_written_before_profiles_existed_gets_the_stock_ones() {
+        let old: Settings = toml::from_str("font_size = 13").expect("parse");
+        assert_eq!(old.speed_profiles, default_speed_profiles());
+    }
+
+    /// ...but a list the user has since edited is theirs, empty included.
+    #[test]
+    fn an_edited_profile_list_survives_a_reload() {
+        let mine = Settings {
+            speed_profiles: vec![SpeedProfile {
+                name: "Calls".into(),
+                limit: Some(64 * 1024),
+            }],
+            ..Settings::default()
+        };
+        let text = toml::to_string(&mine).expect("serialize");
+        let back: Settings = toml::from_str(&text).expect("parse");
+        assert_eq!(back.speed_profiles, mine.speed_profiles);
+
+        let emptied = Settings {
+            speed_profiles: vec![],
+            ..Settings::default()
+        };
+        let text = toml::to_string(&emptied).expect("serialize");
+        let back: Settings = toml::from_str(&text).expect("parse");
+        assert!(back.speed_profiles.is_empty(), "deleting them must stick");
     }
 
     fn legacy_config() -> ConfigFile {
