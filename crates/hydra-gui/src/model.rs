@@ -305,6 +305,23 @@ pub struct CategoryDef {
     pub exts: Vec<String>,
     /// Default download directory for the category.
     pub dir: String,
+    /// The stock categories cannot be renamed or deleted — their file types
+    /// and folder are the user's, their identity is not: the tree icons, the
+    /// [`categorize`] fallback and the AI seeding all name them.
+    #[serde(default)]
+    pub builtin: bool,
+}
+
+impl CategoryDef {
+    /// A user-made category: no file types yet, filed under `Downloads/<name>`.
+    pub fn new(name: &str) -> Self {
+        CategoryDef {
+            name: name.to_string(),
+            exts: vec![],
+            dir: sub(name),
+            builtin: false,
+        }
+    }
 }
 
 fn downloads_dir() -> String {
@@ -320,6 +337,14 @@ fn sub(cat: &str) -> String {
         .to_string_lossy()
         .into_owned()
 }
+
+/// The catch-all category: the file types no other list claims, and the
+/// folder [`category_dir`] falls back to.
+///
+/// It is the first entry and stays first — new categories are appended, and
+/// Options refuses to rename or remove this one — because "uncategorised"
+/// and "category folders are switched off" both resolve through it.
+pub const DEFAULT_CATEGORY: &str = "General";
 
 /// The category model weights and datasets are filed under.
 ///
@@ -379,39 +404,46 @@ pub fn default_categories() -> Vec<CategoryDef> {
     let e = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
     vec![
         CategoryDef {
-            name: "General".into(),
+            name: DEFAULT_CATEGORY.into(),
             exts: vec![],
             dir: downloads_dir(),
+            builtin: true,
         },
         CategoryDef {
             name: AI_CATEGORY.into(),
             exts: AI_TYPES.iter().map(|e| e.to_ascii_lowercase()).collect(),
             dir: sub(AI_CATEGORY),
+            builtin: true,
         },
         CategoryDef {
             name: "Compressed".into(),
             exts: e("zip rar 7z gz gzip bz2 tar arj lzh sit sitx sea ace z xz zst"),
             dir: sub("Compressed"),
+            builtin: true,
         },
         CategoryDef {
             name: "Documents".into(),
             exts: e("doc docx pdf ppt pptx pps txt rtf odt xls xlsx csv epub chm djvu"),
             dir: sub("Documents"),
+            builtin: true,
         },
         CategoryDef {
             name: "Music".into(),
             exts: e("mp3 aac m4a wav wma ogg flac aif mpa ra"),
             dir: sub("Music"),
+            builtin: true,
         },
         CategoryDef {
             name: "Programs".into(),
             exts: e("exe msi msu dmg pkg deb rpm appimage apk bin img iso"),
             dir: sub("Programs"),
+            builtin: true,
         },
         CategoryDef {
             name: "Video".into(),
             exts: e("avi mp4 mkv mov mpg mpeg wmv flv m4v webm rm rmvb ogv 3gp asf qt ts"),
             dir: sub("Video"),
+            builtin: true,
         },
     ]
 }
@@ -433,6 +465,71 @@ pub fn categorize(file: &str, cats: &[CategoryDef]) -> Option<String> {
                 .find(|c| c.exts.contains(&ext))
                 .map(|c| c.name.clone())
         }
+    }
+}
+
+/// Whether `name` is usable as a category name.
+///
+/// Printable ASCII only. The name is also a folder name and the key every
+/// download is filed under, and duplicates are rejected case-insensitively
+/// — which only ASCII case folding can do correctly here, so a non-ASCII
+/// name would let two categories that a case-insensitive filesystem maps to
+/// one folder both exist.
+///
+/// A separator, a drive letter or a `..` is refused rather than quietly
+/// sanitised: a category must not be able to file downloads outside the
+/// folder its name describes. The Windows-reserved characters are refused
+/// everywhere, because a config written on one platform is opened on
+/// another.
+pub fn valid_category_name(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty()
+        && n.len() <= 64
+        && n != "."
+        && n != ".."
+        && !n.contains(['/', '\\', ':', '<', '>', '"', '|', '?', '*'])
+        && n.chars().all(|c| c.is_ascii() && !c.is_ascii_control())
+}
+
+/// One category's file types as typed in Options: whitespace or commas
+/// separate them, a leading dot is optional, case is not significant.
+pub fn parse_exts(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for token in text.split([' ', '\t', '\n', '\r', ',', ';']) {
+        let ext = token.trim().trim_start_matches('.').to_ascii_lowercase();
+        if !ext.is_empty() && !out.contains(&ext) {
+            out.push(ext);
+        }
+    }
+    out
+}
+
+/// Split the Save-to tab's name box into a category name and the file types
+/// to create it with: `Pictures: .png .jpg`.
+///
+/// A colon can never be part of a category name — [`valid_category_name`]
+/// refuses it, because the name is also a folder name — so the split is
+/// unambiguous, and a name may still contain spaces ("My Games").
+pub fn parse_category_entry(text: &str) -> (&str, Vec<String>) {
+    match text.split_once(':') {
+        Some((name, exts)) => (name.trim(), parse_exts(exts)),
+        None => (text.trim(), vec![]),
+    }
+}
+
+/// Give `exts` to the category called `name`, taking each one away from the
+/// other categories.
+///
+/// An extension belongs to exactly one category: [`categorize`] stops at the
+/// first list that matches, so the same extension in two lists files by
+/// whichever category happens to come first — adding `msix` to Programs
+/// would look like it did nothing at all if another list already had it.
+pub fn set_category_exts(cats: &mut [CategoryDef], name: &str, exts: Vec<String>) {
+    for c in cats.iter_mut().filter(|c| c.name != name) {
+        c.exts.retain(|e| !exts.contains(e));
+    }
+    if let Some(c) = cats.iter_mut().find(|c| c.name == name) {
+        c.exts = exts;
     }
 }
 
@@ -1135,12 +1232,26 @@ pub fn load_config() -> ConfigFile {
             q.builtin = true;
         }
     }
+    mark_builtin_categories(&mut cfg.categories);
     if cfg.settings.font_size == 0 {
         cfg.settings = Settings::default();
     }
     migrate_theme_mode(&mut cfg.settings);
     seed_ai_formats(&mut cfg);
     cfg
+}
+
+/// Flag the stock categories, for a config written before the flag existed.
+///
+/// The stock names are the stock categories, exactly as the two stock queues
+/// are recognised by name above. Re-derived on every load rather than
+/// trusted from the file, so a hand-edited config cannot make Programs
+/// deletable — or lock a user's own category by claiming the flag.
+fn mark_builtin_categories(cats: &mut [CategoryDef]) {
+    let stock: Vec<String> = default_categories().into_iter().map(|c| c.name).collect();
+    for c in cats {
+        c.builtin = stock.contains(&c.name);
+    }
 }
 
 /// Add the model and dataset formats to an install that predates them.
@@ -1189,6 +1300,7 @@ fn seed_ai_formats(cfg: &mut ConfigFile) {
             name: AI_CATEGORY.into(),
             exts: AI_TYPES.iter().map(|e| e.to_ascii_lowercase()).collect(),
             dir: sub(AI_CATEGORY),
+            builtin: true,
         });
     }
     crate::log::info(&format!(
@@ -1565,11 +1677,13 @@ mod tests {
                 name: "General".into(),
                 exts: vec![],
                 dir: "/dl".into(),
+                builtin: true,
             },
             CategoryDef {
                 name: "Video".into(),
                 exts: vec!["mp4".into()],
                 dir: "/dl/Video".into(),
+                builtin: true,
             },
         ]
     }
@@ -1649,5 +1763,97 @@ mod tests {
         })
         .unwrap()
         .contains("shutdown_action = \"Sleep\""));
+    }
+
+    #[test]
+    fn a_category_name_may_not_reach_outside_its_folder() {
+        for ok in ["Pictures", "My Games", "Serie TV", "Games (2026)"] {
+            assert!(valid_category_name(ok), "{ok} should be allowed");
+        }
+        // Non-ASCII is refused: the duplicate check folds case the ASCII
+        // way, so "Bücher" and "BÜCHER" would both be created and then
+        // collide in one folder on macOS and Windows.
+        for bad in [
+            "",
+            "   ",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "C:",
+            "we*ird",
+            "a\nb",
+            "Bücher",
+            "برنامه\u{200c}ها",
+        ] {
+            assert!(!valid_category_name(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn file_types_are_read_however_they_are_typed() {
+        assert_eq!(
+            parse_exts("MSIX, .msixbundle\nappx  APPX ;exe"),
+            ["msix", "msixbundle", "appx", "exe"]
+        );
+        assert!(parse_exts("  , ; \n").is_empty());
+    }
+
+    /// A category is created with its file types in one go
+    /// (`Pictures: .png .jpg`); the colon is safe as the separator because a
+    /// name may never contain one.
+    /// A config written before the flag existed carries none, so the stock
+    /// categories would come back renamable and deletable — and a user
+    /// category that happens to be listed there must not be locked.
+    #[test]
+    fn a_config_written_before_the_builtin_flag_still_knows_its_stock_categories() {
+        let toml = "[[categories]]\nname = \"Programs\"\nexts = [\"exe\"]\ndir = \"/dl/p\"\n\n\
+             [[categories]]\nname = \"Games\"\nexts = [\"nsp\"]\ndir = \"/dl/g\"\n";
+        let mut cfg: ConfigFile = toml::from_str(toml).unwrap();
+        mark_builtin_categories(&mut cfg.categories);
+        assert!(cfg.categories[0].builtin, "Programs is stock");
+        assert!(!cfg.categories[1].builtin, "Games is the user's");
+    }
+
+    #[test]
+    fn a_category_entry_carries_its_file_types() {
+        assert_eq!(parse_category_entry("Pictures"), ("Pictures", vec![]));
+        assert_eq!(
+            parse_category_entry("  My Games : .exe, ISO "),
+            ("My Games", vec!["exe".into(), "iso".into()])
+        );
+        assert_eq!(parse_category_entry("Pictures:").1, Vec::<String>::new());
+        assert!(!valid_category_name(parse_category_entry(":png").0));
+    }
+
+    #[test]
+    fn an_extension_moves_to_the_category_that_claims_it() {
+        let mut cats = default_categories();
+        cats.push(CategoryDef::new("Pictures"));
+        set_category_exts(&mut cats, "Pictures", parse_exts("png jpg iso"));
+        // Programs listed iso; it belongs to Pictures now, and the rest of
+        // the Programs list is untouched.
+        let programs = cats.iter().find(|c| c.name == "Programs").unwrap();
+        assert!(!programs.exts.contains(&"iso".to_string()));
+        assert!(programs.exts.contains(&"exe".to_string()));
+        assert_eq!(categorize("disk.iso", &cats).as_deref(), Some("Pictures"));
+        assert_eq!(categorize("setup.exe", &cats).as_deref(), Some("Programs"));
+    }
+
+    #[test]
+    fn a_new_file_type_files_the_next_download_with_it() {
+        let mut cats = default_categories();
+        let mut exts = cats
+            .iter()
+            .find(|c| c.name == "Programs")
+            .unwrap()
+            .exts
+            .clone();
+        exts.extend(parse_exts("msix msixbundle"));
+        set_category_exts(&mut cats, "Programs", exts);
+        assert_eq!(
+            categorize("VSCode.msixbundle", &cats).as_deref(),
+            Some("Programs")
+        );
     }
 }
