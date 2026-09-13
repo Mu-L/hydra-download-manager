@@ -1455,7 +1455,28 @@ async fn probe_resilient_once<C: Connector>(c: &C, t: &Target) -> io::Result<Pro
     let answered = |p: &Probe| {
         p.status >= 200 && p.status < 400 && (p.size > 0 || p.stated_length().is_some())
     };
-    let head = probe(c, t).await;
+    // A HEAD that is never answered must not hold the download forever.
+    //
+    // `s7.uplod.ir:182` accepts the connection, accepts the request, and then
+    // says nothing at all — no headers, no body, no close. The read loop in
+    // `probe` has no deadline of its own, so the probe never returned and the
+    // transfer sat in "Connecting..." indefinitely; the same URL answers
+    // `bytes=0-0` with `206`, its total length and range support. Silence is
+    // the strongest form of "no usable answer" this function already knows how
+    // to handle, so it is treated as one.
+    //
+    // The budget covers connect, TLS and one round trip together, because
+    // `probe` owns all three. Generous on purpose: exceeding it costs one extra
+    // request on a path that is already pathological, while a tight bound would
+    // spend that request on every slow-but-healthy link.
+    const HEAD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+    let head = match tokio::time::timeout(HEAD_PATIENCE, probe(c, t)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "no response to HEAD",
+        )),
+    };
     match &head {
         // A redirect is a complete answer: the object is elsewhere, and asking
         // this host for its bytes only wastes a request.

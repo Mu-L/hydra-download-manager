@@ -1686,6 +1686,33 @@ fn digest_file(path: &str, algo: hya_net::digest::Algo) -> Option<String> {
 
 // ------------------------------------------------------------------ transfer
 
+/// Await `fut`, giving up as soon as the stop flag goes up.
+///
+/// Returns `None` when the download was stopped. The cancellation IS the drop:
+/// the future owns the socket it is blocked on, so letting it go is what closes
+/// the connection — waiting for a request to notice a flag it only reads between
+/// reads is how a stop turns into "sometime in the next few minutes, maybe".
+///
+/// The flag is polled rather than awaited because that is what the engine has:
+/// one `AtomicBool` per live transfer, shared with the command loop and with
+/// every request the transfer makes. The interval only bounds how long a stop
+/// takes to be noticed, and this runs once per connection attempt, never per
+/// arriving chunk.
+async fn cancellable<F: std::future::Future>(fut: F, cancel: &AtomicBool) -> Option<F::Output> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            v = &mut fut => return Some(v),
+            _ = tokio::time::sleep(POLL) => {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 async fn run_download(
     mut spec: StartSpec,
     cancel: Arc<AtomicBool>,
@@ -1807,7 +1834,23 @@ async fn run_download(
         };
         let t = target_for(&u, &spec, &route);
         let t_hop = std::time::Instant::now();
-        match probe_resilient(connector.as_ref(), &t).await {
+        // Stop has to reach a download that is still CONNECTING, not only one
+        // that is already moving bytes. A plain await here read the flag never:
+        // against an origin that accepts a request and then says nothing, the
+        // row sat in "Connecting..." and Stop All left it there, still holding
+        // its socket. Dropping the probe future is what closes that socket.
+        let answer = match cancellable(probe_resilient(connector.as_ref(), &t), &cancel).await {
+            Some(a) => a,
+            None => {
+                ev(Event::Stopped {
+                    id,
+                    done: 0,
+                    held: spec.held.clone(),
+                });
+                return;
+            }
+        };
+        match answer {
             Ok(p) if p.is_redirect() => {
                 let loc = p.location.clone().unwrap_or_default();
                 crate::log::debug(&format!(
@@ -1838,9 +1881,18 @@ async fn run_download(
                 // hop budget as a `3xx`, since a pair of such pages pointing at
                 // each other is a loop like any other.
                 let hop_to = if p.maybe_redirector() {
-                    hya_net::html_redirect(connector.as_ref(), &t)
-                        .await
-                        .and_then(|loc| join_url(&u, &loc))
+                    match cancellable(hya_net::html_redirect(connector.as_ref(), &t), &cancel).await
+                    {
+                        Some(loc) => loc.and_then(|loc| join_url(&u, &loc)),
+                        None => {
+                            ev(Event::Stopped {
+                                id,
+                                done: 0,
+                                held: spec.held.clone(),
+                            });
+                            return;
+                        }
+                    }
                 } else {
                     None
                 };
@@ -1945,7 +1997,18 @@ async fn run_download(
     // list, then costs one wasted fetch rather than an unbounded chain.
     if spec.mirrors.is_empty() && p.serves_metalink() {
         crate::log::info(&format!("#{id} {} serves a Metalink document", u.host));
-        match fetch_metalink(&url, &spec.user_agent, &route).await {
+        let doc = match cancellable(fetch_metalink(&url, &spec.user_agent, &route), &cancel).await {
+            Some(d) => d,
+            None => {
+                ev(Event::Stopped {
+                    id,
+                    done: 0,
+                    held: spec.held.clone(),
+                });
+                return;
+            }
+        };
+        match doc {
             Ok(doc) => match adopt_metalink(&doc, &mut spec, id) {
                 Ok((name, size)) => {
                     // The destination the finisher renames to is held behind a
@@ -2493,7 +2556,21 @@ async fn run_ftp_download(
     let fetcher = hya_net::ftp::FtpFetcher::new(connector.clone())
         .with_pace(hya_net::polite::Pace::shared(limiter.clone()));
 
-    let probe = match fetcher.probe(&ep).await {
+    // Login and SIZE, answerable to Stop: an FTP control channel that accepts
+    // the connection and then stalls on the greeting is the same dead wait as a
+    // silent HEAD, and the row is just as stuck.
+    let answer = match cancellable(fetcher.probe(&ep), cancel).await {
+        Some(a) => a,
+        None => {
+            ev(Event::Stopped {
+                id,
+                done: 0,
+                held: spec.held.clone(),
+            });
+            return;
+        }
+    };
+    let probe = match answer {
         Ok(p) => p,
         Err(e) => {
             crate::log::error(&format!("#{id} ftp probe failed: {e}"));
@@ -2733,6 +2810,46 @@ fn finish_file(
 #[cfg(test)]
 mod tests {
     use hya_core::LimitReason as R;
+
+    /// Stop has to reach a download that has not started moving bytes yet.
+    ///
+    /// An origin that accepts a connection and then never answers leaves the
+    /// probe blocked in a read; a stop flag read only between requests is never
+    /// read at all, and the row stays in "Connecting..." holding its socket.
+    /// Giving up on the future is what closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_reaches_a_request_that_is_still_waiting_for_its_first_byte() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+
+        let never = std::future::pending::<()>();
+        let t0 = std::time::Instant::now();
+        let out = super::cancellable(never, &cancel).await;
+
+        assert!(out.is_none(), "a stopped request must not report an answer");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "the stop must be acted on, not waited out"
+        );
+    }
+
+    /// The flag is polled, so the answer must not be lost to a poll that lands
+    /// in the same moment the future resolves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_that_completes_still_delivers_its_answer() {
+        use std::sync::atomic::AtomicBool;
+
+        let cancel = AtomicBool::new(false);
+        let out = super::cancellable(async { 42u32 }, &cancel).await;
+        assert_eq!(out, Some(42));
+    }
 
     /// The whole point of the reason plumbing: an idle row must say WHY it is
     /// idle. A search that settled reads as a decision, a server limit reads as
@@ -6901,6 +7018,87 @@ x-amzn-waf-action: challenge\r\nConnection: close\r\n\r\n",
             }
         });
         port
+    }
+
+    /// An origin that accepts the connection and then says nothing at all —
+    /// no headers, no body, no close. `s7.uplod.ir:182` answers HEAD this way.
+    fn silent_origin() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(sock) = conn else { continue };
+                // Held, not dropped: closing would hand the client an EOF to
+                // end on, which is the one thing this origin never gives.
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(600));
+                    drop(sock);
+                });
+            }
+        });
+        port
+    }
+
+    /// Stop All has to reach a row that never got past "Connecting...".
+    ///
+    /// The stop flag was read only between requests, and against an origin
+    /// that never answers there is no "between": the probe blocked in a read
+    /// and the transfer ignored the stop entirely, holding its socket open.
+    /// The row stayed active, so Stop All appeared to skip it.
+    #[test]
+    fn stop_reaches_a_download_still_waiting_on_a_silent_origin() {
+        let port = silent_origin();
+        let dir = std::env::temp_dir().join(format!("hydra-silent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("quiet.bin");
+
+        let spec = StartSpec {
+            id: 12,
+            url: format!("http://127.0.0.1:{port}/quiet.bin"),
+            user_agent: "hydra-test".into(),
+            temp_path: out.with_extension("part").to_string_lossy().into_owned(),
+            final_path: out.to_string_lossy().into_owned(),
+            ..StartSpec::plain()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let final_path = out.to_string_lossy().into_owned();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+
+        let stopped = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    flag.store(true, Ordering::Relaxed);
+                });
+                // Well under the probe's own patience: the stop must end this,
+                // not a timeout expiring somewhere underneath it.
+                let ran = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    run_download(
+                        spec,
+                        cancel,
+                        Arc::new(RateLimiter::new(0)),
+                        Arc::new(Mutex::new(final_path)),
+                        tx,
+                    ),
+                )
+                .await;
+                assert!(ran.is_ok(), "the stop was ignored and the transfer hung");
+                let mut stopped = false;
+                while let Ok(ev) = rx.try_recv() {
+                    if matches!(ev, Event::Stopped { .. }) {
+                        stopped = true;
+                    }
+                }
+                stopped
+            });
+
+        assert!(stopped, "a stopped download must report that it stopped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The reported defect, in the GUI's own transfer path.
