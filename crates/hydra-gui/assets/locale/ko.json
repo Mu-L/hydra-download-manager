@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "완료된 다운로드는 대화 상자가 표시된 상태에서 전체 대화 상자를 닫으면 자동으로 목록에서 사라집니다. 다운로드한 파일은 보관됩니다.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "호스트 이름이나 주소, 또는 socks5://127.0.0.1:10808과 같은 완전한 표기법 — 여기서 명시된 구성표가 ‘유형’보다 우선합니다.",
   "A new version of Hydra is available": "Hydra의 새 버전을 사용할 수 있습니다",
+  "AI & Datasets": "AI 및 데이터세트",
   "About Hydra": "Hydra 정보",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "다운로드 폴더에 대한 접근이 거부되었습니다. 시스템 설정 > 개인정보 보호 및 보안 > 파일 및 폴더에서 Hydra를 허용하거나 다른 폴더를 선택하십시오.",
   "Add URL": "URL 추가",

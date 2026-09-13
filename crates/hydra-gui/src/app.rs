@@ -512,6 +512,10 @@ pub struct OptionsState {
     pub login_site: String,
     pub login_user: String,
     pub login_pass: String,
+    /// Row picked in the Connection tab's exception list, so it can be edited
+    /// or removed. `None` is "nothing picked", which is what Remove needs to
+    /// distinguish from "row 0".
+    pub sel_exc: Option<usize>,
     pub conn_exc_server: String,
     pub conn_exc_n: String,
     /// Text buffers for the Download-limit numbers. The draft holds `u64`,
@@ -537,6 +541,7 @@ impl Default for OptionsState {
             login_site: String::new(),
             login_user: String::new(),
             login_pass: String::new(),
+            sel_exc: None,
             conn_exc_server: String::new(),
             conn_exc_n: String::new(),
             dl_limit_mb_txt: String::new(),
@@ -854,6 +859,9 @@ pub enum ConfirmKind {
     },
     /// Help > Check for updates found nothing newer (info box, OK).
     UpToDate,
+    /// View > Language moved the interface onto a different face than the
+    /// running renderer was built with (info box, OK).
+    FontNeedsRestart,
     /// Help > Check for updates could not reach the release server.
     UpdateCheckFailed(String),
     /// "Warn me before stopping downloads" (Connection tab): the stop only
@@ -1116,9 +1124,11 @@ pub enum OptField {
     VirusPicked(Option<String>),
     DefaultConns(usize),
     AdaptiveConns(bool),
+    ExcSel(usize),
     ExcServer(String),
     ExcConns(String),
     ExcAdd,
+    ExcRemove,
     DlLimit(bool),
     DlLimitMb(String),
     DlLimitHours(String),
@@ -1320,6 +1330,30 @@ pub struct PowerPrompt {
 /// How long the cancel window lasts. Long enough to catch the dialog on the
 /// way past, short enough not to sit in front of a finished queue.
 pub const POWER_COUNTDOWN_SECS: u8 = 10;
+
+/// The connection count Options > Connection sets aside for `host`, if any.
+///
+/// A `*.` prefix is accepted and means the same thing the bare suffix does; the
+/// match is on the suffix either way, so `example.com` also covers
+/// `cdn.example.com`. FIRST match wins — see [`upsert_exception`] for why that
+/// makes one entry per server an invariant rather than a nicety.
+fn exception_for(list: &[(String, usize)], host: &str) -> Option<usize> {
+    list.iter()
+        .find(|(server, _)| !server.is_empty() && host.ends_with(server.trim_start_matches("*.")))
+        .map(|(_, n)| *n)
+}
+
+/// Set `server`'s exception to `n`, replacing any entry it already has.
+///
+/// Appending instead would leave the older entry in front of the newer one, and
+/// [`exception_for`] reads the first: the number the user just typed would be
+/// stored, displayed, and never used.
+fn upsert_exception(list: &mut Vec<(String, usize)>, server: String, n: usize) {
+    match list.iter_mut().find(|(s, _)| *s == server) {
+        Some(row) => row.1 = n,
+        None => list.push((server, n)),
+    }
+}
 
 impl App {
     pub fn item(&self, id: DlId) -> Option<&DownloadItem> {
@@ -1523,6 +1557,17 @@ impl App {
         self.cursor_cell.get()
     }
 
+    /// The main window in interface units — the ones the cursor probe reads
+    /// and the overlays are laid out in, so the units a menu has to be kept
+    /// inside.
+    pub fn main_viewport(&self) -> iced::Size {
+        main_viewport(
+            self.main_size,
+            self.window_size(WinKind::Main),
+            self.ui_scale(),
+        )
+    }
+
     /// Ids of [`Self::visible`], in the same order.
     pub fn visible_ids(&self) -> Vec<DlId> {
         self.visible().iter().map(|d| d.id).collect()
@@ -1666,6 +1711,11 @@ impl App {
         self.options.draft = self.cfg.settings.clone();
         self.options.draft_cats = self.cfg.categories.clone();
         self.options.sel_category = "General".into();
+        // Selections are indexes into lists this line has just replaced, so a
+        // selection held from the previous visit points at whatever now happens
+        // to sit at that position — and Remove would take that row instead.
+        self.options.sel_exc = None;
+        self.options.sel_login = None;
         self.options.dl_limit_mb_txt = self.cfg.settings.dl_limit_mb.to_string();
         self.options.dl_limit_hours_txt = self.cfg.settings.dl_limit_hours.to_string();
         self.options.auto_types_edit =
@@ -1866,7 +1916,7 @@ impl App {
         // hydra.desktop (scripts/package-linux.sh, install.sh).
         #[cfg(target_os = "linux")]
         let platform_specific = window::settings::PlatformSpecific {
-            application_id: "hydra".to_string(),
+            application_id: std::env::var("FLATPAK_ID").unwrap_or_else(|_| "hydra".to_string()),
             ..Default::default()
         };
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -1957,14 +2007,7 @@ impl App {
     /// Effective connection count for a URL (Connection tab exceptions).
     fn conns_for(&self, url: &str) -> usize {
         let host = engine::parse_url(url).map(|u| u.host).unwrap_or_default();
-        self.cfg
-            .settings
-            .conn_exceptions
-            .iter()
-            .find(|(server, _)| {
-                !server.is_empty() && host.ends_with(server.trim_start_matches("*."))
-            })
-            .map(|(_, n)| *n)
+        exception_for(&self.cfg.settings.conn_exceptions, &host)
             .unwrap_or(self.cfg.settings.default_conns)
             .clamp(1, 32)
     }
@@ -3513,6 +3556,10 @@ impl App {
             Message::NativeMenu(id) => {
                 if id == "show_main" {
                     return self.open_window(WinKind::Main);
+                }
+                if id == crate::tray::THEME_CHANGED {
+                    crate::tray::refresh_icon();
+                    return Task::none();
                 }
                 match MenuAction::from_id(&id) {
                     Some(a) => self.update(Message::Menu(a)),
@@ -6045,6 +6092,13 @@ impl App {
                 Task::batch(resizes)
             }
             MenuAction::Language(l) => {
+                // The face is chosen from the locale, but the renderer took
+                // its default font when the window system came up: a switch
+                // onto (or off) the bundled Persian/Arabic face only reaches
+                // the interface on the next launch, and the user has to be
+                // told rather than left looking at the wrong one.
+                let face_changes =
+                    crate::font::changes_face(self.cfg.language.as_deref(), Some(&l));
                 i18n::set_locale(&l);
                 self.cfg.language = Some(l);
                 self.save_config();
@@ -6054,6 +6108,10 @@ impl App {
                     let queues: Vec<String> =
                         self.cfg.queues.iter().map(|q| q.name.clone()).collect();
                     crate::tray::reinstall(&queues, self.cfg.settings.power_save);
+                }
+                if face_changes {
+                    self.confirm = Some(ConfirmKind::FontNeedsRestart);
+                    return self.open_window(WinKind::Confirm);
                 }
                 Task::none()
             }
@@ -6257,16 +6315,34 @@ impl App {
             OptField::VirusPicked(None) => {}
             OptField::DefaultConns(n) => s.default_conns = n,
             OptField::AdaptiveConns(b) => s.adaptive_conns = b,
+            OptField::ExcSel(i) => {
+                self.options.sel_exc = Some(i);
+                if let Some((server, n)) = self.options.draft.conn_exceptions.get(i) {
+                    self.options.conn_exc_server = server.clone();
+                    self.options.conn_exc_n = n.to_string();
+                }
+            }
             OptField::ExcServer(v) => self.options.conn_exc_server = v,
             OptField::ExcConns(v) => self.options.conn_exc_n = v,
             OptField::ExcAdd => {
                 let server = self.options.conn_exc_server.trim().to_string();
                 let n: usize = self.options.conn_exc_n.trim().parse().unwrap_or(0);
                 if !server.is_empty() && n > 0 {
-                    self.options
-                        .draft
-                        .conn_exceptions
-                        .push((server, n.clamp(1, 32)));
+                    upsert_exception(
+                        &mut self.options.draft.conn_exceptions,
+                        server,
+                        n.clamp(1, 32),
+                    );
+                    self.options.sel_exc = None;
+                    self.options.conn_exc_server.clear();
+                    self.options.conn_exc_n.clear();
+                }
+            }
+            OptField::ExcRemove => {
+                if let Some(i) = self.options.sel_exc.take() {
+                    if i < self.options.draft.conn_exceptions.len() {
+                        self.options.draft.conn_exceptions.remove(i);
+                    }
                     self.options.conn_exc_server.clear();
                     self.options.conn_exc_n.clear();
                 }
@@ -6478,6 +6554,18 @@ pub fn main_window_size() -> iced::Size {
 /// rejects nonsense: `min_size` holds the window to a full toolbar row
 /// whatever the saved size says, and that floor moves with the font ratio
 /// while this range does not.
+/// The main window in interface units, from what a resize last reported.
+/// `main_size` is in OS points, so it converts back through the View > Font
+/// ratio; before the first resize event it is zero and `opened_at` — the
+/// size the window was asked to open at, already in interface units — stands
+/// in, so a menu is placed against the right window from the first click.
+fn main_viewport(main_size: iced::Size, opened_at: (f32, f32), scale: f32) -> iced::Size {
+    if main_size.width > 0.0 && main_size.height > 0.0 {
+        return iced::Size::new(main_size.width / scale, main_size.height / scale);
+    }
+    iced::Size::new(opened_at.0, opened_at.1)
+}
+
 fn main_open_size(saved: Option<(f32, f32)>, scale: f32) -> (f32, f32) {
     let os = saved
         .filter(|(w, h)| (400.0..=4000.0).contains(w) && (300.0..=2500.0).contains(h))
@@ -7177,6 +7265,55 @@ mod tests {
         }
     }
 
+    /// The Connection tab's list is only as good as the entry the transfer
+    /// actually reads. Re-typing a server has to REPLACE its number, because
+    /// the lookup stops at the first match and a shadowed second entry is a
+    /// setting the user can see, edit and never use.
+    #[test]
+    fn a_re_entered_server_replaces_its_exception_instead_of_shadowing_it() {
+        use super::{exception_for, upsert_exception};
+        let mut list = vec![];
+        upsert_exception(&mut list, "cdn.example.com".into(), 4);
+        upsert_exception(&mut list, "slow.example.org".into(), 1);
+        upsert_exception(&mut list, "cdn.example.com".into(), 16);
+
+        assert_eq!(list.len(), 2, "a repeat is an edit, not a second rule");
+        assert_eq!(exception_for(&list, "cdn.example.com"), Some(16));
+        assert_eq!(exception_for(&list, "slow.example.org"), Some(1));
+    }
+
+    /// Removing the row the user picked must leave the others alone — and must
+    /// take the rule out of force, not merely off the screen.
+    #[test]
+    fn removing_an_exception_takes_its_rule_out_of_force() {
+        use super::{exception_for, upsert_exception};
+        let mut list = vec![];
+        upsert_exception(&mut list, "a.example.com".into(), 2);
+        upsert_exception(&mut list, "b.example.com".into(), 8);
+
+        list.remove(0);
+
+        assert_eq!(exception_for(&list, "a.example.com"), None);
+        assert_eq!(exception_for(&list, "b.example.com"), Some(8));
+    }
+
+    /// A `*.` prefix is how the field is usually filled in, and a bare suffix
+    /// has to mean the same thing. An empty server would match every host, so
+    /// it must match none.
+    #[test]
+    fn an_exception_matches_subdomains_and_never_matches_on_an_empty_server() {
+        use super::exception_for;
+        let list = vec![
+            (String::new(), 32),
+            ("*.example.com".to_string(), 4),
+            ("uplod.ir".to_string(), 1),
+        ];
+        assert_eq!(exception_for(&list, "cdn.example.com"), Some(4));
+        assert_eq!(exception_for(&list, "example.com"), Some(4));
+        assert_eq!(exception_for(&list, "s7.uplod.ir"), Some(1));
+        assert_eq!(exception_for(&list, "other.net"), None);
+    }
+
     #[test]
     fn save_as_splits_folder_and_name() {
         use super::split_save_as as split;
@@ -7358,7 +7495,7 @@ mod tests {
         // the window grows by the ratio on every launch, until it is bigger
         // than the sanity range above and snaps back to the default size.
         let left_at = (1400.0, 900.0);
-        for size in crate::theme::FONT_CHOICES.map(|(_, s)| s) {
+        for size in crate::theme::FONT_SIZES {
             let scale = crate::theme::ui_scale(size);
             let (w, h) = main_open_size(Some(left_at), scale);
             assert!(
@@ -7373,6 +7510,27 @@ mod tests {
         // derives from the display instead, which is never this small.
         let (w, _) = main_open_size(Some((80.0, 40.0)), 1.0);
         assert!(w >= 900.0, "nonsense is replaced, not restored: {w}");
+    }
+
+    #[test]
+    fn a_menu_is_placed_against_the_window_in_the_units_it_is_laid_out_in() {
+        use super::main_viewport;
+
+        // A resize reports OS points; the overlays, and the cursor position
+        // a menu is placed at, are in interface units. Skip the conversion
+        // and a Large-font window reads as half again as tall as it is, so
+        // a menu near the bottom is left running off it.
+        let opened_at = (900.0, 600.0);
+        let scale = crate::theme::ui_scale(20);
+        let v = main_viewport(iced::Size::new(1400.0, 900.0), opened_at, scale);
+        assert!((v.width - 1400.0 / scale).abs() < 0.5 && (v.height - 900.0 / scale).abs() < 0.5);
+
+        // No resize has arrived yet: the size the window was opened at is
+        // already in interface units and is used as it stands.
+        assert_eq!(
+            main_viewport(iced::Size::ZERO, opened_at, scale),
+            iced::Size::new(900.0, 600.0)
+        );
     }
 
     #[test]
@@ -7405,7 +7563,7 @@ mod tests {
         // View menu offers. The window reaches the screen multiplied by the
         // ratio, so that is what has to fit — with room to spare for the
         // taskbar and the title bar.
-        for size in crate::theme::FONT_CHOICES.map(|(_, s)| s) {
+        for size in crate::theme::FONT_SIZES {
             let scale = crate::theme::ui_scale(size);
             let (w, h) = fit_to_display((760.0, 700.0), laptop, scale);
             assert!(

@@ -274,13 +274,26 @@ mod tests {
 
         // A port nobody is listening on any more: the file is what a
         // crashed instance leaves behind.
-        let dead = {
-            let l = TcpListener::bind(("127.0.0.1", 0)).expect("free port");
-            l.local_addr().expect("address").port()
-        };
-        publish(dead);
+        //
+        // Re-rolled rather than trusted once, because a released ephemeral
+        // port is free only until something takes it — and the tests above
+        // bind port 0 on the same loopback, from the same binary, at the same
+        // moment. Handed back the number we had just let go, the connect
+        // succeeds and the test reads a race as the defect. The property under
+        // test is about a file naming a port with no listener, not about any
+        // one number, so a port that turns out to be listening is grounds for
+        // another draw. A file that is trusted WITHOUT connecting fails every
+        // draw, which is the regression this is here to catch.
+        let stale_reads_as_no_instance = (0..32).any(|_| {
+            let dead = {
+                let l = TcpListener::bind(("127.0.0.1", 0)).expect("free port");
+                l.local_addr().expect("address").port()
+            };
+            publish(dead);
+            connect(false).is_none()
+        });
         assert!(
-            connect(false).is_none(),
+            stale_reads_as_no_instance,
             "a stale file must not read as a running app"
         );
 

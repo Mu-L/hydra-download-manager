@@ -455,13 +455,19 @@ fn connection(app: &App) -> El<'_> {
     let st = &app.options;
     let conn_opts: Vec<usize> = vec![1, 2, 4, 8, 16, 32];
     let mut exc = column![].spacing(2);
-    for (server, n) in &s.conn_exceptions {
+    for (i, (server, n)) in s.conn_exceptions.iter().enumerate() {
         exc = exc.push(
-            row![
-                container(text(server.clone()).size(theme::FONT_SIZE)).width(Length::Fill),
-                container(text(n.to_string()).size(theme::FONT_SIZE)).width(70.0),
-            ]
-            .spacing(6),
+            button(
+                row![
+                    container(text(server.clone()).size(theme::FONT_SIZE)).width(Length::Fill),
+                    container(text(n.to_string()).size(theme::FONT_SIZE)).width(70.0),
+                ]
+                .spacing(6),
+            )
+            .padding([1, 2])
+            .width(Length::Fill)
+            .style(theme::btn_row(st.sel_exc == Some(i)))
+            .on_press(o(OptField::ExcSel(i))),
         );
     }
     column![
@@ -487,7 +493,7 @@ fn connection(app: &App) -> El<'_> {
             tr("Starts each transfer with one connection and adds more only while they measurably improve speed; the default max. number acts as a ceiling."),
         ),
         text(tr("Exceptions:")).size(theme::FONT_SIZE),
-        container(exc)
+        container(scrollable(exc).height(Length::Fill))
             .padding(8)
             .width(Length::Fill)
             .height(120.0)
@@ -504,6 +510,10 @@ fn connection(app: &App) -> El<'_> {
                 .style(theme::input)
                 .width(90.0),
             dlg_btn(tr("New"), Some(o(OptField::ExcAdd))),
+            dlg_btn(
+                tr("Remove"),
+                st.sel_exc.map(|_| o(OptField::ExcRemove)),
+            ),
         ]
         .spacing(8),
         section(tr("Download limits")),

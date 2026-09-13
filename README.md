@@ -28,10 +28,10 @@
   - [CLI](#cli)
   - [Desktop GUI](#desktop-gui)
 - [Installation](#installation)
+  - [Quick Install (Bash / PowerShell)](#quick-install-bash--powershell)
   - [Homebrew (macOS / Linux)](#homebrew-macos--linux)
   - [Linux Packages (Ubuntu PPA / Fedora COPR / Arch Linux AUR)](#linux-packages-ubuntu-ppa--fedora-copr--arch-linux-aur)
   - [AppImage (portable, self-updating)](#appimage-portable-self-updating)
-  - [Quick Install (prebuilt binaries)](#quick-install-prebuilt-binaries)
   - [From Source](#from-source)
   - [Browser Extension](#browser-extension)
 - [Uninstall](#uninstall)
@@ -104,6 +104,67 @@
 
 ## Installation
 
+### Quick Install (Bash / PowerShell)
+
+**macOS / Linux** — installs the GUI bundle (GUI + CLI + browser extensions) by default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ja7ad/hydra/main/install.sh | bash
+```
+
+CLI only:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ja7ad/hydra/main/install.sh | bash -s -- --cli
+```
+
+**Windows (PowerShell)** — installs the GUI bundle by default:
+
+```powershell
+irm https://raw.githubusercontent.com/ja7ad/hydra/main/install.ps1 | iex
+```
+
+CLI only:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ja7ad/hydra/main/install.ps1))) -Cli
+```
+
+The scripts detect your OS and architecture (amd64/arm64), fetch the matching archive from the [latest GitHub release](https://github.com/ja7ad/hydra/releases/latest), and install it — on Linux and macOS to `/usr/local` (falling back to `~/.local`; override with `--prefix DIR`), on Windows to `%LOCALAPPDATA%\Programs\Hydra`. The CLI lands under both `hydra` and the short `hya`; an existing `hya` on the same prefix is never overwritten. GUI installs also register the browser native-messaging host. Pin a release with `--version vX.Y.Z` / `-Version vX.Y.Z`, or download the archives yourself from the [releases page](https://github.com/ja7ad/hydra/releases).
+
+**Linux compatibility.** The CLI archive is a static musl build with no shared
+library of any kind, so `--cli` works on any distribution — old LTS releases,
+minimal containers, Alpine — regardless of its glibc. The desktop artifacts
+(GUI archive, `.deb`, `.rpm`, AppImage) link the system's GTK, X11 and ALSA and
+are built on Ubuntu 22.04, which puts their floor at glibc 2.35: Ubuntu 22.04,
+Debian 12, RHEL 9 and newer.
+
+A GUI install is a real desktop app, not a loose binary:
+
+- **Windows** — a start-menu shortcut (`-Desktop` adds a desktop one) and an **Apps & features** entry, so Hydra is listed and uninstallable from Settings like any other app.
+- **macOS** — `Hydra Download Manager.app` is installed into `/Applications` (override with `--app-dir DIR`, e.g. `~/Applications`), with its icon and name in Launchpad, Spotlight, the Dock and the app switcher. `hydra`, `hya`, `hydra-gui` and `hydra-host` in `<prefix>/bin` are symlinks into the app, so the CLI stays on `PATH` and one update refreshes both.
+- **Linux** — the logo lands in the hicolor icon theme and a `hydra.desktop` entry in your applications directory (plus the prefix's, for a system-wide install), so the app shows up in the launcher, the dock and the switcher with its own icon.
+
+Either way the GUI can update itself in place afterwards (**Options → General → Check for updates**), including an install that lives in a root-owned directory — it asks for authorisation before replacing those files.
+
+**Beta channel** — `--beta` (`-Beta` on Windows) installs the newest `-rc` pre-release when it is ahead of the latest stable release; otherwise it installs the stable release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ja7ad/hydra/main/install.sh | bash -s -- --beta
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ja7ad/hydra/main/install.ps1))) -Beta
+```
+
+The GUI's in-app updater follows the same rule: enable **Options → General → Download Beta channel** and update checks will also offer release candidates while one is ahead of stable.
+
+**macOS notes**: since the app isn't notarized yet, Gatekeeper may block it — see the [macOS Permissions Guide](https://github.com/ja7ad/hydra/wiki/macOS-Permissions-Guide-for-Hydra) for granting the required permissions. If you installed via the `.dmg` and macOS refuses to open the app ("damaged" or "unidentified developer"), clear the quarantine attribute:
+
+```bash
+xattr -cr /Applications/Hydra\ Download\ Manager.app
+```
+
 ### Homebrew (macOS / Linux)
 
 **CLI**:
@@ -157,6 +218,20 @@ paru -S hydra-download-manager-bin
 
 > AUR Packages: [hydra-download-manager](https://aur.archlinux.org/packages/hydra-download-manager) | [hydra-download-manager-bin](https://aur.archlinux.org/packages/hydra-download-manager-bin)
 
+### Flatpak (Flathub)
+
+Install from Flathub:
+
+```bash
+flatpak install flathub io.github.ja7ad.hydra
+```
+
+Run Hydra:
+
+```bash
+flatpak run io.github.ja7ad.hydra
+```
+
 ### AppImage (portable, self-updating)
 
 One file, no installation, no root. Download it from the
@@ -206,60 +281,6 @@ too.
 Because it does not bundle GTK, the graphics stack or ALSA — those come from
 your desktop, where they are already correct — a portal-capable desktop is
 still what the file dialogs need. Nothing else is required.
-
-### Quick Install (prebuilt binaries)
-
-**macOS / Linux** — installs the GUI bundle (GUI + CLI + browser extensions) by default:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ja7ad/hydra/main/install.sh | bash
-```
-
-CLI only:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ja7ad/hydra/main/install.sh | bash -s -- --cli
-```
-
-**Windows (PowerShell)** — installs the GUI bundle by default:
-
-```powershell
-irm https://raw.githubusercontent.com/ja7ad/hydra/main/install.ps1 | iex
-```
-
-CLI only:
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ja7ad/hydra/main/install.ps1))) -Cli
-```
-
-The scripts detect your OS and architecture (amd64/arm64), fetch the matching archive from the [latest GitHub release](https://github.com/ja7ad/hydra/releases/latest), and install it — on Linux and macOS to `/usr/local` (falling back to `~/.local`; override with `--prefix DIR`), on Windows to `%LOCALAPPDATA%\Programs\Hydra`. The CLI lands under both `hydra` and the short `hya`; an existing `hya` on the same prefix is never overwritten. GUI installs also register the browser native-messaging host. Pin a release with `--version vX.Y.Z` / `-Version vX.Y.Z`, or download the archives yourself from the [releases page](https://github.com/ja7ad/hydra/releases).
-
-A GUI install is a real desktop app, not a loose binary:
-
-- **Windows** — a start-menu shortcut (`-Desktop` adds a desktop one) and an **Apps & features** entry, so Hydra is listed and uninstallable from Settings like any other app.
-- **macOS** — `Hydra Download Manager.app` is installed into `/Applications` (override with `--app-dir DIR`, e.g. `~/Applications`), with its icon and name in Launchpad, Spotlight, the Dock and the app switcher. `hydra`, `hya`, `hydra-gui` and `hydra-host` in `<prefix>/bin` are symlinks into the app, so the CLI stays on `PATH` and one update refreshes both.
-- **Linux** — the logo lands in the hicolor icon theme and a `hydra.desktop` entry in your applications directory (plus the prefix's, for a system-wide install), so the app shows up in the launcher, the dock and the switcher with its own icon.
-
-Either way the GUI can update itself in place afterwards (**Options → General → Check for updates**), including an install that lives in a root-owned directory — it asks for authorisation before replacing those files.
-
-**Beta channel** — `--beta` (`-Beta` on Windows) installs the newest `-rc` pre-release when it is ahead of the latest stable release; otherwise it installs the stable release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ja7ad/hydra/main/install.sh | bash -s -- --beta
-```
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/ja7ad/hydra/main/install.ps1))) -Beta
-```
-
-The GUI's in-app updater follows the same rule: enable **Options → General → Download Beta channel** and update checks will also offer release candidates while one is ahead of stable.
-
-**macOS notes**: since the app isn't notarized yet, Gatekeeper may block it — see the [macOS Permissions Guide](https://github.com/ja7ad/hydra/wiki/macOS-Permissions-Guide-for-Hydra) for granting the required permissions. If you installed via the `.dmg` and macOS refuses to open the app ("damaged" or "unidentified developer"), clear the quarantine attribute:
-
-```bash
-xattr -cr /Applications/Hydra\ Download\ Manager.app
-```
 
 ### From Source
 
