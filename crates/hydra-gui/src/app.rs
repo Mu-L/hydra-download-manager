@@ -5,8 +5,8 @@
 
 use crate::engine::{self, Cmd, StartSpec};
 use crate::model::{
-    self, categorize, CategoryDef, ConfigFile, DlId, DlQuota, DlState, DownloadItem, PowerAction,
-    ProxyChoice, ProxyMode, ProxyPick, SiteLogin, StateFile, ThemeMode,
+    self, categorize, CategoryDef, Column, ColumnPref, ConfigFile, DlId, DlQuota, DlState,
+    DownloadItem, PowerAction, ProxyChoice, ProxyMode, ProxyPick, SiteLogin, StateFile, ThemeMode,
 };
 use crate::sounds;
 use crate::{fmt, i18n};
@@ -16,6 +16,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 pub type El<'a> = iced::Element<'a, Message>;
+
+/// How far a press on a header cell has to travel before it reorders the
+/// columns instead of sorting by them on release.
+const HEADER_DRAG_SLOP: f32 = 4.0;
 
 // ------------------------------------------------------------------- windows
 
@@ -33,6 +37,8 @@ pub enum WinKind {
     Confirm,
     Permissions,
     Shortcuts,
+    /// Which columns the download table shows, in what order.
+    Columns,
     Update,
     /// The cancellable countdown shown before a "when done" power action.
     Power,
@@ -52,18 +58,6 @@ pub enum TreeSel {
     FinCat(String),
     Queues,
     Queue(String),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SortKey {
-    Name,
-    Queue,
-    Size,
-    Status,
-    TimeLeft,
-    Rate,
-    LastTry,
-    Description,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,7 +98,12 @@ pub enum MenuAction {
     /// Options, opened straight on the Extensions page (toolbar shortcut).
     Extensions,
     HideCategories,
-    ArrangeBy(SortKey),
+    ArrangeBy(Column),
+    /// View > Columns, and the header menu's own entry: the manage dialog.
+    ManageColumns,
+    /// Header menu: show or hide one column, or move it left (`true`).
+    ToggleColumn(Column),
+    MoveColumn(Column, bool),
     SetTheme(ThemeMode),
     FontSize(u16),
     Language(String),
@@ -158,7 +157,12 @@ impl MenuAction {
             MenuAction::Options => "options".into(),
             MenuAction::Extensions => "extensions".into(),
             MenuAction::HideCategories => "hide_cats".into(),
-            MenuAction::ArrangeBy(k) => format!("arrange:{k:?}"),
+            MenuAction::ArrangeBy(k) => format!("arrange:{}", k.id()),
+            MenuAction::ManageColumns => "columns".into(),
+            MenuAction::ToggleColumn(c) => format!("col_show:{}", c.id()),
+            MenuAction::MoveColumn(c, left) => {
+                format!("col_move:{}:{}", c.id(), if *left { "l" } else { "r" })
+            }
             MenuAction::SetTheme(m) => format!("theme:{m:?}"),
             MenuAction::FontSize(s) => format!("font:{s}"),
             MenuAction::Language(l) => format!("lang:{l}"),
@@ -187,17 +191,20 @@ impl MenuAction {
             return Some(MenuAction::StopQueue(q.into()));
         }
         if let Some(k) = id.strip_prefix("arrange:") {
-            let key = match k {
-                "Name" => SortKey::Name,
-                "Size" => SortKey::Size,
-                "Status" => SortKey::Status,
-                "TimeLeft" => SortKey::TimeLeft,
-                "Rate" => SortKey::Rate,
-                "LastTry" => SortKey::LastTry,
-                "Description" => SortKey::Description,
-                _ => SortKey::Name,
-            };
-            return Some(MenuAction::ArrangeBy(key));
+            return Some(MenuAction::ArrangeBy(
+                Column::from_id(k).unwrap_or(Column::Name),
+            ));
+        }
+        if let Some(c) = id.strip_prefix("col_show:").and_then(Column::from_id) {
+            return Some(MenuAction::ToggleColumn(c));
+        }
+        if let Some((c, side)) = id
+            .strip_prefix("col_move:")
+            .and_then(|rest| rest.split_once(':'))
+        {
+            if let Some(c) = Column::from_id(c) {
+                return Some(MenuAction::MoveColumn(c, side == "l"));
+            }
         }
         if let Some(m) = id.strip_prefix("theme:") {
             let mode = match m {
@@ -239,6 +246,7 @@ impl MenuAction {
             "options" => MenuAction::Options,
             "extensions" => MenuAction::Extensions,
             "hide_cats" => MenuAction::HideCategories,
+            "columns" => MenuAction::ManageColumns,
             "homepage" => MenuAction::HomePage,
             "contribute" => MenuAction::Contribute,
             "report_issue" => MenuAction::ReportIssue,
@@ -1084,14 +1092,25 @@ pub enum Message {
     EmptyPress,
     /// A drag swept onto the empty ruled area below the last download.
     EmptyEnter,
-    HeaderEnter(usize),
-    HeaderExit(usize),
+    HeaderEnter(Column),
+    HeaderExit(Column),
     QueueMenuOpen(bool),
     ClipboardAddStart(Option<String>),
     ShortcutEdit(String, String),
     MouseUp,
-    ColResizeStart(usize),
-    SortBy(SortKey),
+    ColResizeStart(Column),
+    /// Left press on a header cell: the start of either a sort (release
+    /// without moving) or a drag that reorders the columns.
+    HeaderPress(Column),
+    /// Right press on a header cell: opens the column menu over it.
+    HeaderRightClick(Column),
+    SortBy(Column),
+    /// Show or hide one column, from the header menu or the manage dialog.
+    ColToggle(Column),
+    /// Move one column one place towards the given side. `true` is left.
+    ColMove(Column, bool),
+    /// Put the table's columns back to the stock order, widths and visibility.
+    ColReset,
     ToolbarResume,
     ToolbarStop,
     ToolbarDelete,
@@ -1336,10 +1355,17 @@ pub struct App {
     pub selected: Vec<DlId>,
     pub sel_anchor: Option<DlId>,
     pub mods: iced::keyboard::Modifiers,
-    /// Live column widths of the download table (drag the header edges).
-    pub col_widths: Vec<f32>,
     /// (column, grab x, width at grab) while a header edge is being dragged.
-    pub resizing: Option<(usize, f32, f32)>,
+    /// The width itself lives in `cfg.settings.columns` and is written there
+    /// as the pointer moves; the config file is only saved once the drag ends.
+    pub resizing: Option<(Column, f32, f32)>,
+    /// A header cell is held down: the column, the pointer x the press is
+    /// measured from, and whether it has since moved far enough to count as a
+    /// reorder drag rather than a click on the title. A press that never
+    /// moves sorts by the column on release.
+    pub header_drag: Option<(Column, f32, bool)>,
+    /// Column the header context menu was opened on, if it is showing.
+    pub header_ctx: Option<Column>,
     pub tree_sel: TreeSel,
     pub tree_open: [bool; 4], // all, unfinished, finished, queues
     /// Sidebar inline rename: the queue currently being renamed, if any,
@@ -1359,7 +1385,7 @@ pub struct App {
     /// the pair is timed here instead, as the download table already does
     /// with [`Self::last_click`].
     pub last_queue_click: Option<(String, Instant)>,
-    pub sort: (SortKey, bool),
+    pub sort: (Column, bool),
     pub add_url: AddUrlState,
     pub file_info: FileInfoState,
     pub zip_preview: ZipPreviewState,
@@ -1421,7 +1447,7 @@ pub struct App {
     /// breaks drag-selection), so the hover highlight is tracked here.
     pub hover_row: Option<DlId>,
     /// Header cell under the pointer, for the same reason.
-    pub hover_col: Option<usize>,
+    pub hover_col: Option<Column>,
     /// Visible order snapshotted when a drag-selection starts. The sweep
     /// extends the selection on every row it crosses, and re-deriving the
     /// order there meant re-filtering and re-sorting the whole list per row.
@@ -1816,24 +1842,24 @@ impl App {
         // on every rebuild — two allocations per *comparison* put O(n log n)
         // of them on the pointer's event rate during a drag.
         match key {
-            SortKey::Name => sort_keyed(&mut v, asc, |d| d.file_name.to_lowercase()),
-            SortKey::Status => sort_keyed(&mut v, asc, DownloadItem::status_text),
+            Column::Name => sort_keyed(&mut v, asc, |d| d.file_name.to_lowercase()),
+            Column::Status => sort_keyed(&mut v, asc, DownloadItem::status_text),
             _ => v.sort_by(|a, b| {
                 let ord = match key {
-                    SortKey::Queue => a.queue.cmp(&b.queue).then(a.q_order.cmp(&b.q_order)),
-                    SortKey::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
-                    SortKey::TimeLeft => a
+                    Column::Queue => a.queue.cmp(&b.queue).then(a.q_order.cmp(&b.q_order)),
+                    Column::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+                    Column::TimeLeft => a
                         .eta_secs
                         .unwrap_or(u64::MAX)
                         .cmp(&b.eta_secs.unwrap_or(u64::MAX)),
-                    SortKey::Rate => a
+                    Column::Rate => a
                         .rate
                         .partial_cmp(&b.rate)
                         .unwrap_or(std::cmp::Ordering::Equal),
-                    SortKey::LastTry => a.last_try.cmp(&b.last_try),
-                    SortKey::Description => a.description.cmp(&b.description),
+                    Column::LastTry => a.last_try.cmp(&b.last_try),
+                    Column::Description => a.description.cmp(&b.description),
                     // Handled above.
-                    SortKey::Name | SortKey::Status => std::cmp::Ordering::Equal,
+                    Column::Name | Column::Status => std::cmp::Ordering::Equal,
                 };
                 if asc {
                     ord
@@ -1843,6 +1869,24 @@ impl App {
             }),
         }
         v
+    }
+
+    /// One column's stored presentation, for the two things that change it:
+    /// a width drag, and the show/hide toggle.
+    fn column_mut(&mut self, col: Column) -> Option<&mut ColumnPref> {
+        self.cfg.settings.columns.iter_mut().find(|p| p.id == col)
+    }
+
+    /// Carry a header drag to pointer x. A press only counts as a reorder
+    /// once it has travelled; until then it is still a click on the title,
+    /// which sorts the list on release.
+    fn drag_header_to(&mut self, x: f32) {
+        let Some((col, from_x, moved)) = self.header_drag else {
+            return;
+        };
+        let moved = moved || (x - from_x).abs() > HEADER_DRAG_SLOP;
+        let from_x = model::drag_column(&mut self.cfg.settings.columns, col, from_x, x);
+        self.header_drag = Some((col, from_x, moved));
     }
 
     /// Mark the download list for persistence. The actual write happens in
@@ -2060,6 +2104,7 @@ impl App {
             WinKind::Batch => (950.0, 700.0),
             WinKind::About => (460.0, 225.0),
             WinKind::Shortcuts => (520.0, 520.0),
+            WinKind::Columns => (420.0, 400.0),
             WinKind::Confirm => (500.0, 200.0),
             WinKind::Permissions => (640.0, 410.0),
             WinKind::Update => (560.0, 520.0),
@@ -3826,6 +3871,7 @@ impl App {
                 self.open_submenu = None;
                 self.ctx_at = None;
                 self.queue_menu = None;
+                self.header_ctx = None;
                 Task::none()
             }
             Message::SubmenuHover(i) => {
@@ -3837,6 +3883,7 @@ impl App {
                 self.open_submenu = None;
                 self.ctx_at = None;
                 self.queue_menu = None;
+                self.header_ctx = None;
                 self.on_menu(action)
             }
             Message::TreeSelect(sel) => {
@@ -3969,10 +4016,12 @@ impl App {
                     }
                 }
                 if let Some((col, grab_x, start_w)) = self.resizing {
-                    if let Some(w) = self.col_widths.get_mut(col) {
-                        *w = (start_w + (p.x - grab_x)).clamp(40.0, 800.0);
+                    if let Some(pref) = self.column_mut(col) {
+                        pref.width =
+                            (start_w + (p.x - grab_x)).clamp(model::COL_MIN_W, model::COL_MAX_W);
                     }
                 }
+                self.drag_header_to(p.x);
                 Task::none()
             }
             Message::Mods(m) => {
@@ -4154,6 +4203,39 @@ impl App {
                 }
                 Task::none()
             }
+            Message::HeaderPress(col) => {
+                self.header_drag = Some((col, self.cursor_now().x, false));
+                Task::none()
+            }
+            Message::HeaderRightClick(col) => {
+                // A press that opened the menu must not also sort on release.
+                self.header_drag = None;
+                self.header_ctx = Some(col);
+                self.ctx_at = Some(self.cursor_now());
+                Task::none()
+            }
+            Message::ColToggle(col) => {
+                // File Name identifies the row; the table stays readable only
+                // while it is there, so its entry is the one that cannot go.
+                if col != Column::Name {
+                    if let Some(p) = self.column_mut(col) {
+                        p.visible = !p.visible;
+                    }
+                    self.save_config();
+                }
+                Task::none()
+            }
+            Message::ColMove(col, left) => {
+                if model::move_column(&mut self.cfg.settings.columns, col, left, false) {
+                    self.save_config();
+                }
+                Task::none()
+            }
+            Message::ColReset => {
+                self.cfg.settings.columns = Column::ALL.into_iter().map(ColumnPref::new).collect();
+                self.save_config();
+                Task::none()
+            }
             Message::QueueMenuOpen(start) => {
                 self.queue_menu = Some(start);
                 self.ctx_at = Some(self.cursor_now());
@@ -4183,8 +4265,17 @@ impl App {
             }
             Message::MouseUp => {
                 if self.resizing.take().is_some() {
-                    self.cfg.settings.column_widths = self.col_widths.clone();
                     self.save_config();
+                }
+                // A header press that never became a drag is a click on the
+                // title, which is what sorts the list; one that moved has
+                // already reordered the columns as it went.
+                if let Some((col, _, moved)) = self.header_drag.take() {
+                    if moved {
+                        self.save_config();
+                    } else {
+                        return self.update(Message::SortBy(col));
+                    }
                 }
                 if self.sch.drag.take().is_some() {
                     self.save_state();
@@ -4197,8 +4288,9 @@ impl App {
                 Task::none()
             }
             Message::ColResizeStart(col) => {
-                if let Some(w) = self.col_widths.get(col) {
-                    self.resizing = Some((col, self.cursor_now().x, *w));
+                if let Some(pref) = self.column_mut(col) {
+                    let w = pref.width;
+                    self.resizing = Some((col, self.cursor_now().x, w));
                 }
                 Task::none()
             }
@@ -6290,6 +6382,16 @@ impl App {
                 Task::none()
             }
             MenuAction::ArrangeBy(key) => self.update(Message::SortBy(key)),
+            MenuAction::ManageColumns => self.open_window(WinKind::Columns),
+            MenuAction::ToggleColumn(col) => self.update(Message::ColToggle(col)),
+            MenuAction::MoveColumn(col, left) => {
+                // From the header, where only shown columns are next to each
+                // other; the dialog moves within its own full list instead.
+                if model::move_column(&mut self.cfg.settings.columns, col, left, true) {
+                    self.save_config();
+                }
+                Task::none()
+            }
             MenuAction::SetTheme(mode) => {
                 let changed = self.cfg.settings.theme() != mode;
                 self.cfg.settings.theme_mode = Some(mode);

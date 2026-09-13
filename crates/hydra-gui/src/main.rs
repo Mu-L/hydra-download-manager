@@ -176,7 +176,6 @@ fn boot() -> (App, Task<Message>) {
         selected: vec![],
         sel_anchor: None,
         mods: iced::keyboard::Modifiers::default(),
-        col_widths: vec![],
         resizing: None,
         tree_sel: app::TreeSel::All,
         tree_open: [true, false, false, false],
@@ -188,7 +187,7 @@ fn boot() -> (App, Task<Message>) {
         cursor: iced::Point::ORIGIN,
         ctx_at: None,
         last_click: None,
-        sort: (app::SortKey::LastTry, false),
+        sort: (model::Column::LastTry, false),
         add_url: app::AddUrlState::default(),
         file_info: app::FileInfoState::default(),
         zip_preview: app::ZipPreviewState::default(),
@@ -214,6 +213,8 @@ fn boot() -> (App, Task<Message>) {
         list_drag_from_empty: false,
         hover_row: None,
         hover_col: None,
+        header_drag: None,
+        header_ctx: None,
         drag_order: Vec::new(),
         table_scroll: 0.0,
         table_scroll_x: 0.0,
@@ -227,19 +228,6 @@ fn boot() -> (App, Task<Message>) {
         power: None,
         system_dark: theme::system_is_dark(),
     };
-
-    // Column widths from config, defaults otherwise.
-    app.col_widths = if app.cfg.settings.column_widths.is_empty() {
-        ui::table::default_widths()
-    } else {
-        app.cfg.settings.column_widths.clone()
-    };
-    // The Q column shrank from a 110px queue-name text column to an
-    // icon-only strip; configs saved before the change still carry the old
-    // default, which would leave a wide empty band next to File Name.
-    if app.col_widths.len() > 1 && app.col_widths[1] == 110.0 {
-        app.col_widths[1] = ui::table::default_widths()[1];
-    }
 
     // Queues marked "start on startup" begin running; the first Tick starts
     // their files. Through set_queue_running so paused members are promoted
@@ -324,6 +312,7 @@ fn view(app: &App, id: window::Id) -> app::El<'_> {
         Some(WinKind::Batch) => windows::batch::view(app),
         Some(WinKind::About) => windows::about::view(app),
         Some(WinKind::Shortcuts) => windows::shortcuts::view(app),
+        Some(WinKind::Columns) => windows::columns::view(app),
         Some(WinKind::Confirm) => windows::confirm::view(app),
         Some(WinKind::Permissions) => windows::permissions::view(app),
         Some(WinKind::Update) => windows::update::view(app),
@@ -351,6 +340,7 @@ fn title(app: &App, id: window::Id) -> String {
         Some(WinKind::Batch) => tr("Add batch download"),
         Some(WinKind::About) => tr("About Hydra"),
         Some(WinKind::Shortcuts) => tr("Keyboard Shortcuts"),
+        Some(WinKind::Columns) => tr("Columns"),
         Some(WinKind::Confirm) => tr("Hydra"),
         Some(WinKind::Permissions) => tr("Permissions"),
         Some(WinKind::Update) => tr("Update Hydra"),
@@ -453,7 +443,7 @@ fn subscription(app: &App) -> Subscription<Message> {
     // display macOS colour-converts that whole surface per present — so a
     // 120 Hz pointer meant 120 full repaints a second for a rectangle that
     // reads the same at 60. Power save halves it again.
-    if app.list_drag || app.resizing.is_some() {
+    if app.list_drag || app.resizing.is_some() || app.header_drag.is_some() {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(if power_save {
                 33

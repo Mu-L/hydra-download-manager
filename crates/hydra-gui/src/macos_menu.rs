@@ -11,8 +11,9 @@
 
 #![cfg(target_os = "macos")]
 
-use crate::app::{MenuAction, SortKey};
+use crate::app::MenuAction;
 use crate::i18n::tr;
+use crate::model::Column;
 use std::cell::RefCell;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 
@@ -153,17 +154,11 @@ pub fn reinstall(state: &MenuState, queues: &[String], languages: &[String]) {
         !state.show_categories,
     );
     let _ = view.append(&hide_categories);
+    let _ = view.append(&item("Columns", MenuAction::ManageColumns));
     let arrange = Submenu::new(tr("Arrange files"), true);
-    for (label, key) in [
-        ("File Name", SortKey::Name),
-        ("Size", SortKey::Size),
-        ("Status", SortKey::Status),
-        ("Time left", SortKey::TimeLeft),
-        ("Transfer rate", SortKey::Rate),
-        ("Last Try Date", SortKey::LastTry),
-        ("Description", SortKey::Description),
-    ] {
-        let _ = arrange.append(&item(label, MenuAction::ArrangeBy(key)));
+    // Q holds an icon, not a value a reader can arrange by.
+    for key in Column::ALL.into_iter().filter(|c| *c != Column::Queue) {
+        let _ = arrange.append(&item(key.label(), MenuAction::ArrangeBy(key)));
     }
     let _ = view.append(&arrange);
     let theme_m = Submenu::new(tr("Theme"), true);

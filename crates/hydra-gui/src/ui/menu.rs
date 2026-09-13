@@ -4,8 +4,8 @@
 //! The menu model (shared with the native macOS menu bar) and the in-window
 //! menu bar + dropdowns drawn on Windows/Linux.
 
-use crate::app::{App, El, MenuAction, MenuBarKind, Message, SortKey};
-use crate::model::DlState;
+use crate::app::{App, El, MenuAction, MenuBarKind, Message};
+use crate::model::{Column, DlState};
 use crate::{i18n::tr, theme};
 use iced::widget::{button, column, container, mouse_area, row, scrollable, space, text};
 use iced::Length;
@@ -177,20 +177,15 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
         MenuBarKind::View => vec![
             Entry::item(tr("Hide categories"), MenuAction::HideCategories)
                 .check(!app.cfg.settings.show_categories),
+            Entry::item(tr("Columns"), MenuAction::ManageColumns),
             Entry::sub(
                 tr("Arrange files"),
-                [
-                    ("File Name", SortKey::Name),
-                    ("Size", SortKey::Size),
-                    ("Status", SortKey::Status),
-                    ("Time left", SortKey::TimeLeft),
-                    ("Transfer rate", SortKey::Rate),
-                    ("Last Try Date", SortKey::LastTry),
-                    ("Description", SortKey::Description),
-                ]
-                .into_iter()
-                .map(|(l, k)| Entry::item(tr(l), MenuAction::ArrangeBy(k)))
-                .collect(),
+                // Q holds an icon, not a value a reader can arrange by.
+                Column::ALL
+                    .into_iter()
+                    .filter(|c| *c != Column::Queue)
+                    .map(|c| Entry::item(tr(c.label()), MenuAction::ArrangeBy(c)))
+                    .collect(),
             ),
             Entry::sub(
                 tr("Theme"),
@@ -244,6 +239,53 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
             Entry::item(tr("About Hydra"), MenuAction::About).sep(),
         ],
     }
+}
+
+/// Context-menu entries for the table header, right-clicked on `col`: the
+/// column's own two moves, then a tick per column to show or hide it, then
+/// the manage dialog for the same choices in one place.
+pub fn header_entries(app: &App, col: Column) -> Vec<Entry> {
+    let cols = &app.cfg.settings.columns;
+    let shown = |side: bool| {
+        let i = cols.iter().position(|p| p.id == col);
+        i.is_some_and(|i| {
+            if side {
+                cols[..i].iter().any(|p| p.visible)
+            } else {
+                cols[i + 1..].iter().any(|p| p.visible)
+            }
+        })
+    };
+    let mut v = vec![
+        Entry {
+            enabled: shown(true),
+            ..Entry::item(tr("Move Left"), MenuAction::MoveColumn(col, true))
+        },
+        Entry {
+            enabled: shown(false),
+            ..Entry::item(tr("Move Right"), MenuAction::MoveColumn(col, false))
+        },
+    ];
+    v.push(
+        Entry::sub(
+            tr("Show columns"),
+            cols.iter()
+                .map(|p| {
+                    Entry {
+                        // File Name names the row: a table without it is a
+                        // grid of sizes and dates with nothing to read them
+                        // against, so that one tick cannot be cleared.
+                        enabled: p.id != Column::Name,
+                        ..Entry::item(tr(p.id.label()), MenuAction::ToggleColumn(p.id))
+                            .check(p.visible)
+                    }
+                })
+                .collect(),
+        )
+        .sep(),
+    );
+    v.push(Entry::item(tr("Columns"), MenuAction::ManageColumns));
+    v
 }
 
 /// Context-menu entries for the selected download row.
