@@ -12,8 +12,8 @@
 # Not "hydra": Fedora already ships a binary package by that name (THC-Hydra,
 # the login cracker) at version 9.x, so a Copr package of the same name loses
 # every version comparison and `dnf install hydra` silently installs the
-# cracker instead. Source0 and %autosetup stay on the upstream tarball name,
-# hydra-%{version}.tar.gz, which is what the release workflow produces.
+# cracker instead. Source0 and %%autosetup stay on the upstream tarball name,
+# hydra-%%{version}.tar.gz, which is what the release workflow produces.
 Name:           hydra-download-manager
 Version:        %{_version}
 Release:        1%{?dist}
