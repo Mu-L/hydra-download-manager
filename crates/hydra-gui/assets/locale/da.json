@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "En fuldført download forsvinder selv fra listen — når dialogen om fuldførelse er lukket, hvis den vises. Den hentede fil bevares.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "Et værtsnavn eller en adresse, eller en fuld angivelse som socks5://127.0.0.1:10808 — et skema skrevet her vinder over Type.",
   "A new version of Hydra is available": "En ny version af Hydra er tilgængelig",
+  "AI & Datasets": "AI og datasæt",
   "About Hydra": "Om Hydra",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "Adgang til downloadmappen blev nægtet. Tillad Hydra under Systemindstillinger > Fortrolighed og sikkerhed > Filer og mapper, eller vælg en anden mappe.",
   "Add URL": "Tilføj URL",
