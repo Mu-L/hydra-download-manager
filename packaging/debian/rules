@@ -14,7 +14,7 @@ export CARGO_HOME := $(CURDIR)/debian/cargo_home
 	dh $@
 
 override_dh_auto_clean:
-	rm -rf target/ dist/ debian/hydra/ debian/.debhelper/ debian/files debian/cargo_home
+	rm -rf target/ dist/ debian/hydra-download-manager/ debian/.debhelper/ debian/files debian/cargo_home
 
 override_dh_clean:
 	dh_clean -X.orig
@@ -25,35 +25,35 @@ override_dh_auto_build:
 	cargo build --release -p hya-cli -p hya-gui -p hya-host
 
 override_dh_auto_install:
-	install -Dm755 target/release/hydra debian/hydra/usr/bin/hydra
-	install -Dm755 target/release/hydra-gui debian/hydra/usr/bin/hydra-gui
-	install -Dm755 target/release/hydra-host debian/hydra/usr/bin/hydra-host
+	install -Dm755 target/release/hydra debian/hydra-download-manager/usr/bin/hydra
+	install -Dm755 target/release/hydra-gui debian/hydra-download-manager/usr/bin/hydra-gui
+	install -Dm755 target/release/hydra-host debian/hydra-download-manager/usr/bin/hydra-host
 
 	# Short second name for the CLI: `hydra` collides with THC-Hydra, which
-	# this package already Conflicts with, and three letters types better for
+	# this package Conflicts with, and three letters types better for
 	# a command run as often as a download. Relative, so it resolves inside
 	# whatever root the package is unpacked into.
-	ln -sf hydra debian/hydra/usr/bin/hya
+	ln -sf hydra debian/hydra-download-manager/usr/bin/hya
 
-	install -Dm644 debian/hydra.desktop debian/hydra/usr/share/applications/hydra.desktop || install -Dm644 packaging/debian/hydra.desktop debian/hydra/usr/share/applications/hydra.desktop
-	install -Dm644 debian/hydra-autostart.desktop debian/hydra/etc/xdg/autostart/hydra.desktop || install -Dm644 packaging/debian/hydra-autostart.desktop debian/hydra/etc/xdg/autostart/hydra.desktop
+	install -Dm644 debian/hydra.desktop debian/hydra-download-manager/usr/share/applications/hydra.desktop || install -Dm644 packaging/debian/hydra.desktop debian/hydra-download-manager/usr/share/applications/hydra.desktop
+	install -Dm644 debian/hydra-autostart.desktop debian/hydra-download-manager/etc/xdg/autostart/hydra.desktop || install -Dm644 packaging/debian/hydra-autostart.desktop debian/hydra-download-manager/etc/xdg/autostart/hydra.desktop
 
-	install -Dm644 docs/logo.png debian/hydra/usr/share/icons/hicolor/512x512/apps/hydra.png
+	install -Dm644 docs/logo.png debian/hydra-download-manager/usr/share/icons/hicolor/512x512/apps/hydra.png
 
-	install -d debian/hydra/usr/share/hydra/extensions
-	scripts/build-extensions.sh --out debian/hydra/usr/share/hydra/extensions --quiet --prefix /usr/share/hydra/extensions
+	install -d debian/hydra-download-manager/usr/share/hydra-download-manager/extensions
+	scripts/build-extensions.sh --out debian/hydra-download-manager/usr/share/hydra-download-manager/extensions --quiet --prefix /usr/share/hydra-download-manager/extensions
 
-	install -d debian/hydra/usr/share/man/man1
+	install -d debian/hydra-download-manager/usr/share/man/man1
 	for page in docs/man/*.1; do \
-		gzip -9n -c "$$page" > debian/hydra/usr/share/man/man1/$$(basename "$$page").gz; \
+		gzip -9n -c "$$page" > debian/hydra-download-manager/usr/share/man/man1/$$(basename "$$page").gz; \
 	done
 
 	for d in etc/opt/chrome etc/chromium etc/opt/edge; do \
-		install -d debian/hydra/$$d/native-messaging-hosts; \
-		install -m644 debian/com.hydra.host.chrome.json debian/hydra/$$d/native-messaging-hosts/com.hydra.host.json || install -m644 packaging/debian/com.hydra.host.chrome.json debian/hydra/$$d/native-messaging-hosts/com.hydra.host.json; \
+		install -d debian/hydra-download-manager/$$d/native-messaging-hosts; \
+		install -m644 debian/com.hydra.host.chrome.json debian/hydra-download-manager/$$d/native-messaging-hosts/com.hydra.host.json || install -m644 packaging/debian/com.hydra.host.chrome.json debian/hydra-download-manager/$$d/native-messaging-hosts/com.hydra.host.json; \
 	done
-	install -d debian/hydra/usr/lib/mozilla/native-messaging-hosts
-	install -m644 debian/com.hydra.host.mozilla.json debian/hydra/usr/lib/mozilla/native-messaging-hosts/com.hydra.host.json || install -m644 packaging/debian/com.hydra.host.mozilla.json debian/hydra/usr/lib/mozilla/native-messaging-hosts/com.hydra.host.json
+	install -d debian/hydra-download-manager/usr/lib/mozilla/native-messaging-hosts
+	install -m644 debian/com.hydra.host.mozilla.json debian/hydra-download-manager/usr/lib/mozilla/native-messaging-hosts/com.hydra.host.json || install -m644 packaging/debian/com.hydra.host.mozilla.json debian/hydra-download-manager/usr/lib/mozilla/native-messaging-hosts/com.hydra.host.json
 
 override_dh_auto_test:
 	# Skip test suite during Debian packaging build
