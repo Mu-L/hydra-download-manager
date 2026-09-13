@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "Un téléchargement terminé quitte la liste de lui-même — une fois la fenêtre de fin fermée, si celle-ci s'affiche. Le fichier téléchargé est conservé.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "Un nom d'hôte ou une adresse, ou une spécification complète comme socks5://127.0.0.1:10808 — un schéma écrit ici l'emporte sur Type.",
   "A new version of Hydra is available": "Une nouvelle version de Hydra est disponible",
+  "AI & Datasets": "IA et jeux de données",
   "About Hydra": "À propos de Hydra",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "L'accès au dossier de téléchargement a été refusé. Autorisez Hydra dans Réglages Système > Confidentialité et sécurité > Fichiers et dossiers, ou choisissez un autre dossier.",
   "Add URL": "Ajouter une URL",

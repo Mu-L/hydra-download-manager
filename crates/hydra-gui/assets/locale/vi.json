@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "Một tải xuống đã hoàn tất sẽ tự rời khỏi danh sách — sau khi hộp thoại hoàn tất được đóng, nếu hộp thoại đó được hiển thị. Tệp đã tải về vẫn được giữ lại.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "Tên máy chủ hoặc địa chỉ, hoặc một đặc tả đầy đủ như socks5://127.0.0.1:10808 — lược đồ ghi ở đây được ưu tiên hơn Loại.",
   "A new version of Hydra is available": "Đã có phiên bản mới của Hydra",
+  "AI & Datasets": "AI và tập dữ liệu",
   "About Hydra": "Giới thiệu về Hydra",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "Quyền truy cập thư mục tải xuống đã bị từ chối. Hãy cấp quyền cho Hydra trong System Settings > Privacy & Security > Files and Folders, hoặc chọn thư mục khác.",
   "Add URL": "Thêm URL",

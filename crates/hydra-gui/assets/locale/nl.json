@@ -12,6 +12,7 @@
   "A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept.": "Een voltooide download verdwijnt vanzelf uit de lijst — zodra het voltooiingsvenster is gesloten, als dat wordt getoond. Het gedownloade bestand blijft behouden.",
   "A host name or address, or a full specification such as socks5://127.0.0.1:10808 — a scheme spelled here wins over Type.": "Een hostnaam of adres, of een volledige opgave zoals socks5://127.0.0.1:10808 — een schema dat hier staat gaat vóór Type.",
   "A new version of Hydra is available": "Er is een nieuwe versie van Hydra beschikbaar",
+  "AI & Datasets": "AI & datasets",
   "About Hydra": "Over Hydra",
   "Access to the download folder was denied. Allow Hydra under System Settings > Privacy & Security > Files and Folders, or choose another folder.": "Toegang tot de downloadmap is geweigerd. Geef Hydra toestemming via Systeeminstellingen > Privacy en beveiliging > Bestanden en mappen, of kies een andere map.",
   "Add URL": "URL toevoegen",
