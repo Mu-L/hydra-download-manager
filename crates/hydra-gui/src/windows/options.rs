@@ -425,6 +425,14 @@ fn downloads(app: &App) -> El<'_> {
             tr("Shows a Hide-tab button inside the Speed Limiter and Options-on-completion tabs."),
         ),
         hinted(
+            checkbox(s.show_conn_details).label(tr("Show connection details"))
+                .on_toggle(|b| o(OptField::ConnDetails(b)))
+                .size(15.0)
+                .text_size(theme::FONT_SIZE)
+                .style(theme::check),
+            tr("Off = the progress window opens collapsed; its \"Show details\" button still opens the per-connection panel."),
+        ),
+        hinted(
             checkbox(s.show_complete_dialog).label(tr("Show download complete dialog"))
                 .on_toggle(|b| o(OptField::CompleteDialog(b)))
                 .size(15.0)
