@@ -284,7 +284,17 @@ const PANEL_MIN_H = 80;
 // so it only has to be visible and not a one-pixel beacon.
 const AUDIO_MIN_W = 100;
 const AUDIO_MIN_H = 20;
-const PANEL_LINGER_MS = 2200;
+// How long the bar stays after it has shown itself — a player started
+// playing, a manifest landed, the pointer moved off. The reader sets it from
+// the popup, in seconds, and zero means "leave it up until I dismiss it".
+// The default was 2.2s, which on a page that autoplays is gone before the
+// eye reaches it.
+const PANEL_LINGER_DEFAULT_MS = 10_000;
+let panelLingerMs = PANEL_LINGER_DEFAULT_MS;
+// A send is finished business, so the confirmation clears itself even when
+// the idle timeout is switched off — otherwise "Sent to Hydra" would sit
+// over the player until the page is left.
+const SENT_LINGER_MS = 1500;
 
 let panelHost = null;
 let panelEl = null;
@@ -328,6 +338,29 @@ function fmtBytes(n) {
   return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${u[i]}`;
 }
 
+// What separates the parts of a row. A middle dot rather than a comma: the
+// parts are peers — quality, container, bitrate — not a sentence.
+const SEP = " \u00b7 ";
+
+// Same wording as the popup's stream list, so a variant reads identically
+// wherever it is offered.
+function fmtBitrate(bps) {
+  if (!bps) return "";
+  return bps >= 1e6 ? `${(bps / 1e6).toFixed(1)} Mbps` : `${Math.round(bps / 1e3)} kbps`;
+}
+
+/// The file's own name, undecorated. A direct file is identified by its
+/// name the way a stream variant is by its quality.
+function fileName(url) {
+  const raw = url.split(/[?#]/)[0].split("/").pop() || "";
+  try {
+    return decodeURIComponent(raw).trim();
+  } catch {
+    // A stray `%` is not a reason to leave the whole list unbuilt.
+    return raw.trim();
+  }
+}
+
 // Must match streamVariantId() in background.js.
 function variantId(v) {
   return [v?.id ?? "", v?.url ?? "", v?.bandwidth ?? ""].join("|");
@@ -340,8 +373,6 @@ function pageTitle() {
   return raw.replace(/[\\/:*?"<>|]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120) || "video";
 }
 
-/// One row per variant per offered container, cheapest quality first — the
-/// order and wording IDM uses, so the list reads the same way.
 /// The file a player is actually playing, if that is a plain download.
 ///
 /// `currentSrc` is what the element resolved to after picking among its
@@ -360,6 +391,15 @@ function playingSrc(el) {
   return src;
 }
 
+/// One row per variant per offered container, cheapest quality first.
+///
+/// Every row leads with what tells it APART from its neighbours — quality
+/// for a stream variant, its own name for a direct file. The page title used
+/// to lead instead, which on a master playlist with sixteen renditions meant
+/// sixteen identical openings and the quality pushed past the ellipsis, so
+/// the one thing the list exists to choose between was the one thing that
+/// could not be read. The title names the file Hydra saves, so it is shown
+/// once at the head of the menu instead of once per row.
 function buildRows(playing) {
   const title = pageTitle();
   const rows = [];
@@ -376,16 +416,15 @@ function buildRows(playing) {
     const what = hit?.kind || (/^[A-Z0-9]{2,5}$/.test(ext) ? ext : "MP4");
     // The file's own name, not the page title: on a page of samples the
     // page title is the same for all of them and names none of them.
-    const named = decodeURIComponent(bare(playing).split("/").pop() || "").trim();
     return [
       {
         kind: "media",
         // The sniffed URL when there is one: it carries whatever query the
         // origin wanted, which a signed URL needs to stay fetchable.
         url: hit?.url || playing,
-        label: [named || title, `${what} file`, fmtBytes(hit?.size)]
+        label: [fileName(playing) || title, what, fmtBytes(hit?.size)]
           .filter(Boolean)
-          .join(", "),
+          .join(SEP),
       },
     ];
   }
@@ -398,17 +437,16 @@ function buildRows(playing) {
     const variants = s.variants.length ? s.variants.slice().reverse() : [null];
     for (const v of variants) {
       for (const container of containers) {
-        const quality = v?.height ? `quality ${v.height}p${v.height >= 720 ? " HD" : ""}` : null;
-        const rate = v?.bandwidth ? `${Math.round(v.bandwidth / 1000)} kbps` : null;
+        const quality = v?.height ? `${v.height}p${v.height >= 720 ? " HD" : ""}` : null;
         rows.push({
           kind: "stream",
           key: s.key,
           variant: variantId(v),
           container,
           filename: title,
-          label: [title, `${container} file`, quality, rate, s.live ? "live" : null]
+          label: [quality, container, fmtBitrate(v?.bandwidth), s.live ? "live" : null]
             .filter(Boolean)
-            .join(", "),
+            .join(SEP),
         });
       }
     }
@@ -422,7 +460,7 @@ function buildRows(playing) {
     rows.push({
       kind: "media",
       url: m.url,
-      label: [title, `${what} file`, fmtBytes(m.size)].filter(Boolean).join(", "),
+      label: [fileName(m.url) || title, what, fmtBytes(m.size)].filter(Boolean).join(SEP),
     });
   }
   return rows;
@@ -594,6 +632,15 @@ function buildPanel() {
       margin-bottom: 2px;
       padding-bottom: 8px;
     }
+    /* The name every row in the list saves under, said once. */
+    .row.head {
+      font-weight: 600;
+      cursor: default;
+      border-bottom: 1px solid #c4d6c5;
+      margin-bottom: 2px;
+      padding-bottom: 8px;
+    }
+    .row.head:hover { background: transparent; }
     .row.note { color: #5c7a5e; cursor: default; }
     .row.note:hover { background: transparent; }
   `;
@@ -763,6 +810,14 @@ function renderRows(el) {
     return t;
   };
 
+  // The filename, once, above the choices — the part every row used to
+  // repeat. Not shown in single-file mode: there the bar downloads on click
+  // and this menu never opens.
+  if (!panelSingle) {
+    const head = mkRow(pageTitle(), null, null, "head");
+    head.title = head.textContent;
+  }
+
   if (panelRows.length > 1) {
     mkRow(
       "Download all",
@@ -857,16 +912,16 @@ function sendSingle() {
   sendRow(r, (rep) => {
     if (rep && rep.ok) {
       panelTitle.textContent = "Sent to Hydra";
-      schedulePanelHide();
+      schedulePanelHide(SENT_LINGER_MS);
     } else {
       panelTitle.textContent = (rep && rep.error) || was;
     }
   });
 }
 
-function schedulePanelHide() {
+function schedulePanelHide(ms = panelLingerMs) {
   clearTimeout(panelTimer);
-  panelTimer = setTimeout(hidePanel, PANEL_LINGER_MS);
+  if (ms > 0) panelTimer = setTimeout(hidePanel, ms);
 }
 
 async function refreshPageItems() {
@@ -875,6 +930,7 @@ async function refreshPageItems() {
     if (r) {
       pageItems = { streams: r.streams || [], media: r.media || [] };
       panelEnabled = r.videoPanel !== false;
+      if (Number.isFinite(r.panelTimeout)) panelLingerMs = r.panelTimeout * 1000;
       if (!panelEnabled) hidePanel();
     }
   } catch {
@@ -940,6 +996,28 @@ chrome.runtime.onMessage.addListener((msg) => {
   return false;
 });
 
+/// Follow the scroll: stay glued to the player, or move on when it has gone.
+///
+/// Placement is clamped to the viewport, so a player scrolled out of the way
+/// left the bar pinned to the edge of the screen offering a video nobody can
+/// see any more — the complaint on a feed like x.com, where a post scrolls
+/// past long before the bar's own timeout runs out. By then the next clip is
+/// usually already on screen and autoplaying, so the bar moves to it rather
+/// than lingering on the one that left.
+function followScroll() {
+  if (!panelTarget) return;
+  // Mid-drag the bar belongs to the hand holding it, not to the scroll.
+  if (panelDrag || playerBigEnough(panelTarget)) return placePanel();
+  const next = panelMedia();
+  hidePanel();
+  if (next) {
+    showPanel(next);
+    // It moved here on its own initiative, so it fades like the bar a `play`
+    // puts up instead of staying for a hover that never happened.
+    schedulePanelHide();
+  }
+}
+
 // Keep it glued to the player without a listener storm.
 for (const ev of ["scroll", "resize"]) {
   window.addEventListener(
@@ -948,7 +1026,7 @@ for (const ev of ["scroll", "resize"]) {
       if (!panelTarget || panelRaf) return;
       panelRaf = requestAnimationFrame(() => {
         panelRaf = 0;
-        placePanel();
+        followScroll();
       });
     },
     { passive: true, capture: true }

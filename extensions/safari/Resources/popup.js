@@ -198,6 +198,8 @@ async function refresh() {
   });
   $("enabled").checked = state.enabled;
   $("video-panel").checked = state.videoPanel !== false;
+  $("panel-timeout").value = state.panelTimeout;
+  $("panel-timeout").disabled = !$("video-panel").checked;
 
   // Liveness: the live WebSocket is the truth; probe only if it looks down
   // (never launches the app).
@@ -253,7 +255,21 @@ $("enabled").addEventListener("change", async (e) => {
 });
 
 $("video-panel").addEventListener("change", async (e) => {
+  // How long a button that is switched off stays up is not a question.
+  $("panel-timeout").disabled = !e.target.checked;
   await chrome.runtime.sendMessage({ type: "set-video-panel", on: e.target.checked });
+});
+
+// `change`, not `input`: a field being typed into passes through states the
+// reader never meant — "1" on the way to "15", empty on the way to anything.
+$("panel-timeout").addEventListener("change", async (e) => {
+  const r = await chrome.runtime.sendMessage({
+    type: "set-panel-timeout",
+    seconds: e.target.value,
+  });
+  // Show what was actually stored, so a value out of range corrects itself
+  // in front of the reader instead of silently meaning something else.
+  if (r && Number.isFinite(r.seconds)) e.target.value = r.seconds;
 });
 
 $("open-hydra").addEventListener("click", async () => {
