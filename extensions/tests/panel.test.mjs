@@ -9,8 +9,8 @@ import { readFileSync } from "node:fs";
 const src = readFileSync("extensions/chrome/content.js", "utf8");
 
 // Pull the pure list-building functions out of the content script.
-const names = ["fmtBytes", "variantId", "pageTitle", "playingSrc", "buildRows"];
-let code = "let pageItems = { streams: [], media: [] };\n";
+const names = ["fmtBytes", "fmtBitrate", "fileName", "variantId", "pageTitle", "playingSrc", "buildRows"];
+let code = 'let pageItems = { streams: [], media: [] };\nconst SEP = " \\u00b7 ";\n';
 for (const n of names) {
   const i = src.indexOf(`function ${n}(`);
   if (i < 0) throw new Error("missing " + n);
@@ -51,16 +51,20 @@ const hlsTs = {
 };
 
 api.set({ streams: [hlsTs], media: [] });
+// The page title opened every row and pushed the quality past the ellipsis,
+// which is the one thing the list exists to choose between. It names the
+// file Hydra saves, so it is carried in `filename` and shown once at the
+// head of the menu; the row itself leads with the quality.
 eq(
   "TS segments offer both containers, cheapest quality first",
   api.buildRows().map((r) => r.label),
   [
-    `${TITLE}, TS file, quality 360p, 1093 kbps`,
-    `${TITLE}, MP4 file, quality 360p, 1093 kbps`,
-    `${TITLE}, TS file, quality 480p, 2060 kbps`,
-    `${TITLE}, MP4 file, quality 480p, 2060 kbps`,
-    `${TITLE}, TS file, quality 1080p HD, 4794 kbps`,
-    `${TITLE}, MP4 file, quality 1080p HD, 4794 kbps`,
+    "360p · TS · 1.1 Mbps",
+    "360p · MP4 · 1.1 Mbps",
+    "480p · TS · 2.1 Mbps",
+    "480p · MP4 · 2.1 Mbps",
+    "1080p HD · TS · 4.8 Mbps",
+    "1080p HD · MP4 · 4.8 Mbps",
   ]
 );
 eq(
@@ -72,9 +76,22 @@ eq(
     variant: "|v3.m3u8|4794000",
     container: "MP4",
     filename: TITLE,
-    label: `${TITLE}, MP4 file, quality 1080p HD, 4794 kbps`,
+    label: "1080p HD · MP4 · 4.8 Mbps",
   }
 );
+// An audio-only rendition has no height to lead with; the container still
+// has to name the row, or it would come out blank.
+api.set({
+  streams: [{ ...hlsTs, variants: [{ id: "a", url: "a.m3u8", bandwidth: 96000 }] }],
+  media: [],
+});
+eq(
+  "a variant with no resolution still says what it is",
+  api.buildRows().map((r) => r.label),
+  ["TS · 96 kbps", "MP4 · 96 kbps"]
+);
+
+api.set({ streams: [hlsTs], media: [] });
 
 api.set({ streams: [{ ...hlsTs, segmentType: "fmp4" }], media: [] });
 eq(
@@ -88,11 +105,11 @@ api.set({
   media: [],
 });
 eq("DASH offers MP4 only", api.buildRows().map((r) => r.label), [
-  `${TITLE}, MP4 file, quality 1080p HD, 4794 kbps`,
+  "1080p HD · MP4 · 4.8 Mbps",
 ]);
 
 api.set({ streams: [{ ...hlsTs, live: true }], media: [] });
-eq("a live stream says so on every row", api.buildRows()[0].label.endsWith(", live"), true);
+eq("a live stream says so on every row", api.buildRows()[0].label.endsWith(" · live"), true);
 
 api.set({ streams: [{ ...hlsTs, drm: "Widevine" }], media: [] });
 eq("a DRM stream produces no rows at all", api.buildRows(), []);
@@ -104,10 +121,13 @@ api.set({
     { url: "https://cdn.ex/a.mp4", size: 48234496 },
   ],
 });
+// A direct file has no quality to choose by, so its own name is what tells
+// it from its neighbours — the same reasoning that already named a playing
+// file after itself.
 eq(
   "direct files are listed too, smallest first",
   api.buildRows().map((r) => r.label),
-  [`${TITLE}, MP4 file, 46 MB`, `${TITLE}, MP4 file, 87 MB`]
+  ["a.mp4 · MP4 · 46 MB", "b.mp4 · MP4 · 87 MB"]
 );
 eq("a direct file downloads by URL", api.buildRows()[0].kind, "media");
 
@@ -131,7 +151,7 @@ eq("a direct file downloads by URL", api.buildRows()[0].kind, "media");
   eq(
     "named by the FILE, since the page title names them all identically",
     rows[0].label,
-    "sample-12s.mp3, MP3 file, 196 KB"
+    "sample-12s.mp3 · MP3 · 196 KB"
   );
 
   // A query string is not part of identity: signed URLs rotate theirs, and
@@ -139,10 +159,17 @@ eq("a direct file downloads by URL", api.buildRows()[0].kind, "media");
   const q = api.buildRows("https://a.ex/s/sample-35s.mp3?token=abc");
   eq("a signed URL still matches its sniffed entry", q[0].url, "https://a.ex/s/sample-35s.mp3");
 
+  // A name the browser cannot percent-decode is still a name; throwing
+  // there would leave the whole list unbuilt over one bad character.
+  api.set({ streams: [], media: [{ url: "https://a.ex/s/100%.mp3", size: 157_000 }] });
+  eq("a name that will not decode is passed through", api.buildRows()[0].label,
+    "100%.mp3 · MP3 · 153 KB");
+
+  api.set({ streams: [], media });
   // Something playing that was never sniffed is still downloadable.
   const un = api.buildRows("https://a.ex/other/voice.wav");
   eq("an unsniffed file is still offered", un.length, 1);
-  eq("with its type read off the name", un[0].label, "voice.wav, WAV file");
+  eq("with its type read off the name", un[0].label, "voice.wav · WAV");
 }
 
 // ---- what counts as "playing a file" ------------------------------------
@@ -264,6 +291,96 @@ eq(
   eq(
     "and restored before the bar can first appear",
     src.indexOf("loadPanelOffset()") > src.indexOf("function loadPanelOffset"),
+    true
+  );
+}
+
+// ---- the bar does not outstay the video it belongs to -------------------
+
+// A feed — x.com, a timeline of clips — scrolls a post past long before the
+// bar's own timeout runs out. Placement is clamped to the viewport, so the
+// bar was left pinned to the edge of the screen offering a video that had
+// gone; the next clip is usually already on screen by then.
+{
+  const follow = src.slice(src.indexOf("function followScroll"));
+  const body = follow.slice(0, follow.indexOf("\n}"));
+  eq(
+    "a player still on screen just keeps the bar glued to it",
+    /playerBigEnough\(panelTarget\)\) return placePanel\(\)/.test(body),
+    true
+  );
+  eq(
+    "one that has scrolled away loses the bar",
+    /hidePanel\(\)/.test(body),
+    true
+  );
+  eq(
+    "which moves to the next visible player rather than vanishing",
+    /panelMedia\(\)/.test(body) && /showPanel\(next\)/.test(body),
+    true
+  );
+  eq(
+    "and starts its timeout there, since no hover put it there",
+    /schedulePanelHide\(\)/.test(body),
+    true
+  );
+  eq(
+    "a drag is not interrupted by a scroll",
+    /panelDrag \|\|/.test(body),
+    true
+  );
+  eq(
+    "the scroll listener runs it instead of placing blindly",
+    /panelRaf = 0;\s*\n\s*followScroll\(\);/.test(src),
+    true
+  );
+}
+
+// ---- how long it stays is the reader's call -----------------------------
+{
+  eq(
+    "the default linger is ten seconds, not the old two",
+    /PANEL_LINGER_DEFAULT_MS = 10_000/.test(src),
+    true
+  );
+  const sched = src.slice(src.indexOf("function schedulePanelHide"));
+  const body = sched.slice(0, sched.indexOf("\n}"));
+  eq(
+    "zero means the bar stays until it is dismissed",
+    /if \(ms > 0\)/.test(body),
+    true
+  );
+  eq(
+    "the popup's value reaches the page",
+    /if \(Number\.isFinite\(r\.panelTimeout\)\) panelLingerMs = r\.panelTimeout \* 1000/.test(src),
+    true
+  );
+  // "Sent to Hydra" is a confirmation, not an offer: leaving it up because
+  // the idle timeout is switched off would strand it over the player.
+  eq(
+    "a send clears its own confirmation whatever the timeout says",
+    /schedulePanelHide\(SENT_LINGER_MS\)/.test(src),
+    true
+  );
+}
+
+// The name every row used to repeat is shown once, above them.
+{
+  const render = src.slice(src.indexOf("function renderRows"));
+  const body = render.slice(0, render.indexOf("\nfunction placePanel"));
+  eq(
+    "the menu heads its list with the filename",
+    /mkRow\(pageTitle\(\), null, null, "head"\)/.test(body),
+    true
+  );
+  eq(
+    "but not when the bar downloads on click and the menu never opens",
+    /if \(!panelSingle\) \{/.test(body),
+    true
+  );
+  eq(
+    "and the full name is one hover away when it is too long to fit",
+    /head\.title = head\.textContent/.test(body),
     true
   );
 }
