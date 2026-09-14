@@ -10,7 +10,7 @@
 //! the same widgets without a second style set.
 
 use crate::model::ThemeMode;
-use iced::widget::{button, checkbox, container, pick_list, progress_bar, text_input};
+use iced::widget::{button, checkbox, container, pick_list, progress_bar, text_editor, text_input};
 use iced::{Background, Border, Color, Theme};
 
 /// The text size the whole layout is written against: every `.size(...)` in
@@ -452,6 +452,40 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
             2.0,
         ),
         icon: dim_text(theme),
+        placeholder: c(TEXT_DIM),
+        value: text_color(theme),
+        selection: c(SELECT_BG),
+    }
+}
+
+/// The frame a text box draws, moved onto a container.
+///
+/// For a box whose content scrolls INSIDE it: the widget's own border is
+/// part of the widget, so it scrolls away with the text and leaves the box
+/// open at the edge it has been scrolled past. Resting colours only — a
+/// container has no focus or hover state to report.
+pub fn input_frame(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(surface(theme))),
+        border: border(
+            if is_dark(theme) {
+                c(0x5A5A5A)
+            } else {
+                c(0x7A7A7A)
+            },
+            1.0,
+            2.0,
+        ),
+        text_color: Some(text_color(theme)),
+        ..Default::default()
+    }
+}
+
+/// A text editor with no frame of its own, for use inside [`input_frame`].
+pub fn editor_bare(theme: &Theme, _status: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
         placeholder: c(TEXT_DIM),
         value: text_color(theme),
         selection: c(SELECT_BG),
