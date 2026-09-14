@@ -8,4 +8,5 @@
 *.hydra
 /bench-out/
 .SRCINFO
+/.flatpak-builder
 

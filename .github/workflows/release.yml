@@ -487,6 +487,57 @@ jobs:
               test -x /tmp/home/.local/share/hydra/hydra-host
             '
 
+  # ---------------------------------------------------------------- Flatpak
+  #
+  # Standalone single-file .flatpak bundles for x86_64 and aarch64 using
+  # flatpak-builder and the Freedesktop 24.08 runtime/SDK with Rust stable extension.
+  # The AppStream metainfo version and release date are baked in dynamically from
+  # the release version.
+  build-flatpak:
+    name: Flatpak ${{ matrix.arch }}
+    needs: [verify-version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Flatpak build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            flatpak flatpak-builder elfutils ostree appstream desktop-file-utils
+
+      - name: Set up Flathub repository and Flatpak SDK
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.freedesktop.Platform//24.08 \
+            org.freedesktop.Sdk//24.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//24.08
+
+      - name: Build Flatpak bundle
+        run: |
+          set -euo pipefail
+          scripts/package-flatpak.sh --bundle --version "$VERSION" --out dist
+          ls -lh dist/
+
+      - name: Upload Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydra-flatpak-${{ matrix.arch }}
+          path: dist/*.flatpak
+          if-no-files-found: error
+
   # ---------------------------------------------------------------- libhydra
   #
   # The embeddable C ABI is a SEPARATE deliverable from the CLI/GUI bundle, and
@@ -785,6 +836,7 @@ jobs:
         build,
         build-appimage,
         verify-appimage,
+        build-flatpak,
         build-ffi,
         build-ffi-android,
         build-ffi-apple,

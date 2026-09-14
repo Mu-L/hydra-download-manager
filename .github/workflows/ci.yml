@@ -46,6 +46,23 @@ jobs:
           # is THC-Hydra in the distro repos.
           ls "$RPM_TOP"/SRPMS/hydra-download-manager-${VERSION}-*.src.rpm
 
+  flatpak-validate:
+    name: Flatpak Metadata Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends appstream desktop-file-utils
+
+      - name: Validate Flatpak desktop and metainfo files
+        run: |
+          set -euo pipefail
+          scripts/package-flatpak.sh --validate-only
+
   fmt:
     name: Code Formatting
     runs-on: ubuntu-latest
