@@ -494,8 +494,11 @@ pub fn is_flatpak() -> bool {
 /// look identical. Windows: the setup installer owns whatever it wrote, and there
 /// is no unprivileged way to rewrite `Program Files`.
 fn package_managed(dir: &Path) -> bool {
+    if is_flatpak() {
+        return true;
+    }
     if cfg!(target_os = "linux") {
-        is_flatpak() || (dir.starts_with("/usr") && !dir.starts_with("/usr/local"))
+        dir.starts_with("/usr") && !dir.starts_with("/usr/local")
     } else if cfg!(target_os = "macos") {
         dir.starts_with("/Applications")
             && Path::new("/var/db/receipts/io.github.ja7ad.hydra.plist").exists()
@@ -1745,5 +1748,9 @@ mod tests {
                 || std::env::var_os("FLATPAK_ID").is_some()
                 || std::path::Path::new("/.flatpak-info").exists()
         );
+        std::env::set_var("FLATPAK_ID", "io.github.ja7ad.hydra");
+        assert!(is_flatpak());
+        assert!(package_managed(std::path::Path::new("/app/bin")));
+        std::env::remove_var("FLATPAK_ID");
     }
 }
