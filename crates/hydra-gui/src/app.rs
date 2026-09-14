@@ -2255,7 +2255,7 @@ impl App {
         // hydra.desktop (scripts/package-linux.sh, install.sh).
         #[cfg(target_os = "linux")]
         let platform_specific = window::settings::PlatformSpecific {
-            application_id: std::env::var("FLATPAK_ID").unwrap_or_else(|_| "hydra".to_string()),
+            application_id: linux_application_id(),
             ..Default::default()
         };
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -9174,4 +9174,19 @@ mod tests {
         assert!(compressed.exts.contains(&"z".to_string()));
         assert!(!compressed.exts.contains(&"zip".to_string()));
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_application_id() {
+        std::env::remove_var("FLATPAK_ID");
+        assert_eq!(super::linux_application_id(), "hydra");
+        std::env::set_var("FLATPAK_ID", "io.github.ja7ad.hydra");
+        assert_eq!(super::linux_application_id(), "io.github.ja7ad.hydra");
+        std::env::remove_var("FLATPAK_ID");
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_application_id() -> String {
+    std::env::var("FLATPAK_ID").unwrap_or_else(|_| "hydra".to_string())
 }

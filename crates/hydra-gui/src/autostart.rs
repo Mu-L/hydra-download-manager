@@ -214,16 +214,7 @@ fn apply_platform(enabled: bool, minimized: bool) {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Ok(id) = std::env::var("FLATPAK_ID") {
-            let space_arg = if minimized { " --minimized" } else { "" };
-            content = format!(
-                "[Desktop Entry]\nType=Application\nName=Hydra Download Manager\nExec=flatpak run {id}{space_arg}\nIcon={id}\nX-GNOME-Autostart-enabled=true\n"
-            );
-        } else {
-            content = format!(
-                "[Desktop Entry]\nType=Application\nName=Hydra Download Manager\nExec=\"{exe}\" {arg}\nIcon=hydra\nX-GNOME-Autostart-enabled=true\n"
-            );
-        }
+        content = unix_desktop_entry_content(&exe, minimized);
     }
     // Already correct: leave it alone (a rewrite would only bump the
     // Background Task Management generation on macOS for no change).
@@ -236,6 +227,20 @@ fn apply_platform(enabled: bool, minimized: bool) {
     match std::fs::write(&path, content) {
         Ok(()) => crate::log::info(&format!("login item written: {} -> {exe}", path.display())),
         Err(e) => crate::log::warn(&format!("login item write failed: {e}")),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn unix_desktop_entry_content(exe: &str, minimized: bool) -> String {
+    let space_arg = if minimized { " --minimized" } else { "" };
+    if let Ok(id) = std::env::var("FLATPAK_ID") {
+        format!(
+            "[Desktop Entry]\nType=Application\nName=Hydra Download Manager\nExec=flatpak run {id}{space_arg}\nIcon={id}\nX-GNOME-Autostart-enabled=true\n"
+        )
+    } else {
+        format!(
+            "[Desktop Entry]\nType=Application\nName=Hydra Download Manager\nExec=\"{exe}\"{space_arg}\nIcon=hydra\nX-GNOME-Autostart-enabled=true\n"
+        )
     }
 }
 
@@ -264,11 +269,13 @@ pub fn is_registered() -> bool {
     std::path::Path::new(&rest[..e]).is_file()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use super::stable_bundle_exe;
     use std::path::PathBuf;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn installed_paths_pass_through() {
         let p = PathBuf::from(
@@ -277,6 +284,7 @@ mod tests {
         assert_eq!(stable_bundle_exe(p.clone()), Some(p));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn transient_paths_without_an_installed_copy_are_rejected() {
         for p in [
@@ -285,5 +293,32 @@ mod tests {
         ] {
             assert_eq!(stable_bundle_exe(PathBuf::from(p)), None, "{p}");
         }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn test_unix_entry_path_and_content() {
+        std::env::remove_var("FLATPAK_ID");
+        let native_entry = super::entry_path();
+        assert!(native_entry.unwrap().ends_with("hydra.desktop"));
+        let native_content = super::unix_desktop_entry_content("/usr/bin/hydra-gui", true);
+        assert!(native_content.contains("Exec=\"/usr/bin/hydra-gui\" --minimized"));
+        assert!(native_content.contains("Icon=hydra"));
+
+        let native_content_no_min = super::unix_desktop_entry_content("/usr/bin/hydra-gui", false);
+        assert!(native_content_no_min.contains("Exec=\"/usr/bin/hydra-gui\"\n"));
+
+        std::env::set_var("FLATPAK_ID", "io.github.ja7ad.hydra");
+        let flatpak_entry = super::entry_path();
+        assert!(flatpak_entry
+            .unwrap()
+            .ends_with("io.github.ja7ad.hydra.desktop"));
+        let flatpak_content = super::unix_desktop_entry_content("", true);
+        assert!(flatpak_content.contains("Exec=flatpak run io.github.ja7ad.hydra --minimized"));
+        assert!(flatpak_content.contains("Icon=io.github.ja7ad.hydra"));
+
+        let flatpak_content_no_min = super::unix_desktop_entry_content("", false);
+        assert!(flatpak_content_no_min.contains("Exec=flatpak run io.github.ja7ad.hydra\n"));
+        std::env::remove_var("FLATPAK_ID");
     }
 }

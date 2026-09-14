@@ -101,18 +101,23 @@ pub fn catch_panics() {
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
             .unwrap_or_else(|| "unknown location".into());
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
-            .unwrap_or("<non-string payload>");
+        let payload = extract_panic_payload(info.payload());
         error(&format!(
             "panic at {where_}: {payload}\n{}",
             std::backtrace::Backtrace::force_capture()
         ));
         previous(info);
     }));
+}
+
+pub(crate) fn extract_panic_payload<'a>(payload: &'a (dyn std::any::Any + Send)) -> &'a str {
+    if let Some(&s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string payload>"
+    }
 }
 
 /// Back-compat alias for the original single-level call sites.
@@ -241,5 +246,21 @@ mod tests {
     fn a_plain_url_is_left_alone() {
         let plain = "https://cdn.example/hls/seg1.ts";
         assert_eq!(redact(plain), plain);
+    }
+
+    #[test]
+    fn test_extract_panic_payload() {
+        use super::extract_panic_payload;
+        let str_payload: Box<dyn std::any::Any + Send> = Box::new("str error");
+        assert_eq!(extract_panic_payload(&*str_payload), "str error");
+
+        let string_payload: Box<dyn std::any::Any + Send> = Box::new("string error".to_string());
+        assert_eq!(extract_panic_payload(&*string_payload), "string error");
+
+        let other_payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(
+            extract_panic_payload(&*other_payload),
+            "<non-string payload>"
+        );
     }
 }
