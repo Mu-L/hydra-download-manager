@@ -109,7 +109,8 @@ pub enum MenuAction {
     ToggleColumn(Column),
     MoveColumn(Column, bool),
     SetTheme(ThemeMode),
-    FontSize(u16),
+    /// View > Scale, in percent (`theme::SCALE_STEPS`).
+    UiScale(u16),
     Language(String),
     HomePage,
     Contribute,
@@ -121,6 +122,12 @@ pub enum MenuAction {
     Properties,
     OpenSel,
     OpenFolderSel,
+    /// Hand the finished file to an application of the user's choosing,
+    /// without changing what its file type opens with by default.
+    OpenWithSel,
+    /// Move the finished file somewhere else, or give it another name, and
+    /// keep the row pointing at it.
+    MoveRenameSel,
     PowerSaveToggle,
     Shortcuts,
     /// Open the session log in the system's default viewer.
@@ -170,7 +177,7 @@ impl MenuAction {
                 format!("col_move:{}:{}", c.id(), if *left { "l" } else { "r" })
             }
             MenuAction::SetTheme(m) => format!("theme:{m:?}"),
-            MenuAction::FontSize(s) => format!("font:{s}"),
+            MenuAction::UiScale(s) => format!("scale:{s}"),
             MenuAction::Language(l) => format!("lang:{l}"),
             MenuAction::HomePage => "homepage".into(),
             MenuAction::Contribute => "contribute".into(),
@@ -182,6 +189,8 @@ impl MenuAction {
             MenuAction::Properties => "props".into(),
             MenuAction::OpenSel => "open_sel".into(),
             MenuAction::OpenFolderSel => "open_folder_sel".into(),
+            MenuAction::OpenWithSel => "open_with_sel".into(),
+            MenuAction::MoveRenameSel => "move_rename_sel".into(),
             MenuAction::PowerSaveToggle => "power_save".into(),
             MenuAction::Shortcuts => "shortcuts".into(),
             MenuAction::Logs => "logs".into(),
@@ -223,8 +232,8 @@ impl MenuAction {
             };
             return Some(MenuAction::SetTheme(mode));
         }
-        if let Some(s) = id.strip_prefix("font:") {
-            return s.parse().ok().map(MenuAction::FontSize);
+        if let Some(s) = id.strip_prefix("scale:") {
+            return s.parse().ok().map(MenuAction::UiScale);
         }
         if let Some(l) = id.strip_prefix("lang:") {
             return Some(MenuAction::Language(l.into()));
@@ -266,6 +275,8 @@ impl MenuAction {
             "props" => MenuAction::Properties,
             "open_sel" => MenuAction::OpenSel,
             "open_folder_sel" => MenuAction::OpenFolderSel,
+            "open_with_sel" => MenuAction::OpenWithSel,
+            "move_rename_sel" => MenuAction::MoveRenameSel,
             "power_save" => MenuAction::PowerSaveToggle,
             "shortcuts" => MenuAction::Shortcuts,
             "logs" => MenuAction::Logs,
@@ -1038,6 +1049,9 @@ pub enum ConfirmKind {
     FontNeedsRestart,
     /// Help > Check for updates could not reach the release server.
     UpdateCheckFailed(String),
+    /// Move/Rename could not move the finished file (info box, OK); carries
+    /// what the filesystem said.
+    MoveFailed(String),
     /// "Warn me before stopping downloads" (Connection tab): the stop only
     /// happens once the user confirms. `stop_queues` carries the Pause All /
     /// Stop All variant, which also halts queue processing.
@@ -1290,6 +1304,8 @@ pub enum OptField {
     GpuRender(bool),
     Clipboard(bool),
     Browser(usize, bool),
+    /// Only offered by a `--config DIR` instance (Options > Extensions).
+    PortableCapture(bool),
     AutoTypesEdit(iced::widget::text_editor::Action),
     SitesEdit(iced::widget::text_editor::Action),
     ExcDialog(bool),
@@ -1731,6 +1747,56 @@ impl App {
         }
     }
 
+    /// Move the selected download's finished file, or give it another name,
+    /// and keep the row pointing at where it went.
+    ///
+    /// Only a finished file moves. A transfer still running owns its `.part`
+    /// and hands the engine a destination at completion time, so moving the
+    /// file out from under it would strand both halves — and there is
+    /// nothing at the destination yet to move. The new name is pinned
+    /// (`name_locked`), or a later probe would hand the server's name back
+    /// and undo the rename.
+    fn move_rename_selected(&mut self) -> Task<Message> {
+        let Some(d) = self.selected_item() else {
+            return Task::none();
+        };
+        let (id, from) = (d.id, d.full_path());
+        if d.state != DlState::Complete || !from.is_file() {
+            return Task::none();
+        }
+        let mut dlg = rfd::FileDialog::new().set_file_name(&d.file_name);
+        if !d.save_dir.is_empty() {
+            dlg = dlg.set_directory(&d.save_dir);
+        }
+        // The native dialog asks about overwriting on its own, which is why
+        // the save picker is the right one here rather than a folder picker
+        // plus a name box: moving and renaming are one gesture in it.
+        let Some(to) = dlg.save_file() else {
+            return Task::none();
+        };
+        if to == from {
+            return Task::none();
+        }
+        if let Err(e) = crate::files::move_file(&from, &to) {
+            crate::log::warn(&format!("move {} -> {}: {e}", from.display(), to.display()));
+            self.confirm = Some(ConfirmKind::MoveFailed(e.to_string()));
+            return self.open_window(WinKind::Confirm);
+        }
+        let dir = to.parent().map(|p| p.to_string_lossy().into_owned());
+        let name = to.file_name().map(|n| n.to_string_lossy().into_owned());
+        if let Some(d) = self.item_mut(id) {
+            if let Some(dir) = dir {
+                d.save_dir = dir;
+            }
+            if let Some(name) = name {
+                d.file_name = name;
+                d.name_locked = true;
+            }
+        }
+        self.save_state();
+        Task::none()
+    }
+
     /// Rebuild the native macOS menu bar so its check marks match state.
     #[cfg(target_os = "macos")]
     pub fn refresh_native_menu(&self) {
@@ -1750,7 +1816,7 @@ impl App {
     /// activation, so the menu has to be set back to what the settings say —
     /// see `macos_menu::sync`. Only the language and the queue submenus need
     /// a rebuild; a toggle does not, and rebuilding for one used to leave
-    /// View > Font showing two sizes ticked at once.
+    /// View > Scale showing two percentages ticked at once.
     #[cfg(target_os = "macos")]
     pub fn sync_native_menu(&self) {
         if !crate::macos_menu::sync(&self.native_menu_state()) {
@@ -1766,7 +1832,7 @@ impl App {
         crate::macos_menu::MenuState {
             theme_mode: self.cfg.settings.theme(),
             show_categories: self.cfg.settings.show_categories,
-            font_size: self.cfg.settings.font_size,
+            ui_scale_pct: self.cfg.settings.ui_scale_pct,
             language: {
                 let l = self.cfg.language.clone().unwrap_or_else(|| "en".into());
                 if l == "English" {
@@ -2062,15 +2128,15 @@ impl App {
         }
     }
 
-    /// The View > Font ratio the windows are laid out at.
+    /// The View > Scale ratio the windows are laid out at.
     fn ui_scale(&self) -> f32 {
-        crate::theme::ui_scale(self.cfg.settings.font_size)
+        crate::theme::ui_scale(self.cfg.settings.ui_scale_pct)
     }
 
     /// The size a window opens at, in interface units — the units
     /// `window::open` and `window::resize` speak.
     ///
-    /// Dialogs are laid out against `theme::FONT_SIZE`, and View > Font
+    /// Dialogs are laid out against `theme::FONT_SIZE`, and View > Scale
     /// scales the interface by the ratio to it (`scale_of` in main.rs). iced
     /// applies that ratio to the size handed to `window::open` itself, so
     /// the constants below are written once, at the ratio the layout was
@@ -2155,7 +2221,7 @@ impl App {
                 }
             }
             // Matches ProgToggleDetails: a box whose details are hidden
-            // must not spring back open when the font ratio resizes it.
+            // must not spring back open when the scale resizes it.
             WinKind::Progress(id) => {
                 let details = self
                     .prog
@@ -2265,7 +2331,7 @@ impl App {
             // Floor: just enough for the full toolbar row; the default
             // stays proportional to the display. Unlike `size`, iced passes
             // a minimum straight to winit, so this one is in OS points and
-            // does carry the font ratio.
+            // does carry the scale.
             min_size: (kind == WinKind::Main)
                 .then(|| iced::Size::new(MAIN_MIN_W * scale, MAIN_MIN_H * scale)),
             resizable,
@@ -3658,7 +3724,7 @@ impl App {
                     let state = crate::macos_menu::MenuState {
                         theme_mode: self.cfg.settings.theme(),
                         show_categories: self.cfg.settings.show_categories,
-                        font_size: self.cfg.settings.font_size,
+                        ui_scale_pct: self.cfg.settings.ui_scale_pct,
                         language: self.cfg.language.clone().unwrap_or_else(|| "en".into()),
                         speed_limiter: self.cfg.settings.speed_limiter_on,
                         speed_profile: self.cfg.settings.active_profile(),
@@ -3708,7 +3774,20 @@ impl App {
                 } else {
                     window::gain_focus(id)
                 };
-                Task::batch([pin_surface, skip_taskbar, parent, reveal])
+                // A dialog whose first act is typing puts the caret in the
+                // box itself. Focusing the window alone leaves every text
+                // input unfocused, so Ctrl-V and the context menu's Paste
+                // had nowhere to land until the box had been clicked — which
+                // is not what any other Add-URL dialog asks of you. Queued
+                // here rather than beside `window::open`: the widget the
+                // operation looks for does not exist until the window does.
+                let caret = match self.windows.get(&id) {
+                    Some(WinKind::AddUrl) => {
+                        iced::widget::operation::focus(crate::windows::add_url::ADDRESS_ID)
+                    }
+                    _ => Task::none(),
+                };
+                Task::batch([pin_surface, skip_taskbar, parent, reveal, caret])
             }
             Message::WindowClosed(id) => {
                 let kind = self.windows.remove(&id);
@@ -3790,7 +3869,7 @@ impl App {
                 // Bookkeeping happens in WindowClosed once it's gone.
                 window::close(id)
             }
-            // Window geometry reaches us divided by the View > Font scale
+            // Window geometry reaches us divided by the View > Scale
             // factor, because that is the space the interface is laid out
             // in. Undo the ratio here so what is stored is in OS points:
             // that is the unit winit measures a window position in, and it
@@ -5362,7 +5441,7 @@ impl App {
             }
             Message::OpenFolder(id) => {
                 if let Some(d) = self.item(id) {
-                    let _ = open::that_detached(&d.save_dir);
+                    crate::files::reveal(&d.full_path());
                 }
                 // Same as Open: the dialog has done its job once the user
                 // has acted on the finished file, so it dismisses itself
@@ -5386,6 +5465,8 @@ impl App {
                 self.options.commit_cat_exts();
                 let details = self.options.draft.show_conn_details;
                 let details_changed = details != self.cfg.settings.show_conn_details;
+                let capture_changed =
+                    self.options.draft.portable_capture != self.cfg.settings.portable_capture;
                 self.cfg.settings = self.options.draft.clone();
                 self.cfg.categories = self.options.draft_cats.clone();
                 self.apply_category_edits();
@@ -5397,6 +5478,13 @@ impl App {
                 // The profile list feeds the native menu's Speed limit
                 // submenu, so a renamed or deleted profile has to rebuild it.
                 self.refresh_native_menu();
+                // A portable copy taking browser capture over (or handing it
+                // back) does so now rather than at the next start: the
+                // manifests and the pointer file are all it takes, and this
+                // instance is already publishing the socket they lead to.
+                if capture_changed {
+                    crate::nmhost::ensure_registered(self.cfg.settings.portable_capture);
+                }
                 // Re-resolve the proxy here rather than at the next transfer:
                 // a route the app cannot take must be reported while the user
                 // is still looking at the tab they set it on.
@@ -6524,7 +6612,7 @@ impl App {
             MenuAction::SetTheme(mode) => {
                 let changed = self.cfg.settings.theme() != mode;
                 self.cfg.settings.theme_mode = Some(mode);
-                // Like View > Font: even a click on the mode already in use
+                // Like View > Scale: even a click on the mode already in use
                 // has to be written back to the menu, because muda unticked
                 // it on the way in.
                 self.sync_native_menu();
@@ -6533,10 +6621,10 @@ impl App {
                 }
                 Task::none()
             }
-            MenuAction::FontSize(size) => {
-                let changed = self.cfg.settings.font_size != size;
-                self.cfg.settings.font_size = size;
-                // Even a click on the size already in use has to be written
+            MenuAction::UiScale(pct) => {
+                let changed = self.cfg.settings.ui_scale_pct != pct;
+                self.cfg.settings.ui_scale_pct = pct;
+                // Even a click on the scale already in use has to be written
                 // back to the menu: muda unticked it on the way in.
                 self.sync_native_menu();
                 if !changed {
@@ -6545,9 +6633,9 @@ impl App {
                 self.save_config();
                 // The new ratio reaches the interface on the next redraw,
                 // but a dialog is sized for the ratio it opened at: resize
-                // the fixed ones now, or the extra rows a larger font needs
+                // the fixed ones now, or the extra rows a larger scale needs
                 // have nowhere to go until the dialog is reopened.
-                let resizes: Vec<Task<Message>> = self
+                let mut tasks: Vec<Task<Message>> = self
                     .windows
                     .iter()
                     .filter(|(_, k)| **k != WinKind::Main)
@@ -6556,7 +6644,20 @@ impl App {
                         window::resize(*id, iced::Size::new(w, h))
                     })
                     .collect();
-                Task::batch(resizes)
+                // The main window keeps its size but not its floor: that is
+                // fixed at creation, in OS points, and carries the ratio
+                // (see `open_window`). Leaving it behind is what would make
+                // scaling down fail to do the one thing it is for — a
+                // window that still cannot be dragged narrower than the
+                // toolbar needed at the old scale.
+                if let Some(id) = self.main_id {
+                    let scale = self.ui_scale();
+                    tasks.push(window::set_min_size(
+                        id,
+                        Some(iced::Size::new(MAIN_MIN_W * scale, MAIN_MIN_H * scale)),
+                    ));
+                }
+                Task::batch(tasks)
             }
             MenuAction::Language(l) => {
                 // The face is chosen from the locale, but the renderer took
@@ -6666,10 +6767,17 @@ impl App {
             }
             MenuAction::OpenFolderSel => {
                 if let Some(d) = self.selected_item() {
-                    let _ = open::that_detached(&d.save_dir);
+                    crate::files::reveal(&d.full_path());
                 }
                 Task::none()
             }
+            MenuAction::OpenWithSel => {
+                if let Some(d) = self.selected_item() {
+                    crate::files::open_with(&d.full_path());
+                }
+                Task::none()
+            }
+            MenuAction::MoveRenameSel => self.move_rename_selected(),
             MenuAction::Properties => {
                 let fi = self.selected_item().map(|d| FileInfoState {
                     dl: d.id,
@@ -6767,6 +6875,7 @@ impl App {
             }
             OptField::GpuRender(b) => s.gpu_render = b,
             OptField::Clipboard(b) => s.monitor_clipboard = b,
+            OptField::PortableCapture(b) => s.portable_capture = b,
             OptField::Browser(i, b) => {
                 if let Some(x) = s.capture_browsers.get_mut(i) {
                     x.1 = b;
@@ -7099,10 +7208,10 @@ pub fn main_window_size() -> iced::Size {
 /// A saved size that no longer describes a screen — a monitor that is gone,
 /// a hand-edited config — derives from the display instead. The range only
 /// rejects nonsense: `min_size` holds the window to a full toolbar row
-/// whatever the saved size says, and that floor moves with the font ratio
+/// whatever the saved size says, and that floor moves with the scale
 /// while this range does not.
 /// The main window in interface units, from what a resize last reported.
-/// `main_size` is in OS points, so it converts back through the View > Font
+/// `main_size` is in OS points, so it converts back through the View > Scale
 /// ratio; before the first resize event it is zero and `opened_at` — the
 /// size the window was asked to open at, already in interface units — stands
 /// in, so a menu is placed against the right window from the first click.
@@ -7123,7 +7232,7 @@ fn main_open_size(saved: Option<(f32, f32)>, scale: f32) -> (f32, f32) {
 
 /// Hold a dialog inside the screen. `size` and the answer are in interface
 /// units, `display` is the whole screen in OS points, and `scale` is the
-/// View > Font ratio between the two.
+/// View > Scale ratio between the two.
 ///
 /// A dialog is fixed-size and cannot be maximized, so anything that opens
 /// past the bottom edge of the display — the OK/Cancel row lives there —
@@ -8117,21 +8226,21 @@ mod tests {
     }
 
     #[test]
-    fn the_main_window_comes_back_the_size_it_was_left_at_whatever_the_font() {
+    fn the_main_window_comes_back_the_size_it_was_left_at_whatever_the_scale() {
         use super::main_open_size;
 
         // What a resize stores (`WinResized`) is the window in OS points.
-        // Reopening divides by the font ratio because iced multiplies the
-        // size handed to `window::open` by it again — get that wrong and
-        // the window grows by the ratio on every launch, until it is bigger
+        // Reopening divides by the scale because iced multiplies the size
+        // handed to `window::open` by it again — get that wrong and the
+        // window grows by the ratio on every launch, until it is bigger
         // than the sanity range above and snaps back to the default size.
         let left_at = (1400.0, 900.0);
-        for size in crate::theme::FONT_SIZES {
-            let scale = crate::theme::ui_scale(size);
+        for pct in crate::theme::SCALE_STEPS {
+            let scale = crate::theme::ui_scale(pct);
             let (w, h) = main_open_size(Some(left_at), scale);
             assert!(
                 (w * scale - left_at.0).abs() < 0.5 && (h * scale - left_at.1).abs() < 0.5,
-                "font {size} reopens a {left_at:?} window at {}x{} points",
+                "{pct}% reopens a {left_at:?} window at {}x{} points",
                 w * scale,
                 h * scale
             );
@@ -8152,10 +8261,10 @@ mod tests {
 
         // A resize reports OS points; the overlays, and the cursor position
         // a menu is placed at, are in interface units. Skip the conversion
-        // and a Large-font window reads as half again as tall as it is, so
-        // a menu near the bottom is left running off it.
+        // and a 150% window reads as half again as tall as it is, so a menu
+        // near the bottom is left running off it.
         let opened_at = (900.0, 600.0);
-        let scale = crate::theme::ui_scale(20);
+        let scale = crate::theme::ui_scale(150);
         let v = main_viewport(iced::Size::new(1400.0, 900.0), opened_at, scale);
         assert!((v.width - 1400.0 / scale).abs() < 0.5 && (v.height - 900.0 / scale).abs() < 0.5);
 
@@ -8193,16 +8302,16 @@ mod tests {
         // The screen the cut-off OK button was reported on: 1920x1080 at
         // 125% display scaling is 1536x864 OS points.
         let laptop = iced::Size::new(1536.0, 864.0);
-        // What the Configuration window asks for, at every font ratio the
-        // View menu offers. The window reaches the screen multiplied by the
+        // What the Configuration window asks for, at every scale the View
+        // menu offers. The window reaches the screen multiplied by the
         // ratio, so that is what has to fit — with room to spare for the
         // taskbar and the title bar.
-        for size in crate::theme::FONT_SIZES {
-            let scale = crate::theme::ui_scale(size);
+        for pct in crate::theme::SCALE_STEPS {
+            let scale = crate::theme::ui_scale(pct);
             let (w, h) = fit_to_display((760.0, 700.0), laptop, scale);
             assert!(
                 h * scale < laptop.height && w * scale < laptop.width,
-                "font {size} opens a {w}x{h} dialog as {}x{} points on a \
+                "{pct}% opens a {w}x{h} dialog as {}x{} points on a \
                  {}x{} screen",
                 w * scale,
                 h * scale,

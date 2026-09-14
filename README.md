@@ -561,10 +561,18 @@ hydra-gui --config ./here
 
 The path may be relative (it is resolved against the working directory at launch) and is created
 if missing. Such an instance is fully independent: it has its own download list and its own
-single-instance lock, so it runs alongside an ordinary Hydra. Two per-user registrations stay
-with the ordinary install and are left untouched — the login item ("launch on startup") and the
-browser native-messaging host, neither of which can carry the flag. The browser extension still
-reaches a running portable instance over its WebSocket port.
+single-instance lock, so it runs alongside an ordinary Hydra. The login item ("launch on
+startup") is per user and cannot carry the flag, so it stays with the ordinary install. The
+browser extension reaches a running portable instance over its WebSocket port either way.
+
+Browser capture while the portable copy is **closed** needs the native-messaging host, which a
+browser addresses by a per-user registration that carries no arguments. Options > Extensions >
+**Let this copy handle browser capture** registers the `hydra-host` sitting next to the portable
+`hydra-gui` and drops a `hydra-profile` file beside it naming the profile directory; the host
+reads that file and launches `hydra-gui --minimized --config <dir>`. It is off by default
+because the registration is per user: switching it on takes browser capture away from any
+ordinary Hydra install on the same account, and switching it off hands it back. `HYDRA_CONFIG`
+overrides the pointer file for scripted setups.
 
 ---
 

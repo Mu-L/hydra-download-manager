@@ -76,6 +76,10 @@ pub fn view(app: &App) -> El<'_> {
             tr("The interface font for this language applies the next time Hydra starts."),
             false,
         ),
+        Some(ConfirmKind::MoveFailed(e)) => (
+            format!("{}\n\n{e}", tr("The file could not be moved.")),
+            false,
+        ),
         Some(ConfirmKind::UpdateCheckFailed(e)) => (
             format!(
                 "{}\n\n{e}",

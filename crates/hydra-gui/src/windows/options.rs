@@ -1105,8 +1105,30 @@ fn ffmpeg_row<'a>(found: Option<std::path::PathBuf>) -> El<'a> {
     .into()
 }
 
-fn extensions(_app: &App) -> El<'_> {
-    column![
+fn extensions(app: &App) -> El<'_> {
+    // Only a `--config DIR` copy has the choice to make: without the flag
+    // this instance IS the one the browsers are registered against, and a
+    // switch that can only be on is not a switch.
+    let portable: Option<El<'_>> = crate::model::app_dir_override().map(|dir| {
+        column![
+            section(tr("Portable copy")),
+            hinted(
+                checkbox(app.options.draft.portable_capture)
+                    .label(tr("Let this copy handle browser capture"))
+                    .on_toggle(|b| o(OptField::PortableCapture(b)))
+                    .size(15.0)
+                    .text_size(theme::FONT_SIZE)
+                    .style(theme::check),
+                tr("Registers this copy's helper with your browsers so capture reaches this profile, and lets a browser start Hydra on it when nothing is running. Browser registration is per user, so this takes capture away from any ordinary Hydra install on this account."),
+            ),
+            text(format!("{} {}", tr("Profile:"), dir.display()))
+                .size(theme::FONT_SIZE - 1.0)
+                .color(theme::dim_text(&iced::Theme::Light)),
+        ]
+        .spacing(6)
+        .into()
+    });
+    let mut col = column![
         section(tr("Browser extensions")),
         text(tr(
             "Install the Hydra extension to capture downloads straight from your browser."
@@ -1150,8 +1172,11 @@ fn extensions(_app: &App) -> El<'_> {
         section(tr("Media tools")),
         ffmpeg_row(hya_stream::ffmpeg()),
     ]
-    .spacing(10)
-    .into()
+    .spacing(10);
+    if let Some(el) = portable {
+        col = col.push(el);
+    }
+    col.into()
 }
 
 fn sounds(app: &App) -> El<'_> {
