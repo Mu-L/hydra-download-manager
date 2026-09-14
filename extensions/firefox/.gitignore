@@ -1,7 +1,8 @@
 # Copies of the shared extension sources, written by
 # scripts/sync-extension-resources.sh firefox. The originals live in
-# extensions/chrome — only manifest.json and README.md are Firefox's own.
-background.js
+# extensions/chrome — manifest.json, background.js and README.md are
+# Firefox's own.
+core.js
 content.js
 popup.html
 popup.css

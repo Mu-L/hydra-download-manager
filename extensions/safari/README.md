@@ -9,9 +9,12 @@ cannot be worked around (see below).
 The extension code in `extensions/chrome` is browser-neutral: it binds
 whichever namespace exists (`browser` on Safari, `chrome` on Chromium),
 handles both native-messaging dialects (Safari returns a promise, Chrome
-takes a callback), and feature-detects every API it uses. Only the manifest
-differs, so `scripts/sync-extension-resources.sh safari` copies the shared files next
-to Safari's own manifest into `Resources/`.
+takes a callback), and feature-detects every API it uses. What differs per
+browser is the manifest and the download-capture path, and Safari has no
+downloads API to capture with — so `scripts/sync-extension-resources.sh safari`
+copies the shared files next to Safari's own manifest into `Resources/`,
+with `core.js` (the browser-neutral part of the extension) taking the
+`background.js` name the manifest points at.
 
 **Edit `extensions/chrome/*`, never `extensions/safari/Resources/*`** — the
 latter is regenerated on every sync.
