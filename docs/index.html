@@ -100,7 +100,8 @@
       "sameAs": [
         "https://github.com/ja7ad/hydra",
         "https://sourceforge.net/projects/hydra-download-manager/",
-        "https://addons.mozilla.org/en-US/firefox/addon/hdm-integration/"
+        "https://addons.mozilla.org/en-US/firefox/addon/hdm-integration/",
+        "https://saascity.io/live/hydra-download-manager"
       ]
     },
     {
@@ -1632,6 +1633,55 @@
         gap: 14px;
       }
     }
+  
+    .badge-row {
+      margin-top: 36px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 14px 18px;
+    }
+
+    .badge-link {
+      display: inline-flex;
+      border-radius: 10px;
+    }
+
+    .badge-link:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 4px;
+    }
+
+    .badge-row img {
+      display: block;
+      height: 52px;
+      width: auto;
+      opacity: 0.82;
+      transition: opacity 0.18s ease, transform 0.18s ease;
+    }
+
+    .badge-link:hover img,
+    .badge-link:focus-visible img {
+      opacity: 1;
+      transform: translateY(-2px);
+    }
+
+    @media (max-width: 480px) {
+      .badge-row img {
+        height: 44px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+
+      .badge-row img,
+      .badge-link:hover img,
+      .badge-link:focus-visible img {
+        transition: none;
+        transform: none;
+      }
+    }
   </style>
 </head>
 
@@ -2370,6 +2420,23 @@
 
         <p class="dl-note">Looking for source code or earlier releases? View all assets on the <a
             href="https://github.com/ja7ad/hydra/releases">GitHub Releases page</a>.</p>
+      </div>
+
+      <div class="badge-row">
+        <a class="badge-link" href="https://smollaunch.com" target="_blank" rel="noopener">
+          <img src="img/badges/smol-launch.svg" alt="Hydra Download Manager — Featured on Smol Launch" width="250"
+            height="60" loading="lazy" decoding="async">
+        </a>
+        <a class="badge-link" href="https://saascity.io/live/hydra-download-manager" target="_blank" rel="noopener">
+          <img src="img/badges/saascity.svg" alt="Hydra Download Manager — Launched on SaaSCity.io" width="210"
+            height="80" loading="lazy" decoding="async">
+        </a>
+        <a class="badge-link"
+          href="https://launchigniter.com/product/hydra-download-manager?ref=badge-hydra-download-manager"
+          target="_blank" rel="noopener">
+          <img src="img/badges/launchigniter.svg" alt="Hydra Download Manager — Featured on LaunchIgniter" width="212"
+            height="55" loading="lazy" decoding="async">
+        </a>
       </div>
     </div>
   </section>
