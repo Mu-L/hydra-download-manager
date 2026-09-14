@@ -75,6 +75,35 @@ jobs:
             echo "prerelease=$PRERELEASE"
           } >> "$GITHUB_OUTPUT"
 
+  verify-packaging:
+    name: Validate packaging metadata
+    needs: [verify-version]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.verify-version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install packaging validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends appstream desktop-file-utils rpm
+
+      - name: Validate Flatpak metadata
+        run: |
+          set -euo pipefail
+          scripts/package-flatpak.sh --validate-only --version "$VERSION"
+
+      - name: Validate RPM spec template
+        run: |
+          set -euo pipefail
+          RPM_TOP="$RUNNER_TEMP/rpmbuild"
+          mkdir -p "$RPM_TOP"/{SOURCES,SRPMS,SPECS,BUILD}
+          scripts/render-rpm-spec.sh "$VERSION" "$RPM_TOP/SPECS/hydra.spec"
+          grep -q "^%global _version ${VERSION}$" "$RPM_TOP/SPECS/hydra.spec"
+          rpmbuild -bs --nodeps --define "_topdir $RPM_TOP" "$RPM_TOP/SPECS/hydra.spec"
+
   build:
     name: Build ${{ matrix.os }}-${{ matrix.arch }}
     needs: [verify-version]
@@ -495,7 +524,7 @@ jobs:
   # the release version.
   build-flatpak:
     name: Flatpak ${{ matrix.arch }}
-    needs: [verify-version]
+    needs: [verify-version, verify-packaging]
     strategy:
       fail-fast: false
       matrix:
@@ -531,12 +560,50 @@ jobs:
           scripts/package-flatpak.sh --bundle --version "$VERSION" --out dist
           ls -lh dist/
 
+      - name: Smoke-test Flatpak bundle
+        run: |
+          set -euo pipefail
+          BUNDLE=$(readlink -f "$(ls -1 dist/*.flatpak | head -1)")
+          flatpak install --user -y "$BUNDLE"
+          flatpak run io.github.ja7ad.hydra --version
+          flatpak run --command=hydra-host io.github.ja7ad.hydra --help
+          flatpak run --command=hydra-updater io.github.ja7ad.hydra --help
+          flatpak uninstall --user -y io.github.ja7ad.hydra
+
       - name: Upload Flatpak artifact
         uses: actions/upload-artifact@v4
         with:
           name: hydra-flatpak-${{ matrix.arch }}
           path: dist/*.flatpak
           if-no-files-found: error
+
+  verify-flatpak:
+    name: Flatpak bundle runs on Ubuntu
+    needs: [build-flatpak]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Flatpak artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: hydra-flatpak-x86_64
+          path: dist
+
+      - name: Install Flatpak runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.freedesktop.Platform//24.08
+
+      - name: Run it in Flatpak sandbox
+        run: |
+          set -euo pipefail
+          BUNDLE=$(readlink -f "$(ls -1 dist/*.flatpak | head -1)")
+          flatpak install --user -y "$BUNDLE"
+          flatpak run io.github.ja7ad.hydra --version
+          flatpak run --command=hydra-host io.github.ja7ad.hydra --help
+          flatpak run --command=hydra-updater io.github.ja7ad.hydra --help
+          flatpak uninstall --user -y io.github.ja7ad.hydra
 
   # ---------------------------------------------------------------- libhydra
   #
@@ -833,10 +900,12 @@ jobs:
     needs:
       [
         verify-version,
+        verify-packaging,
         build,
         build-appimage,
         verify-appimage,
         build-flatpak,
+        verify-flatpak,
         build-ffi,
         build-ffi-android,
         build-ffi-apple,
