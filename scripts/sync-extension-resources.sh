@@ -6,11 +6,14 @@
 #
 #   scripts/sync-extension-resources.sh firefox|safari
 #
-# extensions/chrome is the single source of truth for the extension code —
-# background.js, content.js and the popup are browser-neutral (they bind
-# `browser` or `chrome` and feature-detect every API). Only the manifest
-# differs per browser, so this copies the shared files next to the target's
-# own manifest.json into extensions/<target>/Resources.
+# extensions/chrome is the single source of truth for the shared extension
+# code — core.js, content.js and the popup are browser-neutral (they bind
+# `browser` or `chrome` and feature-detect every API). What differs per
+# browser is the manifest and the capture path, which is each browser's own
+# background.js: Chromium's imports core.js, Firefox's is loaded after it by
+# the manifest, and Safari — no downloads API, nothing to capture — runs
+# core.js alone, so it is copied there under the background.js name the
+# Safari manifest already points at.
 #
 # Firefox can then be loaded from that directory (about:debugging, or packed
 # with `web-ext`); Safari needs the extra wrapper-app step in
@@ -49,9 +52,14 @@ else
   cp "$REPO/extensions/$TARGET/manifest.json" "$DST/manifest.json"
 fi
 
-for f in background.js content.js popup.html popup.css popup.js welcome.html welcome.js; do
+for f in content.js popup.html popup.css popup.js welcome.html welcome.js; do
   cp "$SRC/$f" "$DST/$f"
 done
+if [ "$TARGET" = firefox ]; then
+  cp "$SRC/core.js" "$DST/core.js"
+else
+  cp "$SRC/core.js" "$DST/background.js"
+fi
 rm -rf "$DST/icons"
 cp -R "$SRC/icons" "$DST/icons"
 
