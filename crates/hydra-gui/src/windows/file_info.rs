@@ -17,7 +17,7 @@
 
 use crate::app::{App, El, FileInfoState, Message};
 use crate::model::{DlState, ProxyPick};
-use crate::windows::{dlg_btn, dlg_btn_primary};
+use crate::windows::{dlg_btn, dlg_btn_auto, dlg_btn_primary};
 use crate::{fmt, i18n::tr, theme};
 use iced::widget::{button, checkbox, column, container, pick_list, row, svg, text, text_input};
 use iced::Length;
@@ -114,6 +114,21 @@ pub(crate) fn proxy_problem(st: &FileInfoState) -> Option<String> {
             .then(|| tr("Enter the proxy address, for example socks5://127.0.0.1:10808"));
     }
     crate::proxy::typed_spec_error(st.proxy_pick, &st.proxy_spec)
+}
+
+/// What the start button does is the state's, so its caption is too:
+/// "Start Download" over a finished file reads as "open it", and over a
+/// half-transferred one it hides that the bytes already on disk are kept.
+fn start_label(state: Option<DlState>, downloaded: u64) -> String {
+    match state {
+        // Already running behind the dialog: pressing it reveals the box.
+        Some(s) if s.is_active() => tr("Show Progress"),
+        Some(DlState::Complete) => tr("Start Download As New"),
+        // Held bytes are what makes the next start a resume; a queued item,
+        // and a failure that never wrote any, have nothing to continue from.
+        Some(DlState::Paused | DlState::Error) if downloaded > 0 => tr("Resume Download"),
+        _ => tr("Start Download"),
+    }
 }
 
 pub fn view(app: &App) -> El<'_> {
@@ -331,7 +346,12 @@ pub fn view(app: &App) -> El<'_> {
     } else {
         row![
             dlg_btn(tr("Open"), complete.then_some(Message::OpenFile(st.dl))),
-            dlg_btn(tr("Start Download"), Some(Message::FiStartDownload)),
+            // Sized to its caption: the state labels are far too long for the
+            // uniform width the fixed buttons share.
+            dlg_btn_auto(
+                start_label(item.map(|d| d.state), item.map_or(0, |d| d.downloaded)),
+                Some(Message::FiStartDownload),
+            ),
             dlg_btn_primary(tr("OK"), Some(Message::FiDownloadLater)),
         ]
         .spacing(GAP)
@@ -375,6 +395,33 @@ mod tests {
         assert_eq!(punctuated("Category"), "Category:");
         assert_eq!(punctuated("Address:"), "Address:");
         assert_eq!(punctuated("Last try date :"), "Last try date:");
+    }
+
+    /// The caption has to name what the press does, because the three cases
+    /// do different things to the bytes on disk: a queued item starts, a
+    /// part-transferred one continues, and a finished one is fetched again
+    /// over the file that is already there.
+    #[test]
+    fn the_start_button_is_captioned_by_the_state_it_is_pressed_in() {
+        assert_eq!(start_label(Some(DlState::Queued), 0), "Start Download");
+        assert_eq!(start_label(Some(DlState::Paused), 4096), "Resume Download");
+        assert_eq!(
+            start_label(Some(DlState::Complete), 4096),
+            "Start Download As New"
+        );
+        // A failure that stopped mid-file still has bytes to continue from;
+        // one that never got any is a plain start, not a "resume" that would
+        // silently begin at zero.
+        assert_eq!(start_label(Some(DlState::Error), 4096), "Resume Download");
+        assert_eq!(start_label(Some(DlState::Error), 0), "Start Download");
+        // A paused item can hold no bytes either — the engine was stopped
+        // before the first range landed.
+        assert_eq!(start_label(Some(DlState::Paused), 0), "Start Download");
+        // Running: the press reveals the box rather than starting anything.
+        assert_eq!(start_label(Some(DlState::Receiving), 4096), "Show Progress");
+        assert_eq!(start_label(Some(DlState::Connecting), 0), "Show Progress");
+        // The row was deleted from under the dialog.
+        assert_eq!(start_label(None, 0), "Start Download");
     }
 
     /// Both shapes of the proxy row build — the picker alone, and the picker

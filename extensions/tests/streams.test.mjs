@@ -7,7 +7,7 @@
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
-const SRC = readFileSync("extensions/chrome/background.js", "utf8");
+import { loadBackground } from "./load.mjs";
 let fails = 0;
 const check = (l, c, x = "") => { if (c) console.log(`ok   ${l}`); else { fails++; console.log(`FAIL ${l} ${x}`); } };
 const tick = (n = 6) => new Promise((r) => { let i = 0; const f = () => (++i >= n ? r() : setImmediate(f)); setImmediate(f); });
@@ -76,7 +76,7 @@ function build({ hydraReply = { ok: true } } = {}) {
   };
   const ctx = vm.createContext({ chrome, navigator: { userAgent: "Chrome/120" }, WebSocket: WS, console,
     setTimeout, clearTimeout, setInterval, clearInterval, setImmediate, fetch, AbortController, URL, URLSearchParams });
-  vm.runInContext(SRC, ctx);
+  loadBackground(ctx);
   const hdr = (ct, len) => [{ name: "Content-Type", value: ct }].concat(len ? [{ name: "Content-Length", value: String(len) }] : []);
   return {
     sent, tabsUpdated,

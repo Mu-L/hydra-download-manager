@@ -5051,6 +5051,15 @@ impl App {
                     (true, Some(st)) if st.is_active() => {
                         Task::batch([close, self.open_progress_window(fi.dl)])
                     }
+                    // "Start Download As New": the finished file is being
+                    // fetched again, so nothing left over from the first
+                    // transfer may be taken for a resume.
+                    (true, Some(DlState::Complete)) => {
+                        if let Some(d) = self.item_mut(fi.dl) {
+                            reset_for_redownload(d);
+                        }
+                        Task::batch([close, self.start_download(fi.dl, true)])
+                    }
                     (true, _) => Task::batch([close, self.start_download(fi.dl, true)]),
                     // Download Later: park the background transfer, keep the
                     // bytes for resume, and leave it Queued for Start Queue.
@@ -6403,21 +6412,8 @@ impl App {
                         if self.item(id).map(|d| d.state.is_active()).unwrap_or(false) {
                             continue;
                         }
-                        // Progress reset alone is not enough: the pinned
-                        // `.part` would satisfy the resume check and the new
-                        // object would be written into a file that still has
-                        // the old one's bytes (and, via an edited URL, no
-                        // record of which object it holds). Drop both.
-                        if let Some(d) = self.item(id) {
-                            let _ = std::fs::remove_file(d.part_file());
-                        }
                         if let Some(d) = self.item_mut(id) {
-                            d.held.clear();
-                            d.downloaded = 0;
-                            d.disp_progress = 0.0;
-                            d.state = DlState::Paused;
-                            d.part_path = None;
-                            d.error = None;
+                            reset_for_redownload(d);
                         }
                     }
                     tasks.push(self.start_download(id, show_progress));
@@ -7403,6 +7399,25 @@ fn reroute(d: &DownloadItem, fi: &FileInfoState) -> (ProxyChoice, bool) {
     (want, changed)
 }
 
+/// Forget everything that would let the next start resume this item.
+///
+/// Progress reset alone is not enough: the pinned `.part` would satisfy the
+/// resume check and the new object would be written into a file that still
+/// has the old one's bytes (and, via an edited URL, no record of which object
+/// it holds). Drop both.
+///
+/// The caller owns the check that the transfer is stopped — a running one
+/// owns its `.part`.
+fn reset_for_redownload(d: &mut DownloadItem) {
+    let _ = std::fs::remove_file(d.part_file());
+    d.held.clear();
+    d.downloaded = 0;
+    d.disp_progress = 0.0;
+    d.state = DlState::Paused;
+    d.part_path = None;
+    d.error = None;
+}
+
 /// The file the duplicate dialog should warn about, if any.
 ///
 /// `named` says whether `name` is the name this download will really be
@@ -8071,6 +8086,34 @@ mod tests {
             name_locked: false,
             proxy: ProxyChoice::default(),
         }
+    }
+
+    /// "Start Download As New" over a finished file, and Redownload, both go
+    /// through here: what is left of the first transfer has to be gone before
+    /// the next start, or the resume check accepts the stale staging file and
+    /// the new object is written into the old one's bytes.
+    #[test]
+    fn a_redownload_leaves_nothing_behind_for_the_next_start_to_resume_from() {
+        let dir = std::env::temp_dir().join(format!("hydra-redl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut d = item(1, &dir.to_string_lossy(), "x.zip", None, DlState::Complete);
+        let part = dir.join("x.zip.part");
+        std::fs::write(&part, b"old bytes").expect("staging file");
+        d.part_path = Some(part.to_string_lossy().into_owned());
+        d.held = vec![(0, 9)];
+        d.downloaded = 9;
+        d.disp_progress = 1.0;
+        d.error = Some("HEAD failed".into());
+
+        reset_for_redownload(&mut d);
+
+        assert!(!part.exists(), "the staging file must not survive");
+        assert!(d.held.is_empty() && d.downloaded == 0 && d.part_path.is_none());
+        assert_eq!(d.disp_progress, 0.0);
+        assert_eq!(d.state, DlState::Paused);
+        // The Result line described the transfer that is being replaced.
+        assert_eq!(d.error, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -30,7 +30,12 @@ extension ──────────┤                                     
 - The extension watches `chrome.downloads`. When a download's file type
   matches the capture list, it pauses it, collects the cookies for that URL,
   hands it to Hydra, and only then cancels the browser's copy — if Hydra is
-  unreachable the paused download simply resumes in the browser.
+  unreachable the paused download simply resumes in the browser. That
+  parking step is Chromium's alone and lives in `background.js`; everything
+  browser-neutral (transport, gates, sniffing, menus, the popup's messages)
+  is `core.js`, which `background.js` imports. Firefox has its own
+  `background.js` with a different capture path — see
+  [../firefox/README.md](../firefox/README.md).
 - The **WebSocket is the primary transport**: no process spawn per request,
   and the open socket is itself the "app is running" signal.
 - `hydra-host` is the fallback, spawned by the browser per request. It
@@ -153,11 +158,13 @@ id?, error?}`.
 
 ## Safari
 
-The files in this directory are the **single source of truth for Safari
-too** — they bind `browser` or `chrome`, handle both native-messaging
-dialects, and feature-detect every API. `scripts/sync-extension-resources.sh safari`
-copies them next to Safari's manifest; see
-[../safari/README.md](../safari/README.md) for the build.
+`core.js`, `content.js` and the popup in this directory are the **single
+source of truth for Safari and Firefox too** — they bind `browser` or
+`chrome`, handle both native-messaging dialects, and feature-detect every
+API. `scripts/sync-extension-resources.sh safari` copies them next to
+Safari's manifest (Safari has nothing to capture, so `core.js` is its whole
+background script); see [../safari/README.md](../safari/README.md) for the
+build.
 
 ## Safari (details)
 

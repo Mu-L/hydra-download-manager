@@ -179,8 +179,8 @@ verify_archive() { # <archive>
   entries=$(py -c "
 import sys, zipfile
 print('\n'.join(zipfile.ZipFile(sys.argv[1]).namelist()))" "$archive")
-  for required in manifest.json background.js content.js popup.html popup.js \
-                  popup.css welcome.html welcome.js icons/icon48.png; do
+  for required in manifest.json core.js background.js content.js popup.html \
+                  popup.js popup.css welcome.html welcome.js icons/icon48.png; do
     case $'\n'"$entries"$'\n' in
       *$'\n'"$required"$'\n'*) ;;
       *)
@@ -484,8 +484,8 @@ WARN
 fi
 
 if [ "$TARGETS" = all ] || [ "$TARGETS" = firefox ]; then
-  # extensions/chrome is the single source of truth for the shared code; only
-  # the manifest is Firefox's own.
+  # extensions/chrome is the single source of truth for the shared code; the
+  # manifest and the capture path (background.js) are Firefox's own.
   "$REPO/scripts/sync-extension-resources.sh" firefox >/dev/null
   VERSION=$(manifest_version "$FIREFOX_SRC/manifest.json")
   FIREFOX_XPI="hydra-firefox-$VERSION.xpi"

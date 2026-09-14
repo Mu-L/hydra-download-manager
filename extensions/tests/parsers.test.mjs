@@ -4,9 +4,9 @@
 // HLS/DASH manifest parsing, against the shapes real players emit.
 // Run from the repository root:  node extensions/tests/parsers.test.mjs
 import { readFileSync } from "node:fs";
-const src = readFileSync("extensions/chrome/background.js", "utf8");
+const src = readFileSync("extensions/chrome/core.js", "utf8");
 
-// Pull the pure parser functions out of the service worker source.
+// Pull the pure parser functions out of the shared core.
 const names = ["drmName","absUrl","streamKey","streamVariantId","hlsAttrs","tagValue","parseHls","isoDuration","parseDash","classifyManifest"];
 let code = "";
 for (const n of names) {

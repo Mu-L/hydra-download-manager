@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Hydra Download Manager Integration",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "A browser integration for Hydra: automatic download capture, right-click downloads, and media/HLS/DASH stream sniffing.",
   "browser_specific_settings": {
     "gecko": {
@@ -23,8 +23,11 @@
     "webRequestBlocking"
   ],
   "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';"
+  },
   "background": {
-    "scripts": ["background.js"]
+    "scripts": ["core.js", "background.js"]
   },
   "content_scripts": [
     {
