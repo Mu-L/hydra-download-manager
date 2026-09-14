@@ -604,7 +604,43 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
   );
 }
 
-// ------------------------------------------- 6. what the Firefox manifest pins
+// ------------------------------- 6. how long the in-page video bar stays up
+//
+// The bar is put up by the page, but the setting lives with the rest of the
+// extension's state, so the content script is told the value along with the
+// list it is about to offer.
+{
+  const h = build();
+  await tick(4);
+  const fresh = await h.send({ type: "page-media" });
+  check("panel timeout: ten seconds until told otherwise", fresh.panelTimeout === 10,
+    JSON.stringify(fresh));
+
+  check("panel timeout: a chosen value is stored",
+    (await h.send({ type: "set-panel-timeout", seconds: "45" }))?.seconds === 45);
+  check("panel timeout: and reaches the page",
+    (await h.send({ type: "page-media" })).panelTimeout === 45);
+
+  // Zero is a real answer — leave the bar up until it is dismissed — so it
+  // must survive the clamp rather than being read as "unset".
+  check("panel timeout: zero means until dismissed",
+    (await h.send({ type: "set-panel-timeout", seconds: 0 }))?.seconds === 0);
+  check("panel timeout: and survives the round trip",
+    (await h.send({ type: "page-media" })).panelTimeout === 0);
+
+  check("panel timeout: a value past the ceiling is clamped",
+    (await h.send({ type: "set-panel-timeout", seconds: 99999 }))?.seconds === 600);
+  check("panel timeout: a negative one cannot get through",
+    (await h.send({ type: "set-panel-timeout", seconds: -5 }))?.seconds === 0);
+  // Number("") is 0, which would silently turn an empty field into "never
+  // hide it" rather than "I have not chosen".
+  check("panel timeout: an empty field falls back to the default",
+    (await h.send({ type: "set-panel-timeout", seconds: "" }))?.seconds === 10);
+  check("panel timeout: so does nonsense",
+    (await h.send({ type: "set-panel-timeout", seconds: "soon" }))?.seconds === 10);
+}
+
+// ------------------------------------------- 7. what the Firefox manifest pins
 //
 // The capture path above only runs if the manifest loads it AFTER the core it
 // reaches into, and the loopback socket only connects if the manifest drops

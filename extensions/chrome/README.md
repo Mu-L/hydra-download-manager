@@ -50,10 +50,17 @@ extension ──────────┤                                     
 - **The in-page bar** (`content.js`) mirrors: hovering a player shows
   "Download this video", and hovering that drops a numbered list of every
   variant in every container Hydra can actually produce — TS *and* MP4 for
-  MPEG-TS segments, MP4 only for fragmented MP4 and DASH — named after the
-  page title, cheapest quality first, with "Download all" at the top. It
-  lists only what the background already sniffed; it never probes the page
-  or the network. Turn it off from the popup.
+  MPEG-TS segments, MP4 only for fragmented MP4 and DASH — cheapest quality
+  first, with "Download all" at the top. Each row leads with what tells it
+  from its neighbours — `1080p HD · MP4 · 4.8 Mbps` for a stream variant,
+  its own name for a direct file — and the page title the download is saved
+  under heads the list once instead of opening every row. It lists only what
+  the background already sniffed; it never probes the page or the network.
+- The bar follows the reader: it clears itself once the player it belongs to
+  scrolls out of view and moves to the next one on screen, which is what a
+  feed of clips needs. How long it stays otherwise is the **Hide it after**
+  box in the popup — 10 seconds by default, `0` to leave it up until it is
+  dismissed. Turn the bar off entirely from the popup as well.
 - Adaptive streams are sniffed as one entry per manifest, never per segment:
   a `.m3u8` or `.mpd` response is fetched once, parsed for its variants
   (resolution, bitrate, codecs, duration), and listed under **Streams** in

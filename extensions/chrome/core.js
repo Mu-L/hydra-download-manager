@@ -129,6 +129,21 @@ const MEDIA_PER_TAB = 25;
 
 // ---------------------------------------------------------------- settings
 
+// Seconds the in-page video bar stays up after it has shown itself. Zero
+// leaves it up until it is dismissed; the ceiling only keeps a typo out of
+// setTimeout.
+const PANEL_TIMEOUT_DEFAULT = 10;
+const PANEL_TIMEOUT_MAX = 600;
+
+function clampPanelTimeout(v) {
+  // An empty field is "I have not chosen", not "never hide it" — and
+  // Number("") is 0, which would quietly mean the latter.
+  if (v === "" || v == null) return PANEL_TIMEOUT_DEFAULT;
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return PANEL_TIMEOUT_DEFAULT;
+  return Math.min(Math.max(n, 0), PANEL_TIMEOUT_MAX);
+}
+
 async function getState() {
   return chrome.storage.local.get({
     enabled: true, // extension-side master switch (popup toggle)
@@ -136,6 +151,7 @@ async function getState() {
     autoTypes: DEFAULT_TYPES,
     skipSites: DEFAULT_SKIP,
     videoPanel: true, // the floating Download button over <video> elements
+    panelTimeout: PANEL_TIMEOUT_DEFAULT, // seconds it lingers; 0 = until dismissed
     hydraSeen: false, // ever completed a round-trip
   });
 }
@@ -1246,6 +1262,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.local.set({ videoPanel: !!msg.on });
         sendResponse({ ok: true });
         break;
+      case "set-panel-timeout": {
+        const seconds = clampPanelTimeout(msg.seconds);
+        await chrome.storage.local.set({ panelTimeout: seconds });
+        sendResponse({ ok: true, seconds });
+        break;
+      }
       case "page-media": {
         // What the in-page panel may offer, for the asking tab only.
         const id = await whichTab();
@@ -1254,6 +1276,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           streams: id != null ? await tabStreams(id) : [],
           media: id != null ? await tabMedia(id) : [],
           videoPanel: state.enabled && state.videoPanel,
+          panelTimeout: clampPanelTimeout(state.panelTimeout),
         });
         break;
       }
