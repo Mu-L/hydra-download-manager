@@ -110,7 +110,7 @@ pub fn catch_panics() {
     }));
 }
 
-pub(crate) fn extract_panic_payload<'a>(payload: &'a (dyn std::any::Any + Send)) -> &'a str {
+pub(crate) fn extract_panic_payload(payload: &(dyn std::any::Any + Send)) -> &str {
     if let Some(&s) = payload.downcast_ref::<&str>() {
         s
     } else if let Some(s) = payload.downcast_ref::<String>() {
