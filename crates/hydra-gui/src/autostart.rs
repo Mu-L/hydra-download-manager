@@ -184,8 +184,6 @@ fn apply_platform(enabled: bool, minimized: bool) {
         return;
     }
     let Some(exe) = exe() else { return };
-    #[cfg(not(target_os = "macos"))]
-    let arg = if minimized { "--minimized" } else { "" };
     let content: String;
     #[cfg(target_os = "macos")]
     {
@@ -273,6 +271,7 @@ pub fn is_registered() -> bool {
 mod tests {
     #[cfg(target_os = "macos")]
     use super::stable_bundle_exe;
+    #[cfg(target_os = "macos")]
     use std::path::PathBuf;
 
     #[cfg(target_os = "macos")]

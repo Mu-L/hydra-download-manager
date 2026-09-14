@@ -7794,6 +7794,11 @@ pub fn combo_string(key: &iced::keyboard::Key, mods: iced::keyboard::Modifiers) 
     Some(combo)
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_application_id() -> String {
+    std::env::var("FLATPAK_ID").unwrap_or_else(|_| "hydra".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     /// A combo the table ships but a key press can never produce is an
@@ -9184,9 +9189,4 @@ mod tests {
         assert_eq!(super::linux_application_id(), "io.github.ja7ad.hydra");
         std::env::remove_var("FLATPAK_ID");
     }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn linux_application_id() -> String {
-    std::env::var("FLATPAK_ID").unwrap_or_else(|_| "hydra".to_string())
 }
