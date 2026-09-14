@@ -6,8 +6,8 @@
 // Run from the repository root:  node extensions/tests/capture.test.mjs
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
+import { loadBackground } from "./load.mjs";
 
-const SRC = readFileSync("extensions/chrome/background.js", "utf8");
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -51,9 +51,9 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
     },
     downloads: {
       onCreated,
-      // Gecko has no onDeterminingFilename at all — the capture path keys
-      // off its absence, so a mock that always offers it can only ever test
-      // the Chromium half.
+      // Gecko has no onDeterminingFilename at all; its background.js never
+      // touches it, and a mock that offered it anyway would hide a Firefox
+      // file that had started to.
       ...(gecko ? {} : { onDeterminingFilename: onDetermining }),
       download: async (opts) => calls.push(["download", opts.url]),
       pause: async (id) => calls.push(["pause", id]),
@@ -111,7 +111,7 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
     // are web globals the service worker relies on, so hand them in.
     AbortController, URL, URLSearchParams, TextDecoder,
   });
-  vm.runInContext(SRC, ctx);
+  loadBackground(ctx, gecko ? "firefox" : "chrome");
   const send = (msg) => new Promise((res) => { listeners.msg.l[0](msg, {}, res); });
   // One response, shaped as chrome.webRequest delivers it — and gated by the
   // registered `types` filter, exactly as the browser gates it. Calling the
@@ -602,6 +602,26 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
     !h3.sent.find((m) => m.type === "download")?.filename,
     JSON.stringify(h3.sent)
   );
+}
+
+// ------------------------------------------- 6. what the Firefox manifest pins
+//
+// The capture path above only runs if the manifest loads it AFTER the core it
+// reaches into, and the loopback socket only connects if the manifest drops
+// Firefox's MV3 default CSP: `upgrade-insecure-requests` there rewrites
+// `ws://127.0.0.1` to `wss://`, which the app does not speak, so every
+// request fell through to spawning the native host and the toolbar never
+// showed the app as running.
+{
+  const manifest = JSON.parse(readFileSync("extensions/firefox/manifest.json", "utf8"));
+  check("firefox manifest: core.js is loaded before background.js",
+    JSON.stringify(manifest.background?.scripts) === JSON.stringify(["core.js", "background.js"]),
+    JSON.stringify(manifest.background));
+  const csp = manifest.content_security_policy?.extension_pages || "";
+  check("firefox manifest: the extension CSP does not upgrade the loopback socket",
+    /\bscript-src 'self'/.test(csp) && !/upgrade-insecure-requests/.test(csp), JSON.stringify(csp));
+  check("firefox manifest: the header stage may block",
+    manifest.permissions.includes("webRequestBlocking"));
 }
 
 console.log(fails ? `\n${fails} FAILED` : "\nall passed");
