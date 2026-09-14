@@ -4,6 +4,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
+  <meta name="author" content="Javad Rajabzadeh">
+  <meta name="theme-color" content="#0a0e13">
   <title>Hydra Download Manager (HDM) – Fast, Multi-Source Download Engine</title>
   <meta name="description"
     content="Hydra Download Manager (HDM) is an open-source, high-performance download manager for Windows, macOS, and Linux featuring multi-connection acceleration, browser integration, and CLI support.">
@@ -15,6 +18,7 @@
   <meta property="og:image" content="https://hydra.javad.dev/img/screenshot.jpg">
   <meta property="og:url" content="https://hydra.javad.dev/">
   <meta property="og:type" content="website">
+  <meta property="og:locale" content="en_US">
   <meta property="og:site_name" content="Hydra Download Manager">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Hydra Download Manager (HDM) – Fast, Multi-Source Download Engine">
@@ -24,19 +28,124 @@
   <script type="application/ld+json">
 {
   "@context": "https://schema.org",
-  "@type": "SoftwareApplication",
-  "name": "Hydra Download Manager",
-  "alternateName": ["HDM", "Hydra"],
-  "operatingSystem": "Windows, macOS, Linux",
-  "applicationCategory": "UtilitiesApplication",
-  "offers": {
-    "@type": "Offer",
-    "price": "0",
-    "priceCurrency": "USD"
-  },
-  "url": "https://hydra.javad.dev"
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "@id": "https://hydra.javad.dev/#software",
+      "name": "Hydra Download Manager",
+      "alternateName": [
+        "HDM",
+        "Hydra",
+        "Hydra Download Manager (HDM)",
+        "libhydra"
+      ],
+      "description": "Hydra Download Manager (HDM) is a free, open-source download manager and download accelerator for Windows, macOS and Linux. It splits every file across parallel connections and multiple mirror sources, reclaims byte ranges from stalling peers, and resumes interrupted downloads. The same engine ships as libhydra, an embeddable C ABI library.",
+      "url": "https://hydra.javad.dev/",
+      "downloadUrl": "https://github.com/ja7ad/hydra/releases/latest",
+      "installUrl": "https://hydra.javad.dev/#download",
+      "softwareVersion": "0.5.0",
+      "datePublished": "2026-08-22",
+      "releaseNotes": "https://hydra.javad.dev/changelog.html",
+      "operatingSystem": [
+        "Windows",
+        "macOS",
+        "Linux"
+      ],
+      "applicationCategory": "UtilitiesApplication",
+      "applicationSubCategory": "Download Manager",
+      "license": "https://github.com/ja7ad/hydra/blob/main/LICENSING.md",
+      "isAccessibleForFree": true,
+      "programmingLanguage": [
+        "Rust",
+        "C"
+      ],
+      "image": "https://hydra.javad.dev/img/screenshot.jpg",
+      "screenshot": [
+        "https://hydra.javad.dev/img/screenshot.jpg",
+        "https://hydra.javad.dev/img/screenshot1.jpg",
+        "https://hydra.javad.dev/img/screenshot2.png",
+        "https://hydra.javad.dev/img/screenshot3.png",
+        "https://hydra.javad.dev/img/screenshot4.png"
+      ],
+      "featureList": [
+        "Adaptive concurrency across multiple mirrors and parallel HTTP/S/FTP streams",
+        "Dynamic range stealing from lagging connections",
+        "Sub-timeout stall prediction using statistical CUSUM estimators",
+        "End-to-end integrity with per-chunk checksums and Reed-Solomon erasure coding",
+        "Stable C ABI (libhydra) for embedding into other applications",
+        "Android and iOS mobile packaging",
+        "Language bindings for C, C++, Python, Swift, Go, Kotlin, Dart, C# and Zig",
+        "Durable persistence and resume across process restarts",
+        "Browser extension integration for Chrome, Edge, Firefox and Safari",
+        "Download queues with scheduled start and stop times",
+        "Clipboard watching with per-site exceptions",
+        "Bandwidth speed limits and per-server connection caps",
+        "HTTP CONNECT and SOCKS5 proxy support"
+      ],
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "author": {
+        "@id": "https://hydra.javad.dev/#author"
+      },
+      "publisher": {
+        "@id": "https://hydra.javad.dev/#author"
+      },
+      "maintainer": {
+        "@id": "https://hydra.javad.dev/#author"
+      },
+      "codeRepository": "https://github.com/ja7ad/hydra",
+      "sameAs": [
+        "https://github.com/ja7ad/hydra",
+        "https://sourceforge.net/projects/hydra-download-manager/",
+        "https://addons.mozilla.org/en-US/firefox/addon/hdm-integration/"
+      ]
+    },
+    {
+      "@type": "Person",
+      "@id": "https://hydra.javad.dev/#author",
+      "name": "Javad Rajabzadeh",
+      "alternateName": "ja7ad",
+      "url": "https://javad.dev/",
+      "sameAs": [
+        "https://github.com/ja7ad",
+        "https://sourceforge.net/u/ja7ad/profile/"
+      ]
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://hydra.javad.dev/#website",
+      "url": "https://hydra.javad.dev/",
+      "name": "Hydra Download Manager",
+      "alternateName": "HDM",
+      "inLanguage": "en",
+      "publisher": {
+        "@id": "https://hydra.javad.dev/#author"
+      },
+      "about": {
+        "@id": "https://hydra.javad.dev/#software"
+      }
+    },
+    {
+      "@type": "WebPage",
+      "@id": "https://hydra.javad.dev/#webpage",
+      "url": "https://hydra.javad.dev/",
+      "name": "Hydra Download Manager (HDM)",
+      "description": "Free open-source download manager and accelerator for Windows, macOS and Linux.",
+      "isPartOf": {
+        "@id": "https://hydra.javad.dev/#website"
+      },
+      "about": {
+        "@id": "https://hydra.javad.dev/#software"
+      },
+      "inLanguage": "en",
+      "primaryImageOfPage": "https://hydra.javad.dev/img/screenshot.jpg"
+    }
+  ]
 }
-</script>
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
@@ -1716,19 +1825,19 @@
           </button>
 
           <div class="gui-slide active" data-index="0">
-            <img src="img/screenshot.jpg" alt="Hydra Download Manager - Downloads Queue" loading="lazy">
+            <img src="img/screenshot.jpg" alt="Hydra Download Manager - Downloads Queue" loading="lazy" width="2022" height="1260" decoding="async">
           </div>
           <div class="gui-slide" data-index="1">
-            <img src="img/screenshot1.jpg" alt="Hydra Download Manager - Connection Details" loading="lazy">
+            <img src="img/screenshot1.jpg" alt="Hydra Download Manager - Connection Details" loading="lazy" width="1319" height="615" decoding="async">
           </div>
           <div class="gui-slide" data-index="2">
-            <img src="img/screenshot2.png" alt="Hydra Download Manager - Preferences &amp; Settings" loading="lazy">
+            <img src="img/screenshot2.png" alt="Hydra Download Manager - Preferences &amp; Settings" loading="lazy" width="533" height="270" decoding="async">
           </div>
           <div class="gui-slide" data-index="3">
-            <img src="img/screenshot3.png" alt="Hydra Download Manager - Network &amp; Proxy Settings" loading="lazy">
+            <img src="img/screenshot3.png" alt="Hydra Download Manager - Network &amp; Proxy Settings" loading="lazy" width="1170" height="618" decoding="async">
           </div>
           <div class="gui-slide" data-index="4">
-            <img src="img/screenshot4.png" alt="Hydra Download Manager - Categories &amp; Sorting" loading="lazy">
+            <img src="img/screenshot4.png" alt="Hydra Download Manager - Categories &amp; Sorting" loading="lazy" width="1213" height="769" decoding="async">
           </div>
 
           <button class="gui-nav-btn gui-nav-next" id="gui-next" aria-label="Next screenshot">
@@ -1742,31 +1851,31 @@
         <div class="gui-thumbs" id="gui-thumbs" role="tablist" aria-label="Screenshot Gallery">
           <button class="gui-thumb active" data-index="0" role="tab" aria-selected="true">
             <div class="gui-thumb-img">
-              <img src="img/screenshot.jpg" alt="" loading="lazy">
+              <img src="img/screenshot.jpg" alt="" loading="lazy" width="2022" height="1260" decoding="async">
             </div>
             <span class="gui-thumb-label">1. Home</span>
           </button>
           <button class="gui-thumb" data-index="1" role="tab" aria-selected="false">
             <div class="gui-thumb-img">
-              <img src="img/screenshot1.jpg" alt="" loading="lazy">
+              <img src="img/screenshot1.jpg" alt="" loading="lazy" width="1319" height="615" decoding="async">
             </div>
             <span class="gui-thumb-label">2. Download With Any Size</span>
           </button>
           <button class="gui-thumb" data-index="2" role="tab" aria-selected="false">
             <div class="gui-thumb-img">
-              <img src="img/screenshot2.png" alt="" loading="lazy">
+              <img src="img/screenshot2.png" alt="" loading="lazy" width="533" height="270" decoding="async">
             </div>
             <span class="gui-thumb-label">3. Browser Extension</span>
           </button>
           <button class="gui-thumb" data-index="3" role="tab" aria-selected="false">
             <div class="gui-thumb-img">
-              <img src="img/screenshot3.png" alt="" loading="lazy">
+              <img src="img/screenshot3.png" alt="" loading="lazy" width="1170" height="618" decoding="async">
             </div>
             <span class="gui-thumb-label">4. Download Info</span>
           </button>
           <button class="gui-thumb" data-index="4" role="tab" aria-selected="false">
             <div class="gui-thumb-img">
-              <img src="img/screenshot4.png" alt="" loading="lazy">
+              <img src="img/screenshot4.png" alt="" loading="lazy" width="1213" height="769" decoding="async">
             </div>
             <span class="gui-thumb-label">5. Batch Download List</span>
           </button>
