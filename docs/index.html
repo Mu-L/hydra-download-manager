@@ -2145,7 +2145,7 @@
                 </div>
               </div>
               <div class="matrix-row">
-                <span class="row-label">.zip</span>
+                <span class="row-label">Portable</span>
                 <div class="pill-group">
                   <a class="pill" data-asset="win-x64-zip"
                     href="https://github.com/ja7ad/hydra/releases/download/v0.3.6/hydra-0.3.6-windows-amd64.zip">x64</a>
@@ -2247,7 +2247,16 @@
                 </div>
               </div>
               <div class="matrix-row">
-                <span class="row-label">.tar.gz</span>
+                <span class="row-label">Arch Linux AUR</span>
+                <div class="pill-group">
+                  <a class="pill" href="https://aur.archlinux.org/packages/hydra-download-manager" target="_blank"
+                    rel="noopener">AUR</a>
+                  <a class="pill" href="https://aur.archlinux.org/packages/hydra-download-manager-bin" target="_blank"
+                    rel="noopener">AUR (bin)</a>
+                </div>
+              </div>
+              <div class="matrix-row">
+                <span class="row-label">Portable</span>
                 <div class="pill-group">
                   <a class="pill" data-asset="linux-x64-tar"
                     href="https://github.com/ja7ad/hydra/releases/download/v0.3.6/hydra-0.3.6-linux-amd64.tar.gz">x64</a>
@@ -2311,7 +2320,7 @@
                 </div>
               </div>
               <div class="matrix-row">
-                <span class="row-label">.tar.gz</span>
+                <span class="row-label">Portable</span>
                 <div class="pill-group">
                   <a class="pill" data-asset="mac-x64-tar"
                     href="https://github.com/ja7ad/hydra/releases/download/v0.3.6/hydra-0.3.6-macos-amd64.tar.gz">Intel
@@ -2351,6 +2360,7 @@
               <button class="tab active" role="tab" aria-selected="true" data-target="cmd-unix">macOS / Linux</button>
               <button class="tab" role="tab" aria-selected="false" data-target="cmd-ppa">Ubuntu PPA</button>
               <button class="tab" role="tab" aria-selected="false" data-target="cmd-copr">Fedora COPR</button>
+              <button class="tab" role="tab" aria-selected="false" data-target="cmd-aur">Arch AUR</button>
               <button class="tab" role="tab" aria-selected="false" data-target="cmd-brew">Homebrew</button>
               <button class="tab" role="tab" aria-selected="false" data-target="cmd-win">Windows</button>
             </div>
@@ -2387,6 +2397,16 @@
                 </svg>
               </button>
             </div>
+            <div class="cmd" id="cmd-aur">
+              <code><b>paru</b> -S hydra-download-manager-bin</code>
+              <button class="copy" aria-label="Copy install command" data-copy="paru -S hydra-download-manager-bin">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+                  stroke-linejoin="round" aria-hidden="true">
+                  <rect x="8" y="8" width="13" height="13" rx="2" />
+                  <path d="M16 8V6a2 2 0 00-2-2H5a2 2 0 00-2 2v9a2 2 0 002 2h2" />
+                </svg>
+              </button>
+            </div>
             <div class="cmd" id="cmd-brew">
               <code><b>brew</b> install ja7ad/tap/hydra</code>
               <button class="copy" aria-label="Copy install command" data-copy="brew install ja7ad/tap/hydra">
@@ -2413,7 +2433,9 @@
               <a href="https://launchpad.net/~sonycore/+archive/ubuntu/hydra" target="_blank" rel="noopener">Launchpad
                 Ubuntu PPA</a> ·
               <a href="https://copr.fedorainfracloud.org/coprs/sonycore/hydra/" target="_blank" rel="noopener">Fedora
-                COPR</a>
+                COPR</a> ·
+              <a href="https://aur.archlinux.org/packages/hydra-download-manager-bin" target="_blank"
+                rel="noopener">Arch Linux AUR</a>
             </p>
           </div>
         </div>
@@ -3164,8 +3186,8 @@
           // Windows
           if (name.includes("windows-x64-setup.exe")) assetMap["win-x64-setup"] = url;
           if (name.includes("windows-arm64-setup.exe")) assetMap["win-arm64-setup"] = url;
-          if (name.includes("windows-amd64.zip")) assetMap["win-x64-zip"] = url;
-          if (name.includes("windows-arm64.zip")) assetMap["win-arm64-zip"] = url;
+          if (name.includes("windows-amd64.zip") && !name.includes("hydra-cli")) assetMap["win-x64-zip"] = url;
+          if (name.includes("windows-arm64.zip") && !name.includes("hydra-cli")) assetMap["win-arm64-zip"] = url;
           if (name.includes("hydra-cli") && name.includes("windows-amd64")) assetMap["win-cli-x64"] = url;
           if (name.includes("hydra-cli") && name.includes("windows-arm64")) assetMap["win-cli-arm64"] = url;
 
