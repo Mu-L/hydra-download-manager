@@ -37,7 +37,7 @@ pub fn view(app: &App) -> El<'_> {
     }
     container(
         column![
-            // The table grows with every new action, and View > Font scales
+            // The table grows with every new action, and View > Scale scales
             // every row: scroll rather than push OK off the bottom.
             scrollable(list).height(Length::Fill),
             row![

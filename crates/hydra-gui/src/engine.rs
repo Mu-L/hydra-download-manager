@@ -2764,17 +2764,7 @@ fn finish_file(
         .map(|g| g.clone())
         .unwrap_or_else(|_| spec.final_path.clone());
     let final_path = std::path::Path::new(&final_str);
-    if let Some(dir) = final_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let moved = std::fs::rename(&spec.temp_path, final_path).or_else(|_| {
-        // Cross-device: copy then remove.
-        std::fs::copy(&spec.temp_path, final_path)
-            .map(|_| ())
-            .map(|()| {
-                let _ = std::fs::remove_file(&spec.temp_path);
-            })
-    });
+    let moved = crate::files::move_file(std::path::Path::new(&spec.temp_path), final_path);
     match moved {
         Ok(()) => {
             // After the rename, never before: the mtime has to be set on the

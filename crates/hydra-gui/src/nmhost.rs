@@ -275,36 +275,91 @@ fn register_windows(host: &Path) {
     crate::log::info(&format!("nmhost: registry keys point at {}", dir.display()));
 }
 
+/// Name of the pointer file beside `hydra-host` that tells it which
+/// `--config DIR` to talk to. Must stay equal to `PROFILE_POINTER` in
+/// hydra-host, which is the only reader.
+const PROFILE_POINTER: &str = "hydra-profile";
+
+/// Point the `hydra-host` next to us at `dir` — or, with `None`, take the
+/// pointer away again so it goes back to the default profile.
+///
+/// A native-messaging manifest carries a path and no arguments, so this file
+/// is the only channel there is for telling the host which profile the
+/// browser's capture belongs to. It sits next to the binary rather than
+/// inside the profile it names, so it travels with a portable copy and a
+/// second copy elsewhere cannot claim the same one.
+fn write_profile_pointer(host: &Path, dir: Option<&Path>) {
+    let Some(pointer) = host.parent().map(|d| d.join(PROFILE_POINTER)) else {
+        return;
+    };
+    let Some(dir) = dir else {
+        if pointer.exists() {
+            match std::fs::remove_file(&pointer) {
+                Ok(()) => crate::log::info(&format!("nmhost: removed {}", pointer.display())),
+                Err(e) => crate::log::warn(&format!("nmhost: {}: {e}", pointer.display())),
+            }
+        }
+        return;
+    };
+    let body = format!(
+        "{}
+",
+        dir.display()
+    );
+    if std::fs::read_to_string(&pointer).is_ok_and(|cur| cur == body) {
+        return;
+    }
+    match std::fs::write(&pointer, &body) {
+        Ok(()) => crate::log::info(&format!(
+            "nmhost: {} points at {}",
+            pointer.display(),
+            dir.display()
+        )),
+        Err(e) => crate::log::warn(&format!("nmhost: cannot write {}: {e}", pointer.display())),
+    }
+}
+
 /// Register the host with every browser on this machine. Idempotent, and
 /// safe to call on every start — which is the point: an OS or browser
 /// upgrade that wipes a profile directory repairs itself on the next launch.
 ///
+/// `portable_capture` is the Options > Extensions switch, and only means
+/// anything to a `--config DIR` instance. A manifest is machine-wide per
+/// user and carries no arguments, so registering from a second profile
+/// overwrites whatever an ordinary install registered — which is why a
+/// portable copy stays out of the way by default and the WebSocket
+/// transport (which needs no registration) is all it uses while it runs.
+/// Switched on, it registers its own binary AND leaves the pointer file the
+/// host reads, so a browser can start THIS profile when nothing is running.
+///
 /// Runs off the UI thread; failures are logged and otherwise ignored, since
 /// the WebSocket transport still works whenever the app is already running.
-pub fn ensure_registered() {
-    // A `--config DIR` instance registers nothing. The manifest is
-    // machine-wide per user and carries no arguments, so `hydra-host` always
-    // reads ipc.json from the DEFAULT application directory: registering
-    // here would point every browser at a host that talks to the ordinary
-    // install (or to nothing at all), and overwrite that install's
-    // registration on the way. The WebSocket transport still reaches this
-    // instance while it is running.
-    if let Some(dir) = crate::model::app_dir_override() {
-        crate::log::info(&format!(
-            "nmhost: --config {} — browser registration left to the default profile",
-            dir.display()
-        ));
-        return;
-    }
+pub fn ensure_registered(portable_capture: bool) {
+    let profile = crate::model::app_dir_override().map(Path::to_path_buf);
+    let register = profile.is_none() || portable_capture;
     std::thread::Builder::new()
         .name("nmhost-register".into())
-        .spawn(|| {
+        .spawn(move || {
             let Some(host) = host_binary() else {
                 crate::log::warn(
                     "nmhost: hydra-host is not next to the app; browser capture cannot launch Hydra",
                 );
                 return;
             };
+            // Written before the manifests: a browser that spawns the host
+            // the moment a key appears must already find the profile. `None`
+            // takes the pointer away — the switch turned off, or an ordinary
+            // install clearing one a portable copy left in its directory.
+            write_profile_pointer(&host, profile.as_deref().filter(|_| register));
+            if !register {
+                if let Some(dir) = &profile {
+                    crate::log::info(&format!(
+                        "nmhost: --config {} — browser registration left to the default profile",
+                        dir.display()
+                    ));
+                }
+                return;
+            }
 
             #[cfg(target_os = "windows")]
             {
@@ -403,6 +458,33 @@ mod tests {
         assert!(has(
             "/home/tester/.config/google-chrome/NativeMessagingHosts"
         ));
+    }
+
+    /// The pointer file is the only thing that can tell `hydra-host` which
+    /// `--config DIR` the browser's capture belongs to, and turning the
+    /// switch back off has to leave the host pointing at the default profile
+    /// again — a stale pointer would quietly aim every capture at a portable
+    /// copy the user has stopped using.
+    #[test]
+    fn a_profile_pointer_is_written_beside_the_host_and_taken_away_again() {
+        let tmp = std::env::temp_dir().join(format!("hydra-pointer-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let host = tmp.join("hydra-host");
+        let pointer = tmp.join(PROFILE_POINTER);
+        let profile = Path::new("/media/stick/hydra/data");
+
+        write_profile_pointer(&host, Some(profile));
+        assert_eq!(
+            std::fs::read_to_string(&pointer).unwrap().trim(),
+            "/media/stick/hydra/data"
+        );
+
+        write_profile_pointer(&host, None);
+        assert!(!pointer.exists(), "the pointer is gone, not emptied");
+        // Removing one that was never there is not an error either.
+        write_profile_pointer(&host, None);
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
