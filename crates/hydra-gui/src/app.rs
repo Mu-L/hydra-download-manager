@@ -21,6 +21,12 @@ pub type El<'a> = iced::Element<'a, Message>;
 /// columns instead of sorting by them on release.
 const HEADER_DRAG_SLOP: f32 = 4.0;
 
+/// How long the batch dialog's URL box must stand still before its links are
+/// probed. Long enough that typing a URL out by hand measures it once at the
+/// end rather than once per keystroke, short enough that a paste fills the
+/// table in without a visible pause.
+const BATCH_PROBE_IDLE: std::time::Duration = std::time::Duration::from_millis(400);
+
 // ------------------------------------------------------------------- windows
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -831,6 +837,16 @@ pub struct BatchState {
     /// where it matters: a redirector link (`href.li/?<url>`) implies
     /// `index.html`, and only the probe knows it forwards to `setup.exe`.
     pub names: std::collections::HashMap<String, String>,
+    /// URLs a probe has already been launched for, answered or not.
+    ///
+    /// The list is re-read after every edit, so without this a second paste
+    /// into a box that already holds fifty links would measure all fifty
+    /// again — and an unanswerable link would be retried on every keystroke
+    /// that follows it.
+    pub probing: std::collections::HashSet<String>,
+    /// Counts edits to the URL box so a probe pass can tell whether it is
+    /// still the most recent one. See [`App::update`]'s `BatchProbeIdle`.
+    pub edit_gen: u64,
     pub parsed: bool,
     pub to_category: bool,
     pub category: String,
@@ -870,6 +886,8 @@ impl Default for BatchState {
             checks: Vec::new(),
             sizes: Default::default(),
             names: Default::default(),
+            probing: Default::default(),
+            edit_gen: 0,
             parsed: false,
             to_category: false,
             category: String::new(),
@@ -884,6 +902,23 @@ impl Default for BatchState {
             // sensible default — the same one  ships with.
             hide_dups: true,
         }
+    }
+}
+
+impl BatchState {
+    /// The links in the box that nothing has gone out to measure yet, marked
+    /// as measured on the way out.
+    ///
+    /// Every URL is handed back exactly once for the life of the dialog,
+    /// however often the box is edited afterwards and however often the same
+    /// link appears in it.
+    pub fn take_unprobed(&mut self) -> Vec<String> {
+        let probing = &mut self.probing;
+        self.checks
+            .iter()
+            .filter(|(u, _)| probing.insert(u.clone()))
+            .map(|(u, _)| u.clone())
+            .collect()
     }
 }
 
@@ -1258,6 +1293,8 @@ pub enum Message {
     // batch
     BatchEdit(iced::widget::text_editor::Action),
     BatchLoaded(Option<String>),
+    /// The URL box has stood still since edit `.0` — measure what it holds.
+    BatchProbeIdle(u64),
     BatchProbed(String, Option<engine::LinkMeta>),
     /// A pasted link turned out to be a Metalink document.
     BatchMetalinkProbed(String, Box<Option<engine::MetalinkProbe>>),
@@ -1657,6 +1694,77 @@ fn follow_tree_sel(
         TreeSel::UnfCat(c) => follow(c).map_or(TreeSel::Unfinished, TreeSel::UnfCat),
         TreeSel::FinCat(c) => follow(c).map_or(TreeSel::Finished, TreeSel::FinCat),
         other => other.clone(),
+    }
+}
+
+/// A freshly started app with nothing loaded: no windows, no selection, no
+/// download list. `boot` overrides the handful of fields it reads off disk or
+/// asks the system for, and the rest of this struct is exactly what it used
+/// to spell out field by field.
+impl Default for App {
+    fn default() -> Self {
+        App {
+            cfg: ConfigFile::default(),
+            state: StateFile::default(),
+            windows: HashMap::new(),
+            main_id: None,
+            selected: vec![],
+            sel_anchor: None,
+            mods: iced::keyboard::Modifiers::default(),
+            resizing: None,
+            header_drag: None,
+            header_ctx: None,
+            tree_sel: TreeSel::All,
+            // The download list open, the three folders below it closed.
+            tree_open: [true, false, false, false],
+            renaming_queue: None,
+            queue_rename_draft: String::new(),
+            open_menu: None,
+            open_submenu: None,
+            cursor: Point::ORIGIN,
+            ctx_at: None,
+            last_click: None,
+            last_queue_click: None,
+            sort: (Column::LastTry, false),
+            add_url: AddUrlState::default(),
+            file_info: FileInfoState::default(),
+            zip_preview: ZipPreviewState::default(),
+            prog: HashMap::new(),
+            scans: HashMap::new(),
+            options: OptionsState::default(),
+            updater: UpdateUiState::default(),
+            sch: SchState::default(),
+            batch: BatchState::default(),
+            confirm: None,
+            confirm_remove_file: false,
+            pending_delete: vec![],
+            state_dirty: false,
+            cfg_dirty: false,
+            quota_saved: (0, 0),
+            last_clipboard: String::new(),
+            pending_add: None,
+            capture_raise: false,
+            queue_menu: None,
+            speed_menu: false,
+            list_press: None,
+            list_drag: false,
+            band: None,
+            list_drag_from_empty: false,
+            hover_row: None,
+            hover_col: None,
+            drag_order: Vec::new(),
+            table_scroll: 0.0,
+            table_scroll_x: 0.0,
+            table_vh: 0.0,
+            cursor_cell: std::sync::Arc::new(crate::ui::probe::CursorCell::default()),
+            perm_status: crate::windows::permissions::PermStatus::default(),
+            system_dark: false,
+            main_pos: None,
+            main_size: iced::Size::new(0.0, 0.0),
+            display: iced::Size::ZERO,
+            minimize_on_open: std::collections::HashSet::new(),
+            power: None,
+        }
     }
 }
 
@@ -5873,10 +5981,32 @@ impl App {
 
             // -------------------------------------------------------- batch
             Message::BatchEdit(a) => {
+                let edited = a.is_edit();
                 self.batch.text.perform(a);
                 self.batch.parsed = false;
                 self.parse_batch();
-                Task::none()
+                if !edited {
+                    return Task::none();
+                }
+                // Not measured on the spot: a link typed by hand walks
+                // through a dozen parseable prefixes on its way in, and each
+                // one would put a request on the wire. Wait for the box to
+                // stand still, then measure what it settled on — a paste,
+                // which is one edit, is measured as soon as the wait is up.
+                self.batch.edit_gen += 1;
+                let gen = self.batch.edit_gen;
+                Task::future(async move {
+                    tokio::time::sleep(BATCH_PROBE_IDLE).await;
+                    Message::BatchProbeIdle(gen)
+                })
+            }
+            Message::BatchProbeIdle(gen) => {
+                // A later edit (or a new dialog, which resets the counter)
+                // has its own wait running; this one is stale.
+                if gen != self.batch.edit_gen {
+                    return Task::none();
+                }
+                self.probe_batch()
             }
             Message::BatchLoaded(Some(text)) => {
                 self.batch
@@ -5886,35 +6016,7 @@ impl App {
                     ));
                 self.batch.parsed = false;
                 self.parse_batch();
-                // Probe each link's size in the background ("you may wait
-                // until it checks and fills all file types").
-                let ua = self.cfg.settings.user_agent.clone();
-                let probes: Vec<Task<Message>> = self
-                    .batch
-                    .checks
-                    .iter()
-                    .filter(|(u, _)| !self.batch.names.contains_key(u))
-                    .map(|(u, _)| {
-                        let url = u.clone();
-                        let ua = ua.clone();
-                        // A mirror list answers a different question than a
-                        // size probe: not "how big is this file" but "which
-                        // files are these, and where else do they live". One
-                        // request either way, so it replaces the size probe
-                        // rather than being added to it.
-                        if engine::metalink_address(&url) {
-                            Task::perform(engine::probe_metalink(url.clone(), ua), move |r| {
-                                Message::BatchMetalinkProbed(url.clone(), Box::new(r.ok()))
-                            })
-                        } else {
-                            Task::perform(
-                                engine::probe_link(url.clone(), ua, vec![]),
-                                move |meta| Message::BatchProbed(url.clone(), meta),
-                            )
-                        }
-                    })
-                    .collect();
-                Task::batch(probes)
+                self.probe_batch()
             }
             Message::BatchLoaded(None) => Task::none(),
             Message::InfoProbed(id, meta) => match meta {
@@ -6047,11 +6149,10 @@ impl App {
                 self.parse_batch();
                 // Only what the table shows: a hidden duplicate or a hidden
                 // web page is not added however its checkbox was left.
-                let checked: Vec<String> = self
+                let checked: Vec<BatchRow> = self
                     .batch_rows()
                     .into_iter()
                     .filter(|r| r.checked)
-                    .map(|r| r.url)
                     .collect();
                 if checked.is_empty() {
                     self.confirm = Some(ConfirmKind::NoneChecked);
@@ -6066,7 +6167,8 @@ impl App {
                 } else {
                     "MP4"
                 };
-                for url in checked {
+                for row in checked {
+                    let url = row.url;
                     // A mirror list in the batch is not one download but a list
                     // of them: one item per file entry, each carrying the whole
                     // mirror list, the document's size and digest, and its
@@ -6146,6 +6248,19 @@ impl App {
                         if let Some(d) = self.item_mut(id) {
                             d.resume = Some(true);
                             d.stream = Some(si);
+                        }
+                    } else if let Some(size) = row.size {
+                        // What the dialog measured is what the list shows. A
+                        // "Download Later" item never starts on its own, so
+                        // without this its Size column stays empty until the
+                        // user runs it — the answer was already on hand.
+                        //
+                        // Not for a stream: the row holds the size of the
+                        // MANIFEST, a couple of kilobytes of text, and the
+                        // media's own size is a projection the transfer
+                        // refines as segments land.
+                        if let Some(d) = self.item_mut(id) {
+                            d.size = Some(size);
                         }
                     }
                     let probed = stream_name.or(probed);
@@ -6390,6 +6505,39 @@ impl App {
         })
     }
 
+    /// Measure every link in the box that has not been measured yet, in the
+    /// background ("you may wait until it checks and fills all file types").
+    ///
+    /// Runs for any route the links arrived by — a pasted list, a `.txt`, the
+    /// clipboard item — because the Size and File Name columns are filled by
+    /// this and nothing else.
+    fn probe_batch(&mut self) -> Task<Message> {
+        let ua = self.cfg.settings.user_agent.clone();
+        let probes: Vec<Task<Message>> = self
+            .batch
+            .take_unprobed()
+            .into_iter()
+            .map(|url| {
+                let ua = ua.clone();
+                // A mirror list answers a different question than a size
+                // probe: not "how big is this file" but "which files are
+                // these, and where else do they live". One request either
+                // way, so it replaces the size probe rather than being added
+                // to it.
+                if engine::metalink_address(&url) {
+                    Task::perform(engine::probe_metalink(url.clone(), ua), move |r| {
+                        Message::BatchMetalinkProbed(url.clone(), Box::new(r.ok()))
+                    })
+                } else {
+                    Task::perform(engine::probe_link(url.clone(), ua, vec![]), move |meta| {
+                        Message::BatchProbed(url.clone(), meta)
+                    })
+                }
+            })
+            .collect();
+        Task::batch(probes)
+    }
+
     fn parse_batch(&mut self) {
         if self.batch.parsed {
             return;
@@ -6440,15 +6588,10 @@ impl App {
                 self.batch = BatchState::default();
                 self.batch.category = model::DEFAULT_CATEGORY.into();
                 let open = self.open_window(WinKind::Batch);
-                Task::batch([
-                    open,
-                    iced::clipboard::read().map(|text| match text {
-                        Some(t) => Message::BatchEdit(iced::widget::text_editor::Action::Edit(
-                            iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(t)),
-                        )),
-                        None => Message::Noop,
-                    }),
-                ])
+                // Through `BatchLoaded`, like the `.txt` picker and the
+                // clipboard monitor: pasting the text into the editor is only
+                // half of taking a list in — the other half is measuring it.
+                Task::batch([open, iced::clipboard::read().map(Message::BatchLoaded)])
             }
             MenuAction::AddBatchFile => {
                 self.batch = BatchState::default();
@@ -8096,6 +8239,118 @@ mod tests {
         st.names
             .insert("https://a.b/y.iso".into(), "page.php".into());
         assert_eq!(shown(&st), vec![0, 2]);
+    }
+
+    /// The size column is filled by the probe and by nothing else, so a link
+    /// that is never handed to one shows no size for as long as the dialog is
+    /// open — which is what a clipboard paste used to do. The box is re-read
+    /// after every edit, so "measure what is new" also has to mean "and only
+    /// what is new".
+    #[test]
+    fn every_batch_link_is_measured_once_however_often_the_box_changes() {
+        let mut st = batch_with(&[
+            "https://a.b/x.zip",
+            "https://a.b/y.iso",
+            "https://a.b/x.zip",
+        ]);
+        assert_eq!(
+            st.take_unprobed(),
+            vec![
+                "https://a.b/x.zip".to_string(),
+                "https://a.b/y.iso".to_string()
+            ],
+            "the same link pasted twice is one request, not two"
+        );
+        assert!(
+            st.take_unprobed().is_empty(),
+            "a second look at an unchanged list must not re-measure it"
+        );
+        st.checks.push(("https://a.b/z.bin".into(), true));
+        assert_eq!(st.take_unprobed(), vec!["https://a.b/z.bin".to_string()]);
+    }
+
+    /// The reported bug: the same list measured when it came from a `.txt`
+    /// and not when it came from the clipboard, because only one of the two
+    /// routes asked for a probe. Both arrive as `BatchLoaded` now.
+    #[test]
+    fn a_list_handed_to_the_dialog_is_measured_however_it_arrived() {
+        let mut app = App::default();
+        let list = "https://a.b/x.cab\nhttps://a.b/y.cab\n";
+        let _ = app.update(Message::BatchLoaded(Some(list.into())));
+        assert_eq!(app.batch.checks.len(), 2, "both links reached the table");
+        assert_eq!(
+            app.batch.probing.len(),
+            2,
+            "a link nothing was sent out for can only ever show an empty Size"
+        );
+    }
+
+    /// Typing a URL out by hand walks through a dozen parseable prefixes. The
+    /// probe therefore waits for the box to stand still, and only the newest
+    /// wait is allowed to act on what it finds.
+    #[test]
+    fn a_hand_edited_url_box_is_measured_once_it_stops_changing() {
+        let mut app = App::default();
+        let paste = |t: &str| {
+            Message::BatchEdit(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new(t.to_string()),
+            )))
+        };
+        let _ = app.update(paste("https://a.b/x.cab\n"));
+        assert!(
+            app.batch.probing.is_empty(),
+            "the edit itself must not reach the network"
+        );
+        let stale = app.batch.edit_gen;
+        let _ = app.update(paste("https://a.b/y.cab\n"));
+        let _ = app.update(Message::BatchProbeIdle(stale));
+        assert!(
+            app.batch.probing.is_empty(),
+            "the wait started by the first edit was overtaken by the second"
+        );
+        let _ = app.update(Message::BatchProbeIdle(app.batch.edit_gen));
+        assert_eq!(app.batch.probing.len(), 2);
+        // A move of the caret is not an edit and starts no new wait, so the
+        // links already measured stay measured and nothing is re-sent.
+        let _ = app.update(Message::BatchEdit(text_editor::Action::Move(
+            iced::widget::text_editor::Motion::Home,
+        )));
+        let _ = app.update(Message::BatchProbeIdle(app.batch.edit_gen));
+        assert_eq!(app.batch.probing.len(), 2);
+    }
+
+    /// A batch adds its files as "Download Later": nothing starts, so nothing
+    /// asks the server how big they are a second time. The number the dialog
+    /// showed has to travel with them — except for a manifest, whose measured
+    /// size is the playlist's rather than the media's.
+    #[test]
+    fn a_queued_batch_item_keeps_the_size_the_dialog_measured() {
+        let mut app = App::default();
+        app.batch.checks = vec![
+            ("https://a.b/x.zip".into(), true),
+            ("https://a.b/live.m3u8".into(), true),
+            ("https://a.b/unmeasured.iso".into(), true),
+        ];
+        app.batch.parsed = true;
+        app.batch.sizes.insert("https://a.b/x.zip".into(), 4096);
+        app.batch.sizes.insert("https://a.b/live.m3u8".into(), 812);
+        let _ = app.update(Message::BatchOk);
+
+        let item_at = |url: &str| {
+            app.state
+                .downloads
+                .iter()
+                .find(|d| d.url == url)
+                .unwrap_or_else(|| panic!("{url} was not added"))
+        };
+        assert_eq!(item_at("https://a.b/x.zip").size, Some(4096));
+        assert_eq!(item_at("https://a.b/live.m3u8").size, None);
+        assert_eq!(item_at("https://a.b/unmeasured.iso").size, None);
+        assert!(app
+            .state
+            .downloads
+            .iter()
+            .all(|d| d.state == DlState::Queued));
     }
 
     #[test]
