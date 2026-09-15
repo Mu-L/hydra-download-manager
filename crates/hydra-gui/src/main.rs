@@ -14,6 +14,7 @@ mod dialog_parent;
 mod engine;
 mod ext_info;
 mod extbus;
+mod files;
 mod fmt;
 mod font;
 mod i18n;
@@ -134,7 +135,7 @@ fn main() -> iced::Result {
         .title(title)
         .theme(theme_of)
         .style(style_of)
-        // View > Font is a scale factor, not a text size: iced grows the
+        // View > Scale is a window scale factor, not a text size: iced grows the
         // whole interface by the ratio, so the rows, buttons and dialog
         // chrome keep the proportions the layout was drawn with.
         .scale_factor(scale_of)
@@ -165,7 +166,7 @@ fn boot() -> (App, Task<Message>) {
     extbus::start();
     // Register the native-messaging host with every installed browser, so a
     // fresh install works without anyone running the shell script.
-    nmhost::ensure_registered();
+    nmhost::ensure_registered(cfg.settings.portable_capture);
 
     let quota_saved = (state.dl_quota.used, state.dl_quota.window_start);
     let mut app = App {
@@ -366,9 +367,9 @@ fn theme_of(app: &App, _id: window::Id) -> Theme {
 
 /// Paint every window surface explicitly: unpainted regions otherwise show
 /// through as black bands during resize/tab switches.
-/// The View > Font ratio, applied to every window (see `theme::ui_scale`).
+/// The View > Scale ratio, applied to every window (see `theme::ui_scale`).
 fn scale_of(app: &App, _id: window::Id) -> f32 {
-    theme::ui_scale(app.cfg.settings.font_size)
+    theme::ui_scale(app.cfg.settings.ui_scale_pct)
 }
 
 fn style_of(_app: &App, t: &Theme) -> iced::theme::Style {

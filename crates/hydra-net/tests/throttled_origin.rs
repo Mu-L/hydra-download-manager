@@ -10,7 +10,7 @@
 
 use hya_core::{Scheduler, Source};
 use hya_net::{run_transfer, Target, TlsCapableConnector};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,6 +28,22 @@ const ALLOWED: usize = 2;
 /// repair profitability test misjudge what a steal actually pays, which is a
 /// property of an unrealistic test fixture, not of the scheduler.
 const SLOW_FIRST_BYTE_MS: u64 = 400;
+/// The stretch of the object over which the throttled origin measures the
+/// concurrency it is being asked for — see the `peak` window below.
+///
+/// Progress, not wall clock. Both ends of a transfer are the wrong place to
+/// ask how many connections a client has settled on: the opening burst is
+/// every client at its configured count before the first refusal has been
+/// felt, and the last ranges finish at different moments, so the drain is one
+/// connection writing while the other has nothing left to be given. How long
+/// that drain lasts is a property of how the final ranges happened to divide,
+/// which is why a window pinned to the clock measures the middle of the
+/// transfer on one machine and the drain on another — the same client read 2
+/// here and 1 on CI. Between a quarter and nine tenths of the bytes is after
+/// convergence (which costs a handful of refusals inside the first tenth) and
+/// before the drain, on any machine.
+const WINDOW_LO: u64 = SIZE / 4;
+const WINDOW_HI: u64 = SIZE / 10 * 9;
 
 fn byte_at(off: u64) -> u8 {
     (off % 251) as u8
@@ -38,12 +54,18 @@ async fn spawn_throttled_origin(refusals: Arc<AtomicUsize>, peak: Arc<AtomicUsiz
     let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = l.local_addr().expect("addr").port();
     let inflight = Arc::new(AtomicUsize::new(0));
+    let served = Arc::new(AtomicU64::new(0));
     tokio::spawn(async move {
         loop {
             let Ok((mut s, _)) = l.accept().await else {
                 return;
             };
-            let (inflight, refusals, peak) = (inflight.clone(), refusals.clone(), peak.clone());
+            let (inflight, refusals, peak, served) = (
+                inflight.clone(),
+                refusals.clone(),
+                peak.clone(),
+                served.clone(),
+            );
             tokio::spawn(async move {
                 let mut head = Vec::new();
                 let mut buf = [0u8; 1024];
@@ -98,13 +120,26 @@ async fn spawn_throttled_origin(refusals: Arc<AtomicUsize>, peak: Arc<AtomicUsiz
                     // converged needs few requests, so a request granted while both
                     // slots are held can run to completion without a single further
                     // accept() — and a peak that only updates on accept would then
-                    // see nothing for the rest of the transfer, wiped by the test's
-                    // reset if that grant landed before it, and reporting collapse
+                    // see nothing for the rest of the transfer, wiped by the window
+                    // below if that grant landed before it, and reporting collapse
                     // for a client that never collapsed. Concurrency actually held
                     // is what the assertion means; sampling every chunk this
                     // connection writes is what makes that observable regardless of
                     // when the request that is holding it was granted.
-                    peak.fetch_max(inflight.load(Ordering::SeqCst), Ordering::SeqCst);
+                    //
+                    // [`WINDOW_LO`, `WINDOW_HI`] of the object is the stretch that
+                    // says anything about what the client settled on. Exactly one
+                    // writer crosses each mark, so the burst is forgotten once and
+                    // sampling stops once, at the same point of the transfer on
+                    // every machine.
+                    let before = served.fetch_add(body.len() as u64, Ordering::SeqCst);
+                    let after = before + body.len() as u64;
+                    if before < WINDOW_LO && after >= WINDOW_LO {
+                        peak.store(0, Ordering::SeqCst);
+                    }
+                    if after <= WINDOW_HI {
+                        peak.fetch_max(inflight.load(Ordering::SeqCst), Ordering::SeqCst);
+                    }
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 inflight.fetch_sub(1, Ordering::SeqCst);
@@ -118,7 +153,8 @@ async fn spawn_throttled_origin(refusals: Arc<AtomicUsize>, peak: Arc<AtomicUsiz
 async fn a_429_lowers_the_connection_count_instead_of_livelocking() {
     let refusals = Arc::new(AtomicUsize::new(0));
     // The most requests this origin serves at once ONCE THE CLIENT HAS SETTLED —
-    // the counter is reset below, after the refusals have done their work.
+    // over [`WINDOW_LO`, `WINDOW_HI`] of the object, by which point the refusals
+    // have done their work and the transfer is not yet draining.
     // Converging is only half the requirement: a client that answers a refusal by
     // collapsing to one connection has stopped being refused and is also
     // transferring at half the rate the origin was willing to give.
@@ -131,14 +167,8 @@ async fn a_429_lowers_the_connection_count_instead_of_livelocking() {
 
     // Eight connections against an origin that serves two: without a concurrency
     // response to the refusals, every round is refused exactly as the last one was.
-    // Forget the opening burst: every client reaches the origin's limit before the
-    // first refusal has been felt. What is being measured is what it does after.
-    let settle = peak.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        settle.store(0, Ordering::SeqCst);
-    });
-
+    // What is measured is the middle of the transfer, after the opening burst and
+    // before the drain — the origin keeps the window itself, in bytes served.
     let t0 = std::time::Instant::now();
     let sched = Scheduler::new(SIZE, vec![Source::default()], &[8]).with_stall_timeout(3.0);
     let r = tokio::time::timeout(

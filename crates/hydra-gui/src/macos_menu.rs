@@ -22,7 +22,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu
 pub struct MenuState {
     pub theme_mode: crate::model::ThemeMode,
     pub show_categories: bool,
-    pub font_size: u16,
+    pub ui_scale_pct: u16,
     pub language: String,
     pub speed_limiter: bool,
     /// Index of the ticked speed profile, if the cap in force matches one.
@@ -39,7 +39,7 @@ struct Installed {
     speed_limiter: CheckMenuItem,
     speed_profiles: Vec<CheckMenuItem>,
     themes: Vec<(crate::model::ThemeMode, CheckMenuItem)>,
-    fonts: Vec<(u16, CheckMenuItem)>,
+    scales: Vec<(u16, CheckMenuItem)>,
     languages: Vec<(String, CheckMenuItem)>,
 }
 
@@ -205,20 +205,20 @@ pub fn reinstall(
         themes.push((mode, it));
     }
     let _ = view.append(&theme_m);
-    let font = Submenu::new(tr("Font"), true);
-    let mut fonts = Vec::new();
-    for size in crate::theme::FONT_SIZES {
+    let scale_m = Submenu::new(tr("Scale"), true);
+    let mut scales = Vec::new();
+    for pct in crate::theme::SCALE_STEPS {
         // A bare number: `tr` leaves it alone unless a catalogue localises
-        // the digits, which is exactly what a locale that wants ۱۴ needs.
+        // the digits, which is exactly what a locale that wants ۱۴۰٪ needs.
         let it = check(
-            &size.to_string(),
-            MenuAction::FontSize(size),
-            state.font_size == size,
+            &format!("{pct}%"),
+            MenuAction::UiScale(pct),
+            state.ui_scale_pct == pct,
         );
-        let _ = font.append(&it);
-        fonts.push((size, it));
+        let _ = scale_m.append(&it);
+        scales.push((pct, it));
     }
-    let _ = view.append(&font);
+    let _ = view.append(&scale_m);
     let lang = Submenu::new(tr("Language"), true);
     let mut langs = Vec::new();
     for l in languages {
@@ -257,7 +257,7 @@ pub fn reinstall(
             speed_limiter,
             speed_profiles,
             themes,
-            fonts,
+            scales,
             languages: langs,
         });
     });
@@ -269,10 +269,10 @@ pub fn reinstall(
 /// AppKit flips a check item the moment it is clicked — muda does it in its
 /// own item handler, before the app sees the activation — so the tick a menu
 /// is left with is "whatever was clicked last", not what the setting says.
-/// Left alone, View > Font showed both the old and the new size ticked, and
-/// clicking the size already in use unticked it. The groups here are radio
-/// sets and toggles over settings the app owns, so every one of them is set
-/// from the settings rather than trusted to have toggled itself.
+/// Left alone, View > Scale showed both the old and the new percentage
+/// ticked, and clicking the one already in use unticked it. The groups here
+/// are radio sets and toggles over settings the app owns, so every one of
+/// them is set from the settings rather than trusted to have toggled itself.
 pub fn sync(state: &MenuState) -> bool {
     CURRENT.with(|c| {
         let borrow = c.borrow();
@@ -289,8 +289,8 @@ pub fn sync(state: &MenuState) -> bool {
         for (mode, item) in &installed.themes {
             item.set_checked(*mode == state.theme_mode);
         }
-        for (size, item) in &installed.fonts {
-            item.set_checked(*size == state.font_size);
+        for (pct, item) in &installed.scales {
+            item.set_checked(*pct == state.ui_scale_pct);
         }
         for (lang, item) in &installed.languages {
             item.set_checked(*lang == state.language);

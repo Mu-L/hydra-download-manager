@@ -9,6 +9,10 @@ use crate::{i18n::tr, theme};
 use iced::widget::{checkbox, column, container, pick_list, row, text, text_input};
 use iced::Length;
 
+/// Widget id of the Address box, so the dialog can open with the caret in
+/// it (`App::update`, `Message::WindowOpened`).
+pub const ADDRESS_ID: &str = "add-url-address";
+
 /// The label column, matching the Download File Info dialog's.
 const LABEL_W: f32 = 70.0;
 const GAP: f32 = 8.0;
@@ -30,6 +34,7 @@ pub fn view(app: &App) -> El<'_> {
         label(tr("Address")),
         crate::windows::ext_hint(
             text_input("http://", &st.address)
+                .id(ADDRESS_ID)
                 .on_input(Message::AddrChanged)
                 .on_submit(Message::AddUrlOk)
                 .size(theme::FONT_SIZE)

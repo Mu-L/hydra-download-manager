@@ -136,6 +136,9 @@ VIAddVersionKey "LegalCopyright"  "(C) 2026 ${PUBLISHER}. GPL-3.0-or-later."
 !include "Sections.nsh"
 ${Using:StrFunc} StrRep
 
+; "1" when this account can create files in $INSTDIR; see TestInstDir.
+Var WritableDir
+
 ;--------------------------------
 ; UI
 
@@ -151,6 +154,7 @@ ${Using:StrFunc} StrRep
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
 !insertmacro MUI_PAGE_COMPONENTS
+!define MUI_PAGE_CUSTOMFUNCTION_LEAVE CheckInstDir
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -165,6 +169,20 @@ ${Using:StrFunc} StrRep
 
 Section "Hydra Download Manager" SEC_GUI
   SectionIn RO  ; the app itself is not optional
+
+  ; A silent install (/S, with /D= naming the directory) never reaches the
+  ; Directory page, so its check runs here too. Refusing up front beats
+  ; "Error opening file for writing" once per file over a half-copied
+  ; directory that the uninstaller - which could not be written either -
+  ; will not be able to remove.
+  Call TestInstDir
+  StrCmp $WritableDir "1" instdir_ok
+  SetErrorLevel 2
+  DetailPrint "cannot write to $INSTDIR"
+  Abort "$INSTDIR cannot be written to by this account. Setup runs without \
+administrator rights, so a machine-wide folder such as C:\Program Files needs \
+setup to be started as administrator; otherwise choose a folder you own."
+instdir_ok:
 
   ; Replacing a running exe fails with "file in use"; the GUI holds a
   ; single-instance guard anyway, so stop it (and the host) first.
@@ -406,6 +424,47 @@ SectionEnd
 ;--------------------------------
 ; Callbacks
 
+; Probe $INSTDIR for write access, into $WritableDir.
+;
+; RequestExecutionLevel is `user`: setup never elevates, so a machine-wide
+; target (C:\Program Files, C:\ProgramData) is read-only to it. NSIS does not
+; check this anywhere - it copies files one by one and pops "Error opening
+; file for writing" for each, and a run that is clicked through with Ignore
+; leaves shortcuts and registry entries pointing into a directory holding
+; none of the binaries and no uninstall.exe.
+;
+; Creating a file is the only reliable test: the ACL that matters is the
+; one on the directory, and an admin-owned folder is readable and listable
+; by everyone. A directory this creates for the probe is taken away again,
+; so cancelling on the Directory page leaves nothing behind.
+Function TestInstDir
+  StrCpy $WritableDir "0"
+  StrCpy $0 "0"                    ; "1" when the probe made the directory
+  IfFileExists "$INSTDIR\*.*" probe
+  CreateDirectory "$INSTDIR"
+  StrCpy $0 "1"
+probe:
+  ClearErrors
+  GetTempFileName $1 "$INSTDIR"
+  IfErrors clean
+  StrCmp $1 "" clean
+  Delete $1
+  StrCpy $WritableDir "1"
+clean:
+  StrCmp $0 "1" 0 +2
+  RMDir "$INSTDIR"
+FunctionEnd
+
+; Directory page: keep the wizard on the page until the chosen folder is one
+; this install can actually write to.
+Function CheckInstDir
+  Call TestInstDir
+  StrCmp $WritableDir "1" writable
+  MessageBox MB_OK|MB_ICONEXCLAMATION "Hydra installs for your user account and does not ask for administrator rights, so it cannot write to:$\r$\n$\r$\n$INSTDIR$\r$\n$\r$\nChoose a folder you own - the default $LOCALAPPDATA\Programs\Hydra is one - or close setup and start it again with Run as administrator to install into a machine-wide folder."
+  Abort
+writable:
+FunctionEnd
+
 Function .onInit
   ; /NODESKTOP: opt out of the desktop shortcut from the command line
   ; (Chocolatey: --install-arguments="'/NODESKTOP'", appended to /S).
@@ -476,6 +535,16 @@ ps_unpath_done:
   ; Not /r: leaves user data behind if anything else ever lands in $INSTDIR.
   RMDir "$INSTDIR"
 
+  ; Delete reports nothing to the user, so an uninstall that removed nothing
+  ; - a copy installed into a machine-wide folder by an elevated setup, run
+  ; from an ordinary shell - otherwise ends on "Completed" with every file
+  ; still there. The Add/Remove Programs entry is kept in that case (see
+  ; below) so the uninstall can be retried with the rights it needs.
+  IfFileExists "$INSTDIR\hydra-gui.exe" 0 removed
+  DetailPrint "could not remove $INSTDIR"
+  MessageBox MB_OK|MB_ICONEXCLAMATION "Files in $INSTDIR could not be removed - this account may not write there.$\r$\n$\r$\nRun the uninstaller again with Run as administrator to finish removing Hydra." /SD IDOK
+removed:
+
   Delete "$SMPROGRAMS\Hydra\${APP_NAME}.lnk"
   Delete "$SMPROGRAMS\Hydra\Uninstall ${APP_NAME}.lnk"
   RMDir "$SMPROGRAMS\Hydra"
@@ -486,5 +555,8 @@ ps_unpath_done:
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APP_NAME}"
   Delete "$SMSTARTUP\hydra.cmd"
 
+  ; Only when the files are actually gone: an entry removed over a directory
+  ; that is still there takes the only offer of a retry with it.
+  IfFileExists "$INSTDIR\hydra-gui.exe" +2
   DeleteRegKey HKCU "${UNINST_KEY}"
 SectionEnd

@@ -14,6 +14,12 @@ use iced::widget::{
 };
 use iced::{Background, Length};
 
+/// The URL box: a fixed height with the list scrolling inside it. A batch is
+/// routinely dozens of links, and the review table under it needs the rest of
+/// the dialog.
+const URL_BOX_H: f32 = 150.0;
+const URL_BOX_PAD: f32 = 6.0;
+
 const CHECK_W: f32 = 30.0;
 const NAME_W: f32 = 210.0;
 const KIND_W: f32 = 130.0;
@@ -35,11 +41,36 @@ pub fn view(app: &App) -> El<'_> {
     let st = &app.batch;
     let rows = app.batch_rows();
 
-    let editor = text_editor(&st.text)
-        .placeholder("https://example.com/file1.zip\nhttps://example.com/file2.zip")
-        .on_action(Message::BatchEdit)
-        .size(theme::FONT_SIZE)
-        .height(150.0);
+    // The editor is laid out at its FULL height and the scrollable around it
+    // owns the offset, so the box has a bar and every pasted link can be
+    // reached. Held to a fixed height instead, the editor scrolls only under
+    // the wheel with nothing on screen to say that it can: a paste leaves the
+    // caret at the end, so a list of sixteen opens showing the last eight and
+    // the first eight are simply gone, and the half line clipped at either
+    // edge reads as two URLs printed over each other. iced hands the wheel
+    // straight to the parent once the editor's own bounds are unbounded,
+    // which is what laying it out inside a scrollable makes them.
+    //
+    // The frame moves to the container for the same reason: a border drawn by
+    // the editor is part of the editor and scrolls away with the text.
+    let editor = container(
+        scrollable(
+            text_editor(&st.text)
+                .placeholder("https://example.com/file1.zip\nhttps://example.com/file2.zip")
+                .on_action(Message::BatchEdit)
+                .size(theme::FONT_SIZE)
+                .padding(URL_BOX_PAD)
+                // An empty editor is one line tall, and the placeholder is
+                // clipped to the editor, not to the box: without a floor the
+                // second line of the hint is cut off in an empty dialog.
+                .min_height(URL_BOX_H - 2.0 * URL_BOX_PAD)
+                .style(theme::editor_bare),
+        )
+        .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(URL_BOX_H)
+    .style(theme::input_frame);
 
     let mut list = column![].spacing(1);
     for r in &rows {

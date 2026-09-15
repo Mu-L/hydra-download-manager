@@ -10,25 +10,26 @@
 //! the same widgets without a second style set.
 
 use crate::model::ThemeMode;
-use iced::widget::{button, checkbox, container, pick_list, progress_bar, text_input};
+use iced::widget::{button, checkbox, container, pick_list, progress_bar, text_editor, text_input};
 use iced::{Background, Border, Color, Theme};
 
 /// The text size the whole layout is written against: every `.size(...)` in
 /// the UI, and every padding, row height and column width sitting next to
-/// one, assumes this. View > Font moves the interface off it by scaling
+/// one, assumes this. View > Scale moves the interface off it by scaling
 /// everything at once (see [`ui_scale`]) rather than by resizing text inside
 /// boxes that would then be the wrong height for it.
 pub const FONT_SIZE: f32 = 13.0;
 
-/// The text sizes View > Font offers, in points. Both menu surfaces
-/// (`ui::menu` in-window, `macos_menu` native) build their Font group from
-/// this, so the tick lines up with the setting on either.
+/// The percentages View > Scale offers. Both menu surfaces (`ui::menu`
+/// in-window, `macos_menu` native) build their Scale group from this, so the
+/// tick lines up with the setting on either.
 ///
-/// A point value rather than a Small/Medium/Large triple: three presets have
-/// to land on displays from a 1080p laptop to a 4K panel, and the step
-/// between them is the whole complaint — the size a reader wants is usually
-/// one of the ones in between.
-pub const FONT_SIZES: [u16; 11] = [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+/// A percentage rather than a Small/Medium/Large triple: three presets have
+/// to land on displays from a 14" laptop to a 4K panel, and the step between
+/// them is the whole complaint — the size a reader wants is usually one of
+/// the ones in between. The steps are closer together around 100 %, where a
+/// reader is nudging, and wider at the ends, where they have already decided.
+pub const SCALE_STEPS: [u16; 11] = [50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200];
 
 /// The View > Theme entries: the label and the mode it stands for. Both menu
 /// surfaces (`ui::menu` in-window, `macos_menu` native) build their Theme
@@ -39,19 +40,31 @@ pub const THEME_CHOICES: [(&str, ThemeMode); 3] = [
     ("Dark", ThemeMode::Dark),
 ];
 
-/// The window scale factor for a View > Font choice: the ratio of the chosen
-/// size to the [`FONT_SIZE`] the layout was drawn at (10 -> 0.77, 13 -> 1.0,
-/// 20 -> 1.54). iced multiplies the whole interface by it, so text, the rows
-/// and buttons around it and the dialogs those sit in all grow together.
+/// The window scale factor for a View > Scale choice. iced multiplies the
+/// whole interface by it, so text, the rows and buttons around it, the
+/// dialogs those sit in and the main window's own minimum size all grow and
+/// shrink together — which is what makes 50 % the answer to a window that
+/// will not fit a 14" display.
 ///
-/// Clamped either side of a factor of two, and a config missing the field
-/// (`font_size` 0) reads as the base size, so a hand-edited config.toml
-/// cannot leave the app unreadable or the windows off-screen.
-pub fn ui_scale(font_size: u16) -> f32 {
-    if font_size == 0 {
+/// Clamped either side of a factor of two, and a zero (a hand-edited
+/// config.toml) reads as 100 %, so nothing in the file can leave the app
+/// unreadable or the windows off-screen.
+pub fn ui_scale(pct: u16) -> f32 {
+    if pct == 0 {
         return 1.0;
     }
-    (f32::from(font_size) / FONT_SIZE).clamp(0.5, 2.0)
+    (f32::from(pct) / 100.0).clamp(0.5, 2.0)
+}
+
+/// The offered step nearest `pct`, for a percentage that is not one of them
+/// — a hand-edited config, or one converted from the point size View > Font
+/// used to be set in. Keeping the setting ON a step is what lets the menu
+/// show which one is in force.
+pub fn nearest_scale(pct: u16) -> u16 {
+    SCALE_STEPS
+        .into_iter()
+        .min_by_key(|s| s.abs_diff(pct))
+        .unwrap_or(100)
 }
 
 /// The OS appearance right now, for View > Theme > System Default.
@@ -445,6 +458,40 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     }
 }
 
+/// The frame a text box draws, moved onto a container.
+///
+/// For a box whose content scrolls INSIDE it: the widget's own border is
+/// part of the widget, so it scrolls away with the text and leaves the box
+/// open at the edge it has been scrolled past. Resting colours only — a
+/// container has no focus or hover state to report.
+pub fn input_frame(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(surface(theme))),
+        border: border(
+            if is_dark(theme) {
+                c(0x5A5A5A)
+            } else {
+                c(0x7A7A7A)
+            },
+            1.0,
+            2.0,
+        ),
+        text_color: Some(text_color(theme)),
+        ..Default::default()
+    }
+}
+
+/// A text editor with no frame of its own, for use inside [`input_frame`].
+pub fn editor_bare(theme: &Theme, _status: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        placeholder: c(TEXT_DIM),
+        value: text_color(theme),
+        selection: c(SELECT_BG),
+    }
+}
+
 pub fn check(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
     let dark = is_dark(theme);
     let checked = matches!(
@@ -555,29 +602,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn font_choices_scale_by_their_ratio() {
-        // The View > Font entries (ui/menu.rs, macos_menu.rs).
-        assert_eq!(ui_scale(13), 1.0);
-        assert!((ui_scale(12) - 12.0 / 13.0).abs() < f32::EPSILON);
-        assert!((ui_scale(15) - 15.0 / 13.0).abs() < f32::EPSILON);
+    fn a_percentage_scales_the_interface_by_itself() {
+        assert_eq!(ui_scale(100), 1.0);
+        assert_eq!(ui_scale(50), 0.5);
+        assert_eq!(ui_scale(200), 2.0);
 
-        // Every offered size stays inside the clamp and grows with the
+        // Every offered step stays inside the clamp and grows with the
         // number, so no entry in the menu is a no-op or a surprise.
         let mut previous = 0.0;
-        for size in FONT_SIZES {
-            let scale = ui_scale(size);
-            assert!(scale > previous, "size {size} did not grow the interface");
-            assert!((0.5..=2.0).contains(&scale), "size {size} scales {scale}");
+        for pct in SCALE_STEPS {
+            let scale = ui_scale(pct);
+            assert!(scale > previous, "{pct}% did not grow the interface");
+            assert!((0.5..=2.0).contains(&scale), "{pct}% scales {scale}");
             previous = scale;
         }
-        assert!(
-            FONT_SIZES.contains(&(FONT_SIZE as u16)),
-            "the base size is offered"
-        );
-        // A config written before the field existed, and hand-edited
-        // nonsense, both stay usable.
+        assert!(SCALE_STEPS.contains(&100), "the base size is offered");
+        // Hand-edited nonsense stays usable.
         assert_eq!(ui_scale(0), 1.0);
-        assert_eq!(ui_scale(2), 0.5);
+        assert_eq!(ui_scale(10), 0.5);
         assert_eq!(ui_scale(400), 2.0);
+    }
+
+    /// A setting off the list — converted from the point size View > Font
+    /// used to hold, or typed into config.toml — still lands on an entry the
+    /// menu can tick.
+    #[test]
+    fn an_unlisted_percentage_snaps_to_the_nearest_step() {
+        assert_eq!(nearest_scale(100), 100);
+        assert_eq!(nearest_scale(77), 75);
+        assert_eq!(nearest_scale(154), 150);
+        assert_eq!(nearest_scale(1), 50);
+        assert_eq!(nearest_scale(9000), 200);
+        for pct in SCALE_STEPS {
+            assert_eq!(nearest_scale(pct), pct, "{pct}% is already a step");
+        }
     }
 }
