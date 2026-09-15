@@ -18,7 +18,46 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// Pointer file a portable (`--config DIR`) instance writes next to this
+/// binary when it takes browser capture over; see `nmhost::ensure_registered`
+/// in hydra-gui. One line: the absolute application directory.
+const PROFILE_POINTER: &str = "hydra-profile";
+
+/// The `--config DIR` this host should talk to, if any.
+///
+/// A native-messaging manifest carries a path and no arguments, so the
+/// browser can say nothing about which profile it wants: the answer has to
+/// be found beside us. `HYDRA_CONFIG` is the explicit override — a script, a
+/// second profile, a checkout — and the pointer file is what a portable copy
+/// leaves next to its own `hydra-host`, so the answer travels with the copy
+/// rather than living in the profile it names.
+///
+/// A directory that is not there reads as no override: an unplugged USB
+/// stick must leave the browser reaching an ordinary install rather than
+/// creating an empty profile somewhere the user is not looking.
+fn portable_dir() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    resolve_profile(
+        std::env::var_os("HYDRA_CONFIG"),
+        &exe_dir.join(PROFILE_POINTER),
+    )
+}
+
+/// The profile `HYDRA_CONFIG` or `pointer` names, or None when neither names
+/// a directory that is there. The variable wins: it is the explicit answer
+/// for this one process, while the file is whatever was left beside us.
+fn resolve_profile(env: Option<std::ffi::OsString>, pointer: &std::path::Path) -> Option<PathBuf> {
+    let dir = match env {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::fs::read_to_string(pointer).ok()?.trim()),
+    };
+    (dir.is_absolute() && dir.is_dir()).then_some(dir)
+}
+
 fn app_dir() -> PathBuf {
+    if let Some(dir) = portable_dir() {
+        return dir;
+    }
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA")
@@ -63,10 +102,20 @@ fn connect_once() -> Option<(TcpStream, String)> {
 }
 
 /// A minimized GUI launch, stdio detached from ours.
-fn gui_command(program: &std::ffi::OsStr) -> std::process::Command {
+///
+/// `profile` is the `--config DIR` this host resolved: the launched app has
+/// to come up on the SAME profile, or the browser would start an ordinary
+/// instance and then fail to find the socket it is waiting for.
+fn gui_command(
+    program: &std::ffi::OsStr,
+    profile: Option<&std::path::Path>,
+) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
-    cmd.arg("--minimized")
-        .stdin(std::process::Stdio::null())
+    cmd.arg("--minimized");
+    if let Some(dir) = profile {
+        cmd.arg("--config").arg(dir);
+    }
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     cmd
@@ -82,13 +131,13 @@ fn gui_command(program: &std::ffi::OsStr) -> std::process::Command {
 /// appeared. `CREATE_BREAKAWAY_FROM_JOB` is what Mozilla and Chrome
 /// prescribe for children that must outlive the host; `DETACHED_PROCESS`
 /// keeps the GUI off the console the browser gave us.
-fn spawn_direct(program: std::ffi::OsString) -> bool {
+fn spawn_direct(program: std::ffi::OsString, profile: Option<&std::path::Path>) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
-        if gui_command(&program)
+        if gui_command(&program, profile)
             .creation_flags(CREATE_BREAKAWAY_FROM_JOB | DETACHED_PROCESS)
             .spawn()
             .is_ok()
@@ -100,7 +149,19 @@ fn spawn_direct(program: std::ffi::OsString) -> bool {
         // back to an ordinary spawn — the pre-existing behaviour, and still
         // the right answer on any browser that runs us outside a job.
     }
-    gui_command(&program).spawn().is_ok()
+    gui_command(&program, profile).spawn().is_ok()
+}
+
+/// `hydra-gui` next to this binary, which is where every packaging layout
+/// (and a dev `target/release`) puts the pair.
+fn gui_sibling() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let path = dir.join(if cfg!(windows) {
+        "hydra-gui.exe"
+    } else {
+        "hydra-gui"
+    });
+    path.exists().then_some(path)
 }
 
 /// Launch hydra-gui minimized: the capture dialog is the only surface that
@@ -109,15 +170,34 @@ fn spawn_direct(program: std::ffi::OsString) -> bool {
 /// hit EACCES on ~/Downloads. `open -ga` exits non-zero when the app is not
 /// installed, so its exit status (not spawn success) is the real signal.
 fn launch_gui() {
+    let profile = portable_dir();
+    let dir = profile.as_deref();
     if let Some(p) = std::env::var_os("HYDRA_GUI_BIN") {
-        if spawn_direct(p) {
+        if spawn_direct(p, dir) {
             return;
+        }
+    }
+    let sibling = gui_sibling();
+    // A portable copy keeps hydra-gui beside this binary, and that build is
+    // the one whose profile we are pointing at. It goes first: an installed
+    // app bundle found by name would come up on the ordinary profile and
+    // never publish the socket this host is waiting for.
+    if profile.is_some() {
+        if let Some(path) = sibling.clone() {
+            if spawn_direct(path.into_os_string(), dir) {
+                return;
+            }
         }
     }
     #[cfg(target_os = "macos")]
     {
+        let mut args = vec!["-ga", "Hydra Download Manager", "--args", "--minimized"];
+        let profile_arg = profile.as_ref().map(|p| p.to_string_lossy().into_owned());
+        if let Some(p) = profile_arg.as_deref() {
+            args.extend_from_slice(&["--config", p]);
+        }
         let ok = std::process::Command::new("open")
-            .args(["-ga", "Hydra Download Manager", "--args", "--minimized"])
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -129,19 +209,12 @@ fn launch_gui() {
         }
     }
     // Dev layout: hydra-host sits next to hydra-gui in target/release.
-    if let Ok(me) = std::env::current_exe() {
-        if let Some(dir) = me.parent() {
-            let sibling = dir.join(if cfg!(windows) {
-                "hydra-gui.exe"
-            } else {
-                "hydra-gui"
-            });
-            if sibling.exists() && spawn_direct(sibling.into()) {
-                return;
-            }
+    if let Some(path) = sibling {
+        if spawn_direct(path.into_os_string(), dir) {
+            return;
         }
     }
-    spawn_direct("hydra-gui".into());
+    spawn_direct("hydra-gui".into(), dir);
 }
 
 /// Connect, launching the GUI and polling if needed.
@@ -305,6 +378,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The pointer file (and `HYDRA_CONFIG`) is how a portable copy tells
+    /// its own hydra-host which profile to talk to. Everything either could
+    /// hold that is not a directory here and now has to read as "no
+    /// override", or the browser stops reaching the ordinary install for no
+    /// visible reason.
+    #[test]
+    fn a_profile_answers_only_when_it_names_a_directory_that_is_there() {
+        let base = std::env::temp_dir().join(format!("hydra-pointer-{}", std::process::id()));
+        let profile = base.join("data");
+        std::fs::create_dir_all(&profile).expect("profile dir");
+        let pointer = base.join(PROFILE_POINTER);
+        let write = |body: &str| std::fs::write(&pointer, body).expect("write pointer");
+        let resolved = |p: &std::path::Path| resolve_profile(None, p);
+
+        write(&format!("{}\n", profile.display()));
+        assert_eq!(resolved(&pointer), Some(profile.clone()));
+
+        write(&base.join("gone").to_string_lossy());
+        assert_eq!(resolved(&pointer), None, "an unplugged stick");
+        write("");
+        assert_eq!(resolved(&pointer), None, "an empty file");
+        write("data");
+        assert_eq!(resolved(&pointer), None, "a relative path");
+        std::fs::remove_file(&pointer).expect("remove pointer");
+        assert_eq!(resolved(&pointer), None, "no file at all");
+
+        // HYDRA_CONFIG is the explicit answer and outranks the file, but is
+        // held to the same test: a directory that is not there is not a
+        // profile, whoever named it.
+        write(&format!("{}\n", profile.display()));
+        let env = |v: &str| resolve_profile(Some(v.into()), &pointer);
+        assert_eq!(env(&base.to_string_lossy()), Some(base.clone()));
+        assert_eq!(env(&base.join("gone").to_string_lossy()), None);
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The launched app must come up on the profile this host resolved.
+    /// Without `--config` it publishes ipc.json in the default directory,
+    /// which is not the one the connect loop is watching — the browser then
+    /// waits out the full timeout and reports Hydra as unreachable while a
+    /// window of it is on screen.
+    #[test]
+    fn a_portable_launch_carries_the_profile_it_resolved() {
+        let dir = std::path::Path::new("/opt/hydra-portable/data");
+        let args = |profile| {
+            gui_command(std::ffi::OsStr::new("hydra-gui"), profile)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(None), ["--minimized"]);
+        assert_eq!(
+            args(Some(dir)),
+            ["--minimized", "--config", "/opt/hydra-portable/data"]
+        );
+    }
+
     /// The framing is the whole contract with the browser: four little-endian
     /// bytes, then exactly that many bytes of JSON.
     #[test]
@@ -416,12 +547,16 @@ mod tests {
     #[test]
     fn a_gui_launch_reports_whether_the_process_started() {
         let me = std::env::current_exe().expect("test binary path");
-        assert!(spawn_direct(me.into_os_string()), "a real program starts");
+        assert!(
+            spawn_direct(me.into_os_string(), None),
+            "a real program starts"
+        );
         assert!(
             !spawn_direct(
                 std::env::temp_dir()
                     .join("hydra-gui-that-is-not-here")
-                    .into_os_string()
+                    .into_os_string(),
+                None
             ),
             "a missing program does not"
         );

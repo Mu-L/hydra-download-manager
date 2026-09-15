@@ -963,6 +963,13 @@ pub struct Settings {
     /// exact installs it exists for. Field-level wins, and gives `false`.
     #[serde(default)]
     pub ai_formats_seeded: bool,
+    /// Options > Extensions: let a `--config DIR` (portable) copy register
+    /// its own `hydra-host` with the browsers, so capture reaches THIS
+    /// profile and can start it when nothing is running. Off by default —
+    /// registration is machine-wide per user, so switching it on takes
+    /// browser capture away from any ordinary install on the same account.
+    /// Ignored without `--config`. See [`crate::nmhost::ensure_registered`].
+    pub portable_capture: bool,
     pub dont_start_sites: String,
     pub addr_exceptions: Vec<String>,
     pub show_exception_dialog: bool,
@@ -1038,7 +1045,14 @@ pub struct Settings {
     /// upgrade must not silently move a user off the palette they picked.
     pub dark_mode: Option<bool>,
     pub show_categories: bool,
-    pub font_size: u16,
+    /// View > Scale, in percent of the size the layout was drawn at; see
+    /// [`crate::theme::ui_scale`].
+    pub ui_scale_pct: u16,
+    /// The old View > Font point size (10..20 against a 13 pt layout). Read
+    /// once at load, folded into `ui_scale_pct`, and dropped from the file on
+    /// the next save — an upgrade must not move a reader off the size they
+    /// had settled on.
+    pub font_size: Option<u16>,
     /// Global cap from the toolbar's Speed Limit button, bytes/sec. Kept
     /// across a switch to an unlimited profile so turning the limiter back
     /// on restores the number that was last in force.
@@ -1083,6 +1097,7 @@ impl Default for Settings {
             auto_types: default_auto_types(),
             // A fresh config already has them, so there is nothing to add.
             ai_formats_seeded: true,
+            portable_capture: false,
             dont_start_sites: "*.update.microsoft.com download.windowsupdate.com".into(),
             addr_exceptions: vec![],
             show_exception_dialog: true,
@@ -1135,7 +1150,8 @@ impl Default for Settings {
             theme_mode: None,
             dark_mode: None,
             show_categories: true,
-            font_size: 13,
+            ui_scale_pct: 100,
+            font_size: None,
             global_speed_limit: None,
             speed_limiter_on: false,
             speed_profiles: default_speed_profiles(),
@@ -1457,9 +1473,7 @@ pub fn load_config() -> ConfigFile {
         }
     }
     mark_builtin_categories(&mut cfg.categories);
-    if cfg.settings.font_size == 0 {
-        cfg.settings = Settings::default();
-    }
+    migrate_ui_scale(&mut cfg.settings);
     migrate_theme_mode(&mut cfg.settings);
     migrate_columns(&mut cfg.settings);
     seed_ai_formats(&mut cfg);
@@ -1532,6 +1546,27 @@ fn seed_ai_formats(cfg: &mut ConfigFile) {
         "config: seeded {} model/dataset formats",
         missing.len()
     ));
+}
+
+/// View > Scale replaced View > Font: the old setting was a point size
+/// against a 13 pt layout and scaled the whole interface by the ratio, so a
+/// saved size converts to the percentage it was already producing (10 pt ->
+/// 77 % -> the 75 % step). Snapped onto an offered step, or the menu would
+/// have no entry to tick. The legacy key is dropped either way, so the next
+/// save writes just `ui_scale_pct`.
+///
+/// A nonsense value — 0 from a hand-edited file — leaves the setting at what
+/// it already was rather than resetting the whole block, which is what the
+/// same guard used to do.
+fn migrate_ui_scale(s: &mut Settings) {
+    if let Some(points) = s.font_size.take().filter(|p| *p > 0) {
+        s.ui_scale_pct = crate::theme::nearest_scale(
+            (u32::from(points) * 100 / crate::theme::FONT_SIZE as u32) as u16,
+        );
+    }
+    if s.ui_scale_pct == 0 {
+        s.ui_scale_pct = 100;
+    }
 }
 
 /// View > Theme replaced the Dark Mode checkbox: a config written before it
@@ -1768,6 +1803,32 @@ mod tests {
             Settings::default().ai_formats_seeded,
             "a fresh one must not"
         );
+    }
+
+    /// View > Font (a point size) became View > Scale (a percentage). An
+    /// install that had chosen a size must come back reading at the size it
+    /// chose, not snapped to 100 %.
+    #[test]
+    fn a_font_size_becomes_the_percentage_it_was_already_producing() {
+        let migrated = |toml_src: &str| {
+            let mut s: Settings = toml::from_str(toml_src).expect("parse");
+            migrate_ui_scale(&mut s);
+            s
+        };
+
+        assert_eq!(migrated("font_size = 13").ui_scale_pct, 100);
+        assert_eq!(migrated("font_size = 10").ui_scale_pct, 75);
+        assert_eq!(migrated("font_size = 20").ui_scale_pct, 150);
+        // The legacy key is dropped, so the next save writes only the new
+        // one and a later load cannot undo a scale chosen since.
+        assert_eq!(migrated("font_size = 10").font_size, None);
+
+        // A config that has already migrated keeps its percentage.
+        assert_eq!(migrated("ui_scale_pct = 125").ui_scale_pct, 125);
+        // ...and a fresh one, and nonsense, read as 100 %.
+        assert_eq!(migrated("").ui_scale_pct, 100);
+        assert_eq!(migrated("ui_scale_pct = 0").ui_scale_pct, 100);
+        assert_eq!(migrated("font_size = 0").ui_scale_pct, 100);
     }
 
     /// The limiter has two halves — a switch and a number — and only the

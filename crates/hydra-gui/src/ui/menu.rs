@@ -226,12 +226,12 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
             )
             .sep(),
             Entry::sub(
-                tr("Font"),
-                crate::theme::FONT_SIZES
+                tr("Scale"),
+                crate::theme::SCALE_STEPS
                     .into_iter()
-                    .map(|s| {
-                        Entry::item(s.to_string(), MenuAction::FontSize(s))
-                            .check(app.cfg.settings.font_size == s)
+                    .map(|pct| {
+                        Entry::item(format!("{pct}%"), MenuAction::UiScale(pct))
+                            .check(app.cfg.settings.ui_scale_pct == pct)
                     })
                     .collect(),
             ),
@@ -321,10 +321,18 @@ pub fn context_entries(app: &App) -> Vec<Entry> {
         return vec![];
     };
     let mut v = vec![];
-    if d.state == DlState::Complete {
+    let done = d.state == DlState::Complete;
+    if done {
         v.push(Entry::item(tr("Open"), MenuAction::OpenSel));
+        v.push(Entry::item(tr("Open with..."), MenuAction::OpenWithSel));
     }
     v.push(Entry::item(tr("Open folder"), MenuAction::OpenFolderSel));
+    // Only a finished file has somewhere to be moved from; see
+    // `App::move_rename_selected`.
+    v.push(Entry {
+        enabled: done,
+        ..Entry::item(tr("Move/Rename..."), MenuAction::MoveRenameSel)
+    });
     v.push(Entry {
         enabled: matches!(d.state, DlState::Paused | DlState::Error | DlState::Queued),
         ..Entry::item(tr("Resume Download"), MenuAction::DownloadNow).sep()
