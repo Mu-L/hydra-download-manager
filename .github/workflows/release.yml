@@ -78,6 +78,12 @@ jobs:
   verify-packaging:
     name: Validate packaging metadata
     needs: [verify-version]
+    # Distribution packaging is a stable-release concern. A pre-release ships
+    # the archives, the native installers, the AppImage and libhydra, and is
+    # never pushed to Copr, the PPA, the AUR or Flathub (see the gates on the
+    # publish steps), so validating metadata for formats it does not produce
+    # can only fail a release over something it was never going to ship.
+    if: needs.verify-version.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.verify-version.outputs.version }}
@@ -100,6 +106,12 @@ jobs:
           set -euo pipefail
           RPM_TOP="$RUNNER_TEMP/rpmbuild"
           mkdir -p "$RPM_TOP"/{SOURCES,SRPMS,SPECS,BUILD}
+          # `rpmbuild -bs` opens Source0 even under --nodeps, so the spec cannot
+          # be validated without the tarball it names. Produce it exactly as the
+          # Copr step below does, which makes this a rehearsal of that build
+          # rather than a check of something Copr never runs.
+          git archive --format=tar.gz --prefix="hydra-${VERSION}/" HEAD \
+            > "$RPM_TOP/SOURCES/hydra-${VERSION}.tar.gz"
           scripts/render-rpm-spec.sh "$VERSION" "$RPM_TOP/SPECS/hydra.spec"
           grep -q "^%global _version ${VERSION}$" "$RPM_TOP/SPECS/hydra.spec"
           rpmbuild -bs --nodeps --define "_topdir $RPM_TOP" "$RPM_TOP/SPECS/hydra.spec"
@@ -313,7 +325,7 @@ jobs:
           ls -lh dist/
 
       - name: Build deb and rpm packages (Linux)
-        if: matrix.os == 'linux'
+        if: matrix.os == 'linux' && needs.verify-version.outputs.prerelease == 'false'
         env:
           CARGO_BUILD_TARGET: ${{ matrix.target }}
         run: |
@@ -525,6 +537,7 @@ jobs:
   build-flatpak:
     name: Flatpak ${{ matrix.arch }}
     needs: [verify-version, verify-packaging]
+    if: needs.verify-version.outputs.prerelease == 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -910,7 +923,14 @@ jobs:
         build-ffi-android,
         build-ffi-apple,
       ]
-    if: github.ref_type == 'tag'
+    # The packaging jobs above are skipped for a pre-release, and the default
+    # "every need succeeded" rule would take this job down with them. Require
+    # that nothing *failed* instead, so a pre-release still publishes what it
+    # did build while a real failure anywhere still blocks the release.
+    if: >-
+      !cancelled() && github.ref_type == 'tag'
+      && !contains(needs.*.result, 'failure')
+      && !contains(needs.*.result, 'cancelled')
     permissions:
       contents: write
     steps:
