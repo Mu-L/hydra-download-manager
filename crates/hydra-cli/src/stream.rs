@@ -289,6 +289,9 @@ async fn run_hls(
     let mut playlist = hls::parse(&text, base);
     let mut bandwidth = None;
     let mut source = base.to_string();
+    // Set from the master, before `playlist` becomes the media playlist:
+    // once that happens the rendition groups are gone.
+    let mut audio_url: Option<String> = None;
 
     if playlist.is_master() {
         if job.list {
@@ -302,8 +305,13 @@ async fn run_hls(
             return Verdict::Failed("the master playlist lists no variants".into());
         };
         bandwidth = chosen.bandwidth;
+        audio_url = playlist.audio_for(&chosen).and_then(|r| r.url.clone());
         if !job.quiet {
-            eprintln!("stream: HLS {}", describe(&chosen));
+            eprintln!(
+                "stream: HLS {}{}",
+                describe(&chosen),
+                if audio_url.is_some() { "  + audio" } else { "" }
+            );
         }
         let body = match get(conn, &chosen.url, job, hls::playlist_cap()).await {
             Ok(b) => b,
@@ -328,11 +336,28 @@ async fn run_hls(
         if let Some(enc) = &playlist.encryption {
             return Verdict::Failed(format!("recording {enc} live streams is not supported yet"));
         }
+        let mut windows = vec![Window::of(&playlist)];
+        if let Some(au) = &audio_url {
+            // Primed here rather than left to the first refresh: the track
+            // count is fixed from this point, and a second track that starts
+            // a window late is a recording whose sound is permanently behind
+            // its picture.
+            match media_playlist(conn, job, au).await {
+                Ok(apl) => windows.push(Window::of(&apl)),
+                Err(e) => {
+                    eprintln!("stream: audio unusable, recording video only ({e})");
+                    audio_url = None;
+                }
+            }
+        }
         return record(
             conn,
             job,
-            Live::Hls { url: source },
-            vec![window_of(&playlist)],
+            Live::Hls {
+                url: source,
+                audio_url,
+            },
+            windows,
             playlist.refresh_after(),
             out_path,
             want_ext,
@@ -345,7 +370,21 @@ async fn run_hls(
         Ok(p) => p,
         Err(r) => return Verdict::Failed(r.to_string()),
     };
-    assemble(conn, job, vec![plan], out_path, want_ext, cancel).await
+    // A variant that names an audio rendition group carries no sound of its
+    // own; muxing the rendition back in is what keeps the finished file from
+    // being silent.
+    let mut plans = vec![plan];
+    if let Some(au) = &audio_url {
+        match media_playlist(conn, job, au).await {
+            // Audio that will not resolve is not a reason to lose the video.
+            Ok(apl) => match hls::Plan::build(&apl, None) {
+                Ok(p) => plans.push(p),
+                Err(e) => eprintln!("stream: audio unusable, video only ({e})"),
+            },
+            Err(e) => eprintln!("stream: audio unusable, video only ({e})"),
+        }
+    }
+    assemble(conn, job, plans, out_path, want_ext, cancel).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -397,9 +436,9 @@ async fn run_dash(
         if let Some(d) = &mf.drm {
             return Verdict::Failed(format!("{d} DRM is not supported"));
         }
-        let mut windows = vec![(video.init.clone(), dash::Manifest::timed_window(video))];
+        let mut windows = vec![Window::dash(video)];
         if let Some(a) = audio {
-            windows.push((a.init.clone(), dash::Manifest::timed_window(a)));
+            windows.push(Window::dash(a));
         }
         return record(
             conn,
@@ -429,6 +468,18 @@ async fn run_dash(
         }
     }
     assemble(conn, job, plans, out_path, want_ext, cancel).await
+}
+
+/// Fetch a playlist and parse it against the URL it came from.
+async fn media_playlist(
+    conn: &Arc<TlsCapableConnector>,
+    job: &Job,
+    url: &str,
+) -> Result<hls::Playlist, String> {
+    let body = get(conn, url, job, hls::playlist_cap())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(hls::parse(&String::from_utf8_lossy(&body), url))
 }
 
 // ------------------------------------------------------------- assembly
@@ -629,11 +680,13 @@ async fn assemble(
     if !job.quiet {
         eprintln!();
     }
-    finish(&plans[0], &parts, out_path, want_ext, job)
+    let kinds: Vec<hls::Segments> = plans.iter().map(|p| p.kind).collect();
+    finish(&kinds, &parts, out_path, want_ext, job)
 }
 
 fn finish(
-    plan: &hls::Plan,
+    // One per staging file, in the same order.
+    kinds: &[hls::Segments],
     // `(staging file, checkpoint sidecar)`; a recording has no sidecar.
     parts: &[(String, Option<String>)],
     out_path: &PathBuf,
@@ -666,11 +719,12 @@ fn finish(
             std::path::Path::new(&parts[0].0),
             std::path::Path::new(&parts[1].0),
             out_path,
+            kinds[1],
         )
         .map(|()| hls::Finished::Remuxed)
     } else {
         hls::finish(
-            plan.kind,
+            kinds[0],
             want_ext,
             std::path::Path::new(&parts[0].0),
             out_path,
@@ -711,6 +765,9 @@ fn finish(
 enum Live {
     Hls {
         url: String,
+        /// The `#EXT-X-MEDIA` rendition the variant plays with, when the
+        /// sound is a playlist of its own.
+        audio_url: Option<String>,
     },
     Dash {
         url: String,
@@ -723,10 +780,33 @@ enum Live {
 /// seconds)` per entry. The DURATION rides along because `--record-seconds`
 /// is a promise about media, and only the manifest knows how much media a
 /// segment is worth.
-type WindowList = Vec<(Option<hls::Segment>, Vec<(u64, hls::Segment, f64)>)>;
+struct Window {
+    init: Option<hls::Segment>,
+    segments: Vec<(u64, hls::Segment, f64)>,
+    /// What the segments are framed in. Two tracks of a recording need not
+    /// agree — an HLS variant may be MPEG-TS while its audio rendition is
+    /// fragmented MP4 — and the muxer has to be told which.
+    kind: hls::Segments,
+}
 
-fn window_of(pl: &hls::Playlist) -> (Option<hls::Segment>, Vec<(u64, hls::Segment, f64)>) {
-    (pl.init.clone(), pl.timed_window())
+type WindowList = Vec<Window>;
+
+impl Window {
+    fn of(pl: &hls::Playlist) -> Window {
+        Window {
+            init: pl.init.clone(),
+            segments: pl.timed_window(),
+            kind: pl.segments_kind.unwrap_or(hls::Segments::Ts),
+        }
+    }
+
+    fn dash(t: &dash::Track) -> Window {
+        Window {
+            init: t.init.clone(),
+            segments: dash::Manifest::timed_window(t),
+            kind: hls::Segments::Fmp4,
+        }
+    }
 }
 
 async fn refresh(
@@ -735,11 +815,10 @@ async fn refresh(
     source: &Live,
 ) -> Result<(WindowList, bool, std::time::Duration), String> {
     match source {
-        Live::Hls { url } => {
-            let body = get(conn, url, job, hls::playlist_cap())
+        Live::Hls { url, audio_url } => {
+            let pl = media_playlist(conn, job, url)
                 .await
                 .map_err(|e| format!("could not re-read the playlist: {e}"))?;
-            let pl = hls::parse(&String::from_utf8_lossy(&body), url);
             if let Some(d) = &pl.drm {
                 return Err(format!("{d} DRM is not supported"));
             }
@@ -748,7 +827,17 @@ async fn refresh(
             if let Some(enc) = &pl.encryption {
                 return Err(format!("recording {enc} live streams is not supported yet"));
             }
-            Ok((vec![window_of(&pl)], pl.ended, pl.refresh_after()))
+            let mut windows = vec![Window::of(&pl)];
+            if let Some(au) = audio_url {
+                // The track count was fixed when the recording started, so a
+                // window that cannot be read now has to stop the recording
+                // rather than quietly leave the audio behind the picture.
+                let apl = media_playlist(conn, job, au)
+                    .await
+                    .map_err(|e| format!("could not re-read the audio playlist: {e}"))?;
+                windows.push(Window::of(&apl));
+            }
+            Ok((windows, pl.ended, pl.refresh_after()))
         }
         Live::Dash {
             url,
@@ -765,10 +854,10 @@ async fn refresh(
             let Some(v) = mf.video.iter().find(|t| &t.id == video_id) else {
                 return Err("the manifest no longer offers that video rendition".into());
             };
-            let mut w = vec![(v.init.clone(), dash::Manifest::timed_window(v))];
+            let mut w = vec![Window::dash(v)];
             if let Some(aid) = audio_id {
                 if let Some(a) = mf.audio.iter().find(|t| &t.id == aid) {
-                    w.push((a.init.clone(), dash::Manifest::timed_window(a)));
+                    w.push(Window::dash(a));
                 }
             }
             Ok((w, false, mf.refresh_after()))
@@ -824,6 +913,7 @@ async fn record(
 
     let mut last: Vec<Option<u64>> = vec![None; tracks];
     let mut init_done = vec![false; tracks];
+    let mut kinds = vec![hls::Segments::Ts; tracks];
     // Media already PLANNED per track, which is what the length ask is
     // measured against. Per track because video and audio cover the same
     // span, so summing them would halve the recording.
@@ -860,7 +950,9 @@ async fn record(
             }
         };
 
-        for (i, (init, segments)) in windows.iter().enumerate().take(tracks) {
+        for (i, w) in windows.iter().enumerate().take(tracks) {
+            let (init, segments) = (&w.init, &w.segments);
+            kinds[i] = w.kind;
             if !init_done[i] {
                 if let Some(u) = init {
                     let dest = format!("{staging}.i{i}");
@@ -1054,19 +1146,7 @@ async fn record(
         }
         return Verdict::Failed(e);
     }
-    let kind = if matches!(source, Live::Dash { .. }) {
-        hls::Segments::Fmp4
-    } else {
-        hls::Segments::Ts
-    };
-    let plan = hls::Plan {
-        init: None,
-        segments: vec![],
-        kind,
-        duration: 0.0,
-        estimated_size: None,
-    };
-    finish(&plan, &parts, out_path, want_ext, job)
+    finish(&kinds, &parts, out_path, want_ext, job)
 }
 
 fn append(src: &str, out: &mut std::fs::File) -> std::io::Result<()> {
@@ -1248,6 +1328,158 @@ fn extension_for(content_type: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+
+    /// An HTTP/1.1 origin serving a fixed route table and recording what it
+    /// was asked for. A stream is hundreds of small objects, and the only way
+    /// to show that a track was fetched is to watch an origin be asked for
+    /// it.
+    fn serve(routes: Vec<(String, Vec<u8>)>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log, routes) = (seen.clone(), Arc::new(routes));
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let (routes, log) = (routes.clone(), log.clone());
+                // A thread per connection: serving inside the accept loop
+                // would serialise a client that fetches segments in parallel.
+                std::thread::spawn(move || {
+                    let Ok(peek) = sock.try_clone() else { return };
+                    let mut r = BufReader::new(peek);
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    loop {
+                        let mut h = String::new();
+                        if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" || h == "\n" {
+                            break;
+                        }
+                    }
+                    if let Ok(mut g) = log.lock() {
+                        g.push(path.clone());
+                    }
+                    let resp = match routes.iter().find(|(p, _)| *p == path) {
+                        Some((_, b)) => {
+                            let mut out = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                b.len()
+                            )
+                            .into_bytes();
+                            out.extend_from_slice(b);
+                            out
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+                    };
+                    let _ = sock.write_all(&resp);
+                    let _ = sock.flush();
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), seen)
+    }
+
+    fn job_for(url: String, out: PathBuf) -> Job {
+        Job {
+            url,
+            output: Some(out),
+            container: "mp4".into(),
+            user_agent: "hydra-test/1".into(),
+            quiet: true,
+            no_progress: true,
+            ..Job::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn hls_alternate_audio_is_downloaded_alongside_the_video() {
+        // The shape X serves: the variant carries video only and the sound
+        // is a rendition group it points at. Ignoring the group is how a
+        // finished download ends up silent.
+        let (base, seen) = serve(vec![
+            (
+                "/master.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n",
+                    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",",
+                    "DEFAULT=YES,URI=\"a/en.m3u8\"\n",
+                    "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"aac\"\n",
+                    "v/index.m3u8\n"
+                )
+                .into(),
+            ),
+            (
+                "/v/index.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nv0.ts\n#EXT-X-ENDLIST\n".into(),
+            ),
+            (
+                "/a/en.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\na0.ts\n#EXT-X-ENDLIST\n".into(),
+            ),
+            ("/v/v0.ts".into(), b"VVVV".to_vec()),
+            ("/a/a0.ts".into(), b"AAAA".to_vec()),
+        ]);
+        let dir = std::env::temp_dir().join("hydra-cli-hls-av");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.mp4");
+        let verdict = run(job_for(format!("{base}/master.m3u8"), out.clone())).await;
+
+        let reqs = seen.lock().unwrap().clone();
+        for want in ["/a/en.m3u8", "/a/a0.ts", "/v/v0.ts"] {
+            assert!(
+                reqs.iter().any(|r| r == want),
+                "the audio rendition was skipped: {reqs:?}"
+            );
+        }
+        // Combining is ffmpeg's step and these four-byte fixtures are not
+        // media, so it may refuse them; what this pins is that both tracks
+        // were fetched and handed to it.
+        if let Verdict::Failed(msg) = &verdict {
+            assert!(msg.contains("ffmpeg"), "unexpected failure: {msg}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_audio_rendition_still_yields_the_video() {
+        // Audio that will not resolve is not a reason to lose the download.
+        let (base, _seen) = serve(vec![
+            (
+                "/master.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n",
+                    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",",
+                    "DEFAULT=YES,URI=\"a/gone.m3u8\"\n",
+                    "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"aac\"\n",
+                    "v/index.m3u8\n"
+                )
+                .into(),
+            ),
+            (
+                "/v/index.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nv0.ts\n#EXT-X-ENDLIST\n".into(),
+            ),
+            ("/v/v0.ts".into(), b"VVVV".to_vec()),
+        ]);
+        let dir = std::env::temp_dir().join("hydra-cli-hls-noaudio");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.ts");
+        let job = Job {
+            container: "ts".into(),
+            ..job_for(format!("{base}/master.m3u8"), out.clone())
+        };
+        match run(job).await {
+            Verdict::Done { path, .. } => {
+                assert_eq!(std::fs::read(&path).unwrap(), b"VVVV");
+            }
+            other => panic!("a missing audio rendition should not fail the video: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_generic_manifest_name_borrows_the_directory_above_it() {
