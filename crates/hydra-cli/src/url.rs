@@ -26,13 +26,17 @@ pub struct Url {
     pub pass: Option<String>,
 }
 
-/// Percent-decode a userinfo component.
+/// Percent-decode a URL component.
 ///
 /// Credentials containing `@`, `:`, or `/` must be percent-encoded in a URL, so they have to
 /// be decoded before use or the login is sent wrong. Invalid escapes are left verbatim
 /// rather than dropped: silently altering a password produces an authentication failure
-/// that looks like a server problem.
-fn pct_decode(s: &str) -> String {
+/// that looks like a server problem, and a name is better shown as typed than mangled.
+///
+/// Decoding admits characters the encoded form could not hold, so a caller turning the
+/// result into a filename must reduce it to a basename afterwards — see
+/// [`Url::suggested_filename`].
+pub fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -202,18 +206,32 @@ impl Url {
     }
 
     /// Filename implied by the URL path, for when `-O` is not given.
+    ///
+    /// The segment is percent-decoded, because a path is an encoded form: saving
+    /// `Elementor%20Pro.zip` verbatim writes the escape into the name the user reads.
+    /// Decoding admits characters the encoded segment could not contain, so the result
+    /// is reduced to its own basename afterwards — `%2F` and `%5C` are separators and
+    /// `%00` truncates the name at the OS boundary, and a URL must not get to pick a
+    /// directory for a download that was never told one.
     pub fn suggested_filename(&self) -> String {
-        let name = self
-            .path
-            .rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or("download");
-        // Query strings and fragments are not part of a filename.
-        let name = name.split(['?', '#']).next().unwrap_or("download");
-        if name.is_empty() {
+        // Query strings and fragments are not part of a filename, and they are stripped
+        // BEFORE the path is split: a query may itself contain '/', and taking the last
+        // segment first names the file after the tail of `?redirect=/a/b.zip`.
+        let path = self.path.split(['?', '#']).next().unwrap_or("");
+        let segment = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+        let decoded = pct_decode(segment);
+        let base = decoded
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .split('\0')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if base.is_empty() || base == "." || base == ".." {
             "download".to_string()
         } else {
-            name.to_string()
+            base.to_string()
         }
     }
 
@@ -424,6 +442,68 @@ mod tests {
                 .suggested_filename(),
             "dir"
         );
+        // A query may contain '/'; the filename comes from the PATH, not from the
+        // tail of a redirect parameter.
+        assert_eq!(
+            Url::parse("http://x.org/get.php?url=/other/decoy.zip")
+                .unwrap()
+                .suggested_filename(),
+            "get.php"
+        );
+    }
+
+    #[test]
+    fn an_escaped_path_names_the_file_a_human_reads() {
+        // The reported bug: a space-bearing name reached disk as `…%20….zip`.
+        assert_eq!(
+            Url::parse("https://x.org/dl/Elementor%20Pro%204.2.3.zip")
+                .unwrap()
+                .suggested_filename(),
+            "Elementor Pro 4.2.3.zip"
+        );
+        // Non-ASCII arrives as UTF-8 octets, one escape per byte.
+        assert_eq!(
+            Url::parse("https://x.org/%D9%86%D9%85%D9%88%D9%86%D9%87.pdf")
+                .unwrap()
+                .suggested_filename(),
+            "نمونه.pdf"
+        );
+        // A malformed escape is a literal '%', matching how credentials are decoded:
+        // a name is better left verbatim than mangled.
+        assert_eq!(
+            Url::parse("https://x.org/100%pure.bin")
+                .unwrap()
+                .suggested_filename(),
+            "100%pure.bin"
+        );
+        // The path itself keeps the encoded form — it is what goes on the wire.
+        assert_eq!(
+            Url::parse("https://x.org/a%20b.zip").unwrap().path,
+            "/a%20b.zip"
+        );
+    }
+
+    #[test]
+    fn a_decoded_segment_cannot_choose_a_directory() {
+        // Decoding admits characters the segment could not otherwise hold. Each of
+        // these would escape the directory the user asked for, or truncate the name
+        // where the OS stops reading it.
+        for (url, want) in [
+            ("https://x.org/%2E%2E%2F%2E%2E%2Fevil.sh", "evil.sh"),
+            ("https://x.org/a%2Fb%2Fc.bin", "c.bin"),
+            ("https://x.org/..%5C..%5Cevil.exe", "evil.exe"),
+            ("https://x.org/ok.zip%00.exe", "ok.zip"),
+            ("https://x.org/%2E", "download"),
+            ("https://x.org/%2E%2E", "download"),
+            ("https://x.org/%2F", "download"),
+            ("https://x.org/%20%20", "download"),
+        ] {
+            assert_eq!(
+                Url::parse(url).unwrap().suggested_filename(),
+                want,
+                "{url} must not name a path outside the output directory"
+            );
+        }
     }
 
     #[test]
