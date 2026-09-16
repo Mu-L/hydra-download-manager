@@ -909,8 +909,11 @@ A master playlist is read for its ladder, one rendition is chosen (see
 .BR \-\-quality ),
 and its media playlist is fetched and turned into a plan \(em after which no
 further playlist is read.
-DASH carries video and audio as separate representations, so both are
-planned and the two finished tracks are combined at the end.
+DASH carries video and audio as separate representations, and an HLS master
+does the same whenever its variants name an
+.B EXT\-X\-MEDIA
+audio rendition group, so in both cases the two tracks are planned and the
+finished pair is combined at the end.
 Relative URIs resolve against the address the manifest
 .I finally
 came from, not the address asked for: a CDN answering with a redirect to a
@@ -953,7 +956,8 @@ MPEG-TS@ts@placed as assembled@placed as assembled
 MPEG-TS@mp4@remuxed@refused
 fragmented MP4@mp4@remuxed, faststart@kept as assembled
 fragmented MP4@ts@remuxed@refused
-DASH video+audio@mp4@combined@refused
+separate video+audio@mp4@combined@refused
+separate video+audio@ts@combined@refused
 .TE
 .PP
 The remux is always a stream copy, never a re-encode.

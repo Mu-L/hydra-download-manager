@@ -112,6 +112,26 @@ pub struct Variant {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub codecs: Option<String>,
+    /// `AUDIO` group this variant plays with. When it names a group whose
+    /// chosen rendition has a URI of its own, the variant carries video
+    /// only and the sound is a second playlist.
+    pub audio: Option<String>,
+}
+
+/// An `#EXT-X-MEDIA` alternative rendition. Only `TYPE=AUDIO` is kept:
+/// subtitles and closed captions are not written into the output file, so
+/// parsing them would add state nothing reads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Rendition {
+    pub group: String,
+    pub name: Option<String>,
+    pub language: Option<String>,
+    pub default: bool,
+    pub autoselect: bool,
+    /// Absent means the audio is inside the variant playlist itself
+    /// (RFC 8216 4.3.4.2.1), which is the muxed case and needs no second
+    /// track.
+    pub url: Option<String>,
 }
 
 /// The container the segments are in, which decides what can be produced.
@@ -163,6 +183,9 @@ impl std::fmt::Display for Refusal {
 #[derive(Clone, Debug, Default)]
 pub struct Playlist {
     pub variants: Vec<Variant>,
+    /// `#EXT-X-MEDIA:TYPE=AUDIO` renditions, in the order the master lists
+    /// them.
+    pub audio: Vec<Rendition>,
     pub segments: Vec<Segment>,
     /// Each segment's `#EXTINF`, seconds, in step with `segments`. A live
     /// recording has no size to report progress against, so how much TIME
@@ -191,6 +214,25 @@ pub struct Playlist {
 impl Playlist {
     pub fn is_master(&self) -> bool {
         !self.variants.is_empty()
+    }
+
+    /// The separate audio playlist this variant needs, if it has one.
+    ///
+    /// A variant that names an `AUDIO` group carries no sound of its own
+    /// unless the group's chosen rendition is the in-band one — so ignoring
+    /// this tag is how a download ends up silent. The rendition a player
+    /// would pick is the one taken: `DEFAULT=YES`, then `AUTOSELECT=YES`,
+    /// then the first listed. `None` means there is nothing extra to fetch,
+    /// either because no group was named or because the audio is already in
+    /// the variant's own segments.
+    pub fn audio_for(&self, variant: &Variant) -> Option<&Rendition> {
+        let group = variant.audio.as_deref()?;
+        let in_group = || self.audio.iter().filter(move |r| r.group == group);
+        let chosen = in_group()
+            .find(|r| r.default)
+            .or_else(|| in_group().find(|r| r.autoselect))
+            .or_else(|| in_group().next())?;
+        chosen.url.is_some().then_some(chosen)
     }
 
     /// The window as `(sequence number, url)`, so a caller refreshing a live
@@ -274,6 +316,11 @@ fn attrs(line: &str) -> Vec<(String, String)> {
     out
 }
 
+/// An enumerated HLS attribute whose only true value is `YES`.
+fn yes(v: Option<&str>) -> bool {
+    v.is_some_and(|v| v.eq_ignore_ascii_case("YES"))
+}
+
 fn attr<'a>(list: &'a [(String, String)], name: &str) -> Option<&'a str> {
     list.iter()
         .find(|(k, _)| k == name)
@@ -344,6 +391,18 @@ pub fn parse(text: &str, base: &str) -> Playlist {
         }
         if let Some(v) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             pending = Some(attrs(v));
+        } else if let Some(v) = line.strip_prefix("#EXT-X-MEDIA:") {
+            let a = attrs(v);
+            if attr(&a, "TYPE").is_some_and(|t| t.eq_ignore_ascii_case("AUDIO")) {
+                pl.audio.push(Rendition {
+                    group: attr(&a, "GROUP-ID").unwrap_or_default().to_string(),
+                    name: attr(&a, "NAME").map(str::to_string),
+                    language: attr(&a, "LANGUAGE").map(str::to_string),
+                    default: yes(attr(&a, "DEFAULT")),
+                    autoselect: yes(attr(&a, "AUTOSELECT")),
+                    url: attr(&a, "URI").and_then(|u| crate::url::join(base, u)),
+                });
+            }
         } else if line.starts_with("#EXT-X-KEY:") || line.starts_with("#EXT-X-SESSION-KEY:") {
             let a = attrs(tag_value(line));
             let method = attr(&a, "METHOD").unwrap_or("").to_ascii_uppercase();
@@ -474,6 +533,7 @@ pub fn parse(text: &str, base: &str) -> Playlist {
                         width: w,
                         height: h,
                         codecs: attr(&a, "CODECS").map(str::to_string),
+                        audio: attr(&a, "AUDIO").map(str::to_string),
                     });
                 }
             }
@@ -1724,38 +1784,48 @@ pub fn remux(src: &std::path::Path, dst: &std::path::Path, kind: Segments) -> Re
 }
 
 /// Combine a video track and an audio track into one file. Stream copy, so
-/// nothing is re-encoded and quality is untouched.
+/// nothing is re-encoded and quality is untouched. `audio_kind` is the
+/// container the audio track was assembled in.
 ///
-/// DASH keeps the two apart, and putting them back together is genuinely a
-/// muxing job — there is no concatenation that does it. Until the pure-Rust
-/// muxer exists this needs ffmpeg, and says so plainly instead of leaving a
-/// silent video behind.
+/// DASH keeps the two apart, and so does HLS whenever a variant names an
+/// `AUDIO` rendition group; putting them back together is genuinely a muxing
+/// job — there is no concatenation that does it. Until the pure-Rust muxer
+/// exists this needs ffmpeg, and says so plainly instead of leaving a silent
+/// video behind.
 pub fn mux(
     video: &std::path::Path,
     audio: &std::path::Path,
     dst: &std::path::Path,
+    audio_kind: Segments,
 ) -> Result<(), String> {
     let Some(ff) = ffmpeg() else {
         return Err(
-            "combining DASH video and audio needs ffmpeg on PATH; install it to get one file"
+            "combining separate video and audio tracks needs ffmpeg on PATH; install it to \
+             get one file"
                 .into(),
         );
     };
-    let out = std::process::Command::new(ff)
-        .args(["-y", "-loglevel", "error", "-i"])
+    let to_mp4 = dst
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("mp4"));
+    let mut cmd = std::process::Command::new(ff);
+    cmd.args(["-y", "-loglevel", "error", "-i"])
         .arg(video)
         .arg("-i")
         .arg(audio)
-        .args([
-            "-c",
-            "copy",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-movflags",
-            "+faststart",
-        ])
+        .args(["-c", "copy", "-map", "0:v:0", "-map", "1:a:0"]);
+    if audio_kind == Segments::Ts && to_mp4 {
+        // Same trap as `remux`: AAC inside MPEG-TS is ADTS-framed and MP4
+        // wants it raw. Skipping the filter leaves a file whose picture is
+        // perfect and whose sound is noise — the failure this whole function
+        // exists to avoid.
+        cmd.args(["-bsf:a", "aac_adtstoasc"]);
+    }
+    if to_mp4 {
+        // Rejected outright by every other muxer, so it is not passed to one.
+        cmd.args(["-movflags", "+faststart"]);
+    }
+    let out = cmd
         .arg(dst)
         .output()
         .map_err(|e| format!("ffmpeg could not run: {e}"))?;
@@ -1781,6 +1851,79 @@ v8/index.m3u8\n\
 v5/index.m3u8\n\
 #EXT-X-STREAM-INF:BANDWIDTH=902000,RESOLUTION=640x360\n\
 v2/index.m3u8\n";
+
+    /// A master shaped like the ones X and every other fMP4 publisher
+    /// serve: the variants carry video only, and the sound is a rendition
+    /// group they point at.
+    const SPLIT_AUDIO: &str = "#EXTM3U\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"Deutsch\",LANGUAGE=\"de\",AUTOSELECT=YES,URI=\"a/de.m3u8\"\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,AUTOSELECT=YES,URI=\"a/en.m3u8\"\n\
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"English\",URI=\"s/en.m3u8\"\n\
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"aac\"\n\
+v5/index.m3u8\n";
+
+    #[test]
+    fn audio_renditions_are_parsed_and_their_uris_resolved() {
+        let pl = parse(SPLIT_AUDIO, "https://cdn.example/hls/master.m3u8");
+        // Only TYPE=AUDIO is kept; the subtitle rendition is not a track.
+        assert_eq!(pl.audio.len(), 2);
+        let en = &pl.audio[1];
+        assert_eq!(en.group, "aac");
+        assert_eq!(en.name.as_deref(), Some("English"));
+        assert_eq!(en.language.as_deref(), Some("en"));
+        assert!(en.default && en.autoselect);
+        assert_eq!(en.url.as_deref(), Some("https://cdn.example/hls/a/en.m3u8"));
+        assert!(!pl.audio[0].default);
+        assert_eq!(pl.variants[0].audio.as_deref(), Some("aac"));
+    }
+
+    #[test]
+    fn a_variant_that_names_a_group_plays_with_its_default_rendition() {
+        let pl = parse(SPLIT_AUDIO, "https://cdn.example/hls/master.m3u8");
+        let audio = pl
+            .audio_for(&pl.variants[0])
+            .expect("a video-only variant must name its audio");
+        // DEFAULT=YES wins over the rendition that merely comes first, which
+        // is what a player would pick.
+        assert_eq!(
+            audio.url.as_deref(),
+            Some("https://cdn.example/hls/a/en.m3u8")
+        );
+    }
+
+    #[test]
+    fn an_autoselect_rendition_is_taken_when_none_is_default() {
+        let text = SPLIT_AUDIO.replace(",DEFAULT=YES", "");
+        let pl = parse(&text, "https://cdn.example/hls/master.m3u8");
+        let audio = pl.audio_for(&pl.variants[0]).expect("autoselect is a pick");
+        assert_eq!(
+            audio.url.as_deref(),
+            Some("https://cdn.example/hls/a/de.m3u8")
+        );
+    }
+
+    #[test]
+    fn in_band_audio_is_not_fetched_as_a_second_track() {
+        // A rendition with no URI means the audio is already inside the
+        // variant's segments. Fetching "it" would mean fetching nothing, and
+        // muxing would then be asked to find a track that is not there.
+        let text = "#EXTM3U\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",DEFAULT=YES\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"Commentary\",URI=\"a/cm.m3u8\"\n\
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720,AUDIO=\"aac\"\n\
+v5/index.m3u8\n";
+        let pl = parse(text, "https://cdn.example/hls/master.m3u8");
+        assert!(pl.audio_for(&pl.variants[0]).is_none());
+    }
+
+    #[test]
+    fn a_variant_naming_no_group_has_no_alternate_audio() {
+        // The master here lists an audio rendition, but no variant points at
+        // it: the sound is muxed into the variants and taking the rendition
+        // as well would double it.
+        let pl = parse(MASTER, "https://cdn.example/hls/master.m3u8");
+        assert!(pl.variants.iter().all(|v| pl.audio_for(v).is_none()));
+    }
 
     fn media_vod() -> String {
         let mut s = String::from("#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-TARGETDURATION:6\n");
