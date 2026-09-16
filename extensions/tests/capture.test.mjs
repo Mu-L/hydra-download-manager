@@ -159,10 +159,19 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
   await tick(4);
   check("capture: browser download is paused on creation", h.calls.some(([c, id]) => c === "pause" && id === 1), JSON.stringify(h.calls));
 
-  h.onDetermining.fire(item, () => h.calls.push(["suggest"]));
+  const determined = h.onDetermining.fire(item, () => h.calls.push(["suggest"]));
+  // Everything the browser does with a download after this listener answers —
+  // reserving the path, and the "Save as" dialog above all — must not happen
+  // while Hydra is still being asked. Suggesting here and deciding later put
+  // the browser's save dialog on screen next to Hydra's own.
+  check("capture: the suggestion is deferred, not answered on the spot", !h.calls.some(([c]) => c === "suggest"), JSON.stringify(h.calls));
+  check("capture: the listener returns true to claim the deferral", determined.every((r) => r === true), JSON.stringify(determined));
+
   await tick(8);
   const dl = h.sent.find((m) => m.type === "download");
-  check("capture: onDeterminingFilename calls suggest()", h.calls.some(([c]) => c === "suggest"));
+  check("capture: suggest() is still called once the decision is in", h.calls.filter(([c]) => c === "suggest").length === 1, JSON.stringify(h.calls));
+  check("capture: the browser is released only after its copy is cancelled",
+    h.calls.findIndex(([c]) => c === "suggest") > h.calls.findIndex(([c]) => c === "cancel"), JSON.stringify(h.calls));
   check("capture: matching type is handed to Hydra", !!dl, JSON.stringify(h.sent));
   check("capture: the URL is forwarded", dl?.url === "https://cdn.example/pack.zip");
   check("capture: cookies ride along", dl?.cookies === "sid=abc");
@@ -178,9 +187,12 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
   await tick(4);
   const item = { id: 2, url: "https://cdn.example/page.html", filename: "page.html", mime: "text/html" };
   h.onCreated.fire(item); await tick(3);
-  h.onDetermining.fire(item, () => {}); await tick(6);
+  h.onDetermining.fire(item, () => h.calls.push(["suggest"])); await tick(6);
   check("passthrough: unlisted type is not sent to Hydra", !h.sent.some((m) => m.type === "download"));
   check("passthrough: the browser download resumes", h.calls.some(([c]) => c === "resume"));
+  // A deferred suggestion that never arrives is a download wedged in target
+  // determination: no bytes, no dialog, no error.
+  check("passthrough: the browser is released to save it itself", h.calls.filter(([c]) => c === "suggest").length === 1, JSON.stringify(h.calls));
 }
 
 // ------------------------------------------------------ 3. Alt-click bypass
@@ -188,9 +200,10 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
   const h = build({ store: { altTs: Date.now() } });
   await tick(4);
   const item = { id: 3, url: "https://cdn.example/pack.zip", filename: "pack.zip", mime: "application/zip" };
-  h.onDetermining.fire(item, () => {}); await tick(6);
+  h.onDetermining.fire(item, () => h.calls.push(["suggest"])); await tick(6);
   check("alt bypass: nothing is sent to Hydra", !h.sent.some((m) => m.type === "download"));
   check("alt bypass: the browser keeps the download", h.calls.some(([c]) => c === "resume"));
+  check("alt bypass: the browser is released to save it itself", h.calls.filter(([c]) => c === "suggest").length === 1, JSON.stringify(h.calls));
 }
 
 // ------------------------------- 3b. the Gecko stand-in for an Alt+click save
