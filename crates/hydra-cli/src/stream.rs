@@ -171,10 +171,16 @@ fn output_name(url: &str, ext: &str) -> String {
     } else {
         stem
     };
-    let name: String = name
+    // Decoded here rather than before the generic-stem test above: the escape is
+    // what the reader should not see, but `master`/`index` never carry one, and
+    // deciding on the raw segment keeps that comparison exact. Sanitizing straight
+    // afterwards is what makes decoding safe — `%2F` becomes a separator, `%00` a
+    // NUL the OS would truncate the name at, and both land in the map below.
+    let name: String = crate::url::pct_decode(name)
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
             c => c,
         })
         .collect();
@@ -1194,18 +1200,9 @@ fn to_local(http_date: &str) -> String {
 }
 
 fn file_name_of(url: &str) -> String {
-    let bare = url.split(['?', '#']).next().unwrap_or(url);
-    let path = match bare.find("://") {
-        Some(i) => {
-            let rest = &bare[i + 3..];
-            rest.find('/').map(|j| &rest[j..]).unwrap_or("")
-        }
-        None => bare,
-    };
-    path.rsplit('/')
-        .find(|p| !p.is_empty())
-        .unwrap_or("download")
-        .to_string()
+    crate::url::Url::parse(url)
+        .map(|u| u.suggested_filename())
+        .unwrap_or_else(|| "download".into())
 }
 
 /// The extension a MIME type implies, for a URL whose path has none.
@@ -1288,8 +1285,26 @@ mod tests {
 
     #[test]
     fn a_name_from_a_url_cannot_contain_path_separators() {
-        assert!(!output_name("https://e/a/b%2Fc.m3u8", "mp4").contains('/'));
+        // Decoded, `%2F` IS a separator and `%00` truncates the name where the OS
+        // stops reading it; the sanitizer has to see both.
+        assert_eq!(output_name("https://e/a/b%2Fc.m3u8", "mp4"), "b_c.mp4");
+        assert_eq!(output_name("https://e/a/b%5Cc.m3u8", "mp4"), "b_c.mp4");
+        assert_eq!(output_name("https://e/a/b%00c.m3u8", "mp4"), "b_c.mp4");
         assert_eq!(output_name("https://e/a/b:c*d.m3u8", "mp4"), "b_c_d.mp4");
+    }
+
+    #[test]
+    fn a_stream_is_saved_under_the_name_a_reader_would_type() {
+        assert_eq!(
+            output_name("https://e/a/Big%20Buck%20Bunny.m3u8", "mp4"),
+            "Big Buck Bunny.mp4"
+        );
+        // The generic-stem rule still reaches for the directory above, and that
+        // name is decoded too.
+        assert_eq!(
+            output_name("https://e/My%20Show%20S01E02/index.m3u8", "mp4"),
+            "My Show S01E02.mp4"
+        );
     }
 
     #[test]
@@ -1314,6 +1329,11 @@ mod tests {
         // Nothing in the path at all still yields something usable.
         assert_eq!(file_name_of("https://e.com/"), "download");
         assert_eq!(file_name_of("https://e.com"), "download");
+        // And the name a reader sees, not the encoded form the path carries.
+        assert_eq!(file_name_of("https://e.com/My%20File.bin"), "My File.bin");
+        // A string that is not a URL at all still has to answer with something
+        // writable rather than panic on the caller's behalf.
+        assert_eq!(file_name_of("gopher://e.com/f"), "download");
     }
 
     #[test]
