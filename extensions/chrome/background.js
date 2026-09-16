@@ -37,7 +37,33 @@ async function parkDownload(item) {
 }
 
 chrome.downloads.onCreated.addListener((item) => parkDownload(item));
+
+// The decision point — and the last moment before the browser commits to a
+// file of its own.
+//
+// Chromium asks extensions for a filename BEFORE it reserves the path and,
+// with "Ask where to save each file" on, before it puts up the "Save as"
+// dialog. Answering straight away and deciding afterwards therefore raced
+// the browser's own save UI to the screen, and lost: users saw the picker
+// open behind Hydra's New Download window on every capture. Returning true
+// is what holds target determination open until the round-trip to the app is
+// done; by then the download Hydra took is already cancelled and there is
+// nothing left for the dialog to ask about.
+//
+// `suggest` is still called exactly once on every path, as the API requires:
+// on a declined download it releases the browser to save it normally, and on
+// one Hydra took it lands on a cancelled item and does nothing. Skipping it
+// to avoid that no-op would leave a download stuck in target determination
+// for good on any path where the cancel did not take.
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  suggest();
-  decideCapture(item, true);
+  decideCapture(item, true)
+    .catch((e) => console.debug(`hydra: capture decision failed — ${e}`))
+    .finally(() => {
+      try {
+        suggest();
+      } catch {
+        // The item is gone: Hydra took it and the callback outlived it.
+      }
+    });
+  return true;
 });

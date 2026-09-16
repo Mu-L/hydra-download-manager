@@ -157,6 +157,14 @@ id?, error?}`.
   take it. Pausing is reversible where cancelling is not: small files cannot
   finish before the round-trip, and signed one-shot URLs never need
   re-requesting.
+- **The filename suggestion is deferred**: the `onDeterminingFilename`
+  listener returns `true` and calls `suggest()` only after the decision.
+  Chromium reserves the path and puts up its own **"Save as" dialog** in the
+  steps straight after this listener answers, so answering it immediately
+  raced that dialog onto the screen next to Hydra's New Download window for
+  everyone with *Ask where to save each file* enabled. `suggest()` is still
+  called exactly once on every path — releasing a declined download, and
+  harmlessly landing on a cancelled one.
 - **Single instance**: launching hydra-gui while another instance runs now
   just surfaces the running instance's window and exits — the extension
   always talks to the instance that owns `ipc.json`.
