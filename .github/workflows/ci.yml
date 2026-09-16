@@ -83,8 +83,12 @@ jobs:
       - name: Set up Rust cache
         uses: Swatinem/rust-cache@v2
 
+      # --locked because this is the first job to resolve the whole workspace:
+      # a manifest version bumped without regenerating Cargo.lock fails here,
+      # on the pull request, instead of in publish-crates.yml after the merge,
+      # where `cargo publish --locked` refuses to run at all.
       - name: Run clippy checks
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     name: Test
