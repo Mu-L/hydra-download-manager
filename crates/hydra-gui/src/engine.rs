@@ -4044,7 +4044,12 @@ pub fn drm_refusal(system: &str) -> String {
 /// Where a recording re-reads its segment list from.
 enum LiveSource {
     /// A media playlist, re-read for new `#EXT-X-MEDIA-SEQUENCE` entries.
-    Hls { url: String },
+    /// `audio_url` is the `#EXT-X-MEDIA` rendition the variant plays with,
+    /// when the sound is a playlist of its own.
+    Hls {
+        url: String,
+        audio_url: Option<String>,
+    },
     /// A dynamic MPD, re-read for new `$Number$` entries. The Representation
     /// ids are pinned so a refresh cannot silently switch rendition.
     Dash {
@@ -4062,6 +4067,37 @@ struct Window {
     kind: hya_stream::hls::Segments,
 }
 
+impl Window {
+    fn of(pl: &hya_stream::hls::Playlist) -> Window {
+        Window {
+            init: pl.init.clone(),
+            segments: pl.timed_window(),
+            kind: pl.segments_kind.unwrap_or(hya_stream::hls::Segments::Ts),
+        }
+    }
+}
+
+/// Fetch a playlist and parse it against the URL it actually came from.
+async fn hls_playlist(
+    connector: &Arc<TlsCapableConnector>,
+    url: &str,
+    spec: &StreamSpec,
+    route: &Route,
+) -> Result<hya_stream::hls::Playlist, String> {
+    let body = stream_get(
+        connector,
+        url,
+        spec.cookies.as_deref(),
+        spec.referer.as_deref(),
+        &spec.user_agent,
+        route,
+        hya_stream::hls::playlist_cap(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(hya_stream::hls::parse(&String::from_utf8_lossy(&body), url))
+}
+
 /// Re-read the source and report each track's current window, whether the
 /// stream has ended, and how long to wait before asking again.
 async fn live_windows(
@@ -4077,7 +4113,7 @@ async fn live_windows(
     );
     let cap = hya_stream::hls::playlist_cap();
     match source {
-        LiveSource::Hls { url } => {
+        LiveSource::Hls { url, audio_url } => {
             let body = stream_get(connector, url, ck, rf, ua, route, cap)
                 .await
                 .map_err(|e| format!("could not re-read the playlist: {e}"))?;
@@ -4089,15 +4125,17 @@ async fn live_windows(
                 return Err(format!("{enc} encrypted streams are not supported yet"));
             }
             let refresh = pl.refresh_after();
-            Ok((
-                vec![Window {
-                    init: pl.init.clone(),
-                    segments: pl.timed_window(),
-                    kind: pl.segments_kind.unwrap_or(hya_stream::hls::Segments::Ts),
-                }],
-                pl.ended,
-                refresh,
-            ))
+            let mut windows = vec![Window::of(&pl)];
+            if let Some(au) = audio_url {
+                // The track count was fixed when the recording started, so a
+                // window that cannot be read now has to stop the recording
+                // rather than quietly leave the audio file behind the video.
+                let apl = hls_playlist(connector, au, spec, route)
+                    .await
+                    .map_err(|e| format!("could not re-read the audio playlist: {e}"))?;
+                windows.push(Window::of(&apl));
+            }
+            Ok((windows, pl.ended, refresh))
         }
         LiveSource::Dash {
             url,
@@ -4177,7 +4215,7 @@ async fn record_live(
     };
 
     let tracks = match &source {
-        LiveSource::Hls { .. } => 1,
+        LiveSource::Hls { audio_url, .. } => 1 + usize::from(audio_url.is_some()),
         LiveSource::Dash { audio_id, .. } => 1 + usize::from(audio_id.is_some()),
     };
     if let Some(dir) = std::path::Path::new(&spec.temp_path).parent() {
@@ -4573,6 +4611,7 @@ async fn record_live(
             std::path::Path::new(&parts[0]),
             std::path::Path::new(&parts[1]),
             final_p,
+            kinds[1],
         )
         .map_err(|e| {
             let v = final_p.with_extension("video.mp4");
@@ -4856,6 +4895,9 @@ async fn run_stream(
         let mut playlist = hya_stream::hls::parse(&text, &base);
         let mut bandwidth = spec.bandwidth;
         let mut variant_url = base.clone();
+        // Set from the master, before `playlist` becomes the media playlist:
+        // once that happens the rendition groups are gone.
+        let mut audio_url: Option<String> = None;
         if playlist.is_master() {
             let Some(chosen) = hya_stream::hls::choose(
                 &playlist.variants,
@@ -4880,6 +4922,14 @@ async fn run_stream(
                 chosen.bandwidth.unwrap_or(0) / 1000,
                 chosen.url
             ));
+            if let Some(rendition) = playlist.audio_for(&chosen) {
+                crate::log::info(&format!(
+                    "#{id} alternate audio \"{}\" ({})",
+                    rendition.name.as_deref().unwrap_or("-"),
+                    rendition.language.as_deref().unwrap_or("-")
+                ));
+                audio_url = rendition.url.clone();
+            }
             let body = match stream_get(&connector, &chosen.url, ck, rf, ua, &route, cap).await {
                 Ok(b) => b,
                 Err(e) => return fail(format!("could not read the variant playlist: {e}")),
@@ -4900,18 +4950,27 @@ async fn run_stream(
                 "#{id} recording live hls from {}",
                 crate::log::redact(&variant_url)
             ));
-            let primed = Some((
-                vec![Window {
-                    init: playlist.init.clone(),
-                    segments: playlist.timed_window(),
-                    kind: playlist
-                        .segments_kind
-                        .unwrap_or(hya_stream::hls::Segments::Ts),
-                }],
-                playlist.ended,
-                playlist.refresh_after(),
-            ));
-            let source = LiveSource::Hls { url: variant_url };
+            let mut windows = vec![Window::of(&playlist)];
+            if let Some(au) = &audio_url {
+                // Primed here rather than left to the first refresh: the
+                // track count is fixed from this point, and a second track
+                // that starts a window late is a recording whose sound is
+                // permanently behind its picture.
+                match hls_playlist(&connector, au, &spec, &route).await {
+                    Ok(apl) => windows.push(Window::of(&apl)),
+                    Err(e) => {
+                        crate::log::warn(&format!(
+                            "#{id} alternate audio unusable, recording video only: {e}"
+                        ));
+                        audio_url = None;
+                    }
+                }
+            }
+            let primed = Some((windows, playlist.ended, playlist.refresh_after()));
+            let source = LiveSource::Hls {
+                url: variant_url,
+                audio_url,
+            };
             return record_live(
                 &spec,
                 source,
@@ -4925,9 +4984,36 @@ async fn run_stream(
             )
             .await;
         }
-        match hya_stream::hls::Plan::build(&playlist, bandwidth) {
-            Ok(p) => Assembly::Single(p),
+        let vplan = match hya_stream::hls::Plan::build(&playlist, bandwidth) {
+            Ok(p) => p,
             Err(refusal) => return fail(refusal.to_string()),
+        };
+        // A variant that names an audio rendition group carries no sound of
+        // its own; muxing the rendition back in is what keeps the finished
+        // file from being silent.
+        match &audio_url {
+            Some(u) => match hls_playlist(&connector, u, &spec, &route).await {
+                Ok(apl) => match hya_stream::hls::Plan::build(&apl, None) {
+                    Ok(aplan) => {
+                        crate::log::info(&format!(
+                            "#{id} hls audio: {} segments",
+                            aplan.segments.len()
+                        ));
+                        Assembly::VideoAudio(vplan, aplan)
+                    }
+                    // Audio that will not resolve is not a reason to lose
+                    // the video.
+                    Err(e) => {
+                        crate::log::warn(&format!("#{id} hls audio unusable: {e}"));
+                        Assembly::Single(vplan)
+                    }
+                },
+                Err(e) => {
+                    crate::log::warn(&format!("#{id} could not read the audio playlist: {e}"));
+                    Assembly::Single(vplan)
+                }
+            },
+            None => Assembly::Single(vplan),
         }
     };
 
@@ -5161,7 +5247,7 @@ async fn run_stream(
     }
 
     let result = match (&assembly, parts.as_slice()) {
-        (Assembly::VideoAudio(..), [video, audio]) => {
+        (Assembly::VideoAudio(_, aplan), [video, audio]) => {
             ev(Event::Status {
                 id,
                 line: crate::i18n::tr("Combining video and audio..."),
@@ -5170,6 +5256,7 @@ async fn run_stream(
                 std::path::Path::new(video),
                 std::path::Path::new(audio),
                 final_p,
+                aplan.kind,
             )
             .map_err(|e| {
                 // Both tracks are playable on their own, so they are kept and
@@ -5956,6 +6043,124 @@ mod stream_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[tokio::test]
+    async fn hls_alternate_audio_is_fetched_alongside_video_rather_than_dropped() {
+        let dir = tmp("hls-av");
+        // The shape X serves: the variant is video only and the sound is a
+        // rendition group it points at. Before this was read, the finished
+        // file was the video track alone — a download that looked successful
+        // and played silent.
+        let (base, seen) = serve(vec![
+            (
+                "/master.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n",
+                    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",",
+                    "DEFAULT=YES,AUTOSELECT=YES,URI=\"a/en.m3u8\"\n",
+                    "#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720,",
+                    "CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"aac\"\n",
+                    "v/index.m3u8\n"
+                )
+                .into(),
+            ),
+            (
+                "/v/index.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"vi.mp4\"\n",
+                    "#EXTINF:4.0,\nv0.m4s\n#EXT-X-ENDLIST\n"
+                )
+                .into(),
+            ),
+            (
+                "/a/en.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"ai.mp4\"\n",
+                    "#EXTINF:4.0,\na0.m4s\n#EXT-X-ENDLIST\n"
+                )
+                .into(),
+            ),
+            ("/v/vi.mp4".into(), b"VI".to_vec()),
+            ("/v/v0.m4s".into(), b"VVVV".to_vec()),
+            ("/a/ai.mp4".into(), b"AI".to_vec()),
+            ("/a/a0.m4s".into(), b"AAAA".to_vec()),
+        ]);
+        let spec = spec_for(12, format!("{base}/master.m3u8"), &dir, "out.mp4");
+        let (_, failure) = drive(spec.clone(), Arc::new(AtomicBool::new(false))).await;
+
+        let reqs = seen.lock().unwrap().clone();
+        for want in ["/a/en.m3u8", "/a/ai.mp4", "/a/a0.m4s"] {
+            assert!(
+                reqs.iter().any(|r| r.starts_with(want)),
+                "the audio rendition was skipped: {reqs:?}"
+            );
+        }
+        // Exactly as the DASH pair behaves: with no ffmpeg the answer is a
+        // plain explanation and both tracks are kept; with ffmpeg it is
+        // invoked, and these four-byte fixtures are not real media so it may
+        // still refuse them.
+        match hya_stream::hls::ffmpeg() {
+            None => {
+                let msg = failure.expect("combining without ffmpeg should not claim success");
+                assert!(msg.contains("ffmpeg"), "unhelpful message: {msg}");
+                assert!(dir.join("out.video.mp4").exists(), "video was thrown away");
+                assert!(dir.join("out.audio.m4a").exists(), "audio was thrown away");
+            }
+            Some(_) => {
+                if let Some(msg) = failure {
+                    assert!(msg.contains("ffmpeg"), "unexpected failure: {msg}");
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The master half of the split-audio shape, pointing at `audio`.
+    fn split_audio_master(audio: &str) -> Vec<u8> {
+        format!(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",DEFAULT=YES,URI=\"{audio}\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"aac\"\n\
+             v/index.m3u8\n"
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn audio_that_will_not_resolve_leaves_the_video_intact() {
+        let dir = tmp("hls-badaudio");
+        // Two ways the rendition can be useless: the playlist is not there,
+        // and the playlist is there but lists nothing. Neither is a reason to
+        // throw away a video that downloaded perfectly well.
+        let (base, _) = serve(vec![
+            ("/gone.m3u8".into(), split_audio_master("a/gone.m3u8")),
+            ("/empty.m3u8".into(), split_audio_master("a/empty.m3u8")),
+            (
+                "/a/empty.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-ENDLIST\n".into(),
+            ),
+            (
+                "/v/index.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nv0.ts\n#EXT-X-ENDLIST\n".into(),
+            ),
+            ("/v/v0.ts".into(), b"VVVV".to_vec()),
+        ]);
+        for (n, master) in ["gone", "empty"].iter().enumerate() {
+            let spec = StreamSpec {
+                container: "TS".into(),
+                ..spec_for(
+                    30 + n as DlId,
+                    format!("{base}/{master}.m3u8"),
+                    &dir,
+                    &format!("{master}.ts"),
+                )
+            };
+            let (_, failure) = drive(spec.clone(), Arc::new(AtomicBool::new(false))).await;
+            assert_eq!(failure, None, "{master}: audio cost us the video");
+            assert_eq!(std::fs::read(&spec.final_path).unwrap(), b"VVVV");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A live media playlist as it looks at one moment: a sliding window.
     /// A six-segment window, two seconds each, for the tests that care about
     /// how a window is fetched rather than what is in it.
@@ -6120,6 +6325,94 @@ mod stream_tests {
                 "{seg} was fetched more than once: {reqs:?}"
             );
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_live_hls_recording_follows_the_audio_rendition_too() {
+        let dir = tmp("live-hls-av");
+        // Two sliding windows, one per track. The audio playlist has to be
+        // primed with the video's, not picked up on the next refresh: a
+        // track that starts a window late is a recording whose sound never
+        // catches up with its picture.
+        let (base, seen) = serve_sequence(vec![
+            (
+                "/master.m3u8".into(),
+                vec![concat!(
+                    "#EXTM3U\n",
+                    "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",",
+                    "DEFAULT=YES,URI=\"a/en.m3u8\"\n",
+                    "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO=\"aac\"\n",
+                    "v/index.m3u8\n"
+                )
+                .into()],
+            ),
+            (
+                "/v/index.m3u8".into(),
+                vec![
+                    live_playlist(10, &["v0.ts"], false),
+                    live_playlist(11, &["v1.ts"], true),
+                ],
+            ),
+            (
+                "/a/en.m3u8".into(),
+                vec![
+                    live_playlist(10, &["a0.ts"], false),
+                    live_playlist(11, &["a1.ts"], true),
+                ],
+            ),
+            ("/v/v0.ts".into(), vec![b"VVVV".to_vec()]),
+            ("/v/v1.ts".into(), vec![b"WWWW".to_vec()]),
+            ("/a/a0.ts".into(), vec![b"AAAA".to_vec()]),
+            ("/a/a1.ts".into(), vec![b"BBBB".to_vec()]),
+        ]);
+        let spec = StreamSpec {
+            container: "TS".into(),
+            ..spec_for(21, format!("{base}/master.m3u8"), &dir, "live.ts")
+        };
+        let (_, failure) = drive(spec.clone(), Arc::new(AtomicBool::new(false))).await;
+
+        let reqs = seen.lock().unwrap().clone();
+        for seg in ["/a/a0.ts", "/a/a1.ts", "/v/v0.ts", "/v/v1.ts"] {
+            assert_eq!(
+                reqs.iter().filter(|r| r.starts_with(seg)).count(),
+                1,
+                "{seg} was not recorded exactly once: {reqs:?}"
+            );
+        }
+        // The combining step is ffmpeg's, and these four-byte fixtures are
+        // not media — what this test pins is that both tracks were recorded.
+        if let Some(msg) = failure {
+            assert!(msg.contains("ffmpeg"), "unexpected failure: {msg}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_recording_carries_on_when_the_audio_rendition_is_unreachable() {
+        let dir = tmp("live-hls-noaudio");
+        let (base, _) = serve_sequence(vec![
+            (
+                "/master.m3u8".into(),
+                vec![split_audio_master("a/gone.m3u8")],
+            ),
+            (
+                "/v/index.m3u8".into(),
+                vec![
+                    live_playlist(10, &["v0.ts"], false),
+                    live_playlist(11, &["v1.ts"], true),
+                ],
+            ),
+            ("/v/v0.ts".into(), vec![b"VVVV".to_vec()]),
+            ("/v/v1.ts".into(), vec![b"WWWW".to_vec()]),
+        ]);
+        let spec = StreamSpec {
+            container: "TS".into(),
+            ..spec_for(22, format!("{base}/master.m3u8"), &dir, "live.ts")
+        };
+        let (_, failure) = drive(spec.clone(), Arc::new(AtomicBool::new(false))).await;
+        assert_eq!(failure, None, "a missing rendition stopped the recording");
+        assert_eq!(std::fs::read(&spec.final_path).unwrap(), b"VVVVWWWW");
         std::fs::remove_dir_all(&dir).ok();
     }
 
