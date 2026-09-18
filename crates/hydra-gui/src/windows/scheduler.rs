@@ -25,6 +25,63 @@ const LIST_W: f32 = 240.0;
 /// 18 px, and at the ordinary dialog gap the ticks read as one dense block.
 const ROW_GAP: f32 = 16.0;
 
+/// Spin-arrow geometry: the pair stacks to the height of the text input it
+/// sits against — `FONT_SIZE` plus the input's own padding — so the box and
+/// its arrows read as one control.
+const ARROW_W: f32 = 16.0;
+const ARROW_H: f32 = 13.0;
+
+/// One step of a number field, or `None` at the end of its range — an arrow
+/// with nothing to move to is disabled rather than firing a change that
+/// clamps straight back.
+fn step(value: u32, up: bool, range: &std::ops::RangeInclusive<u32>) -> Option<u32> {
+    let next = if up {
+        value.checked_add(1)?
+    } else {
+        value.checked_sub(1)?
+    };
+    range.contains(&next).then_some(next)
+}
+
+/// A number field with the spin arrows beside it. Typing still works; the
+/// arrows are there because the field only takes text that parses, so a box
+/// cleared to retype keeps showing the old number and a value cannot be
+/// nudged without retyping it whole.
+fn spin<'a>(
+    value: u32,
+    range: std::ops::RangeInclusive<u32>,
+    field: fn(String) -> SchField,
+    width: f32,
+) -> El<'a> {
+    let arrow = |glyph: &'static str, next: Option<u32>| -> El<'a> {
+        let mut b =
+            button(container(text(glyph).size(theme::FONT_SIZE - 5.0)).center(Length::Fill))
+                .padding(0)
+                .width(ARROW_W)
+                .height(ARROW_H)
+                .style(theme::btn);
+        if let Some(n) = next {
+            b = b.on_press(s(field(n.to_string())));
+        }
+        b.into()
+    };
+    row![
+        text_input("", &value.to_string())
+            .on_input(move |v| s(field(v)))
+            .size(theme::FONT_SIZE)
+            .style(theme::input)
+            .width(width),
+        column![
+            arrow("▲", step(value, true, &range)),
+            arrow("▼", step(value, false, &range)),
+        ]
+        .spacing(1),
+    ]
+    .spacing(2)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
 /// A dialog button that takes the width it is given rather than the fixed
 /// dialog-button width, for a row sized to something else.
 fn wide_btn<'a>(label: String, msg: Option<Message>) -> El<'a> {
@@ -207,11 +264,12 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
                 .size(15.0)
                 .text_size(theme::FONT_SIZE)
                 .style(theme::check),
-            text_input("10", &sc.retries.to_string())
-                .on_input(|v| s(SchField::Retries(v)))
-                .size(theme::FONT_SIZE)
-                .style(theme::input)
-                .width(70.0),
+            spin(
+                sc.retries,
+                crate::model::QUEUE_RETRIES,
+                SchField::Retries,
+                70.0,
+            ),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center),
@@ -356,11 +414,12 @@ fn files_tab(app: &App) -> El<'_> {
     column![
         row![
             text(tr("Download")).size(theme::FONT_SIZE),
-            text_input("4", &files_at_once.to_string())
-                .on_input(|v| s(SchField::FilesAtOnce(v)))
-                .size(theme::FONT_SIZE)
-                .style(theme::input)
-                .width(50.0),
+            spin(
+                files_at_once,
+                crate::model::FILES_AT_ONCE,
+                SchField::FilesAtOnce,
+                50.0,
+            ),
             text(tr("files at the same time")).size(theme::FONT_SIZE),
         ]
         .spacing(8)
@@ -429,6 +488,7 @@ pub fn view(app: &App) -> El<'_> {
             iced::widget::space::horizontal(),
             dlg_btn_primary(tr("Start now"), Some(Message::SchStartNow)),
             dlg_btn(tr("Stop"), Some(Message::SchStop)),
+            dlg_btn(tr("Save"), Some(Message::SchSave)),
             dlg_btn(
                 tr("Close"),
                 app.win_of(WinKind::Scheduler).map(Message::CloseThis)
@@ -451,4 +511,37 @@ pub fn view(app: &App) -> El<'_> {
     .height(Length::Fill)
     .style(theme::window)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_arrow_at_the_end_of_its_range_has_nowhere_to_go() {
+        let r = crate::model::FILES_AT_ONCE;
+        assert_eq!(step(4, true, &r), Some(5));
+        assert_eq!(step(4, false, &r), Some(3));
+        assert_eq!(step(*r.end(), true, &r), None);
+        assert_eq!(step(*r.start(), false, &r), None);
+    }
+
+    /// A config file written by hand can hold a number below the field's
+    /// floor. The up arrow is then the way out of it, not one more control
+    /// that does nothing.
+    #[test]
+    fn a_value_under_the_range_can_still_be_stepped_into_it() {
+        let r = crate::model::QUEUE_RETRIES;
+        assert_eq!(step(0, true, &r), Some(1));
+        assert_eq!(step(0, false, &r), None);
+    }
+
+    /// An arrow with no `on_press` is a different widget tree from one with
+    /// it, and a tree that fails to build takes the window down with it.
+    #[test]
+    fn the_spin_box_builds_at_both_ends_of_its_range() {
+        let r = crate::model::FILES_AT_ONCE;
+        let _floor: El<'_> = spin(*r.start(), r.clone(), SchField::FilesAtOnce, 50.0);
+        let _ceiling: El<'_> = spin(*r.end(), r, SchField::FilesAtOnce, 50.0);
+    }
 }
