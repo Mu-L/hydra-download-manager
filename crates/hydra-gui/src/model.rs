@@ -1190,6 +1190,19 @@ impl Settings {
     }
 }
 
+/// What the Scheduler's two number fields accept, whether they are typed
+/// into or stepped with their arrows. The ceiling on simultaneous files is
+/// the queue's own: past a handful the connections compete for the same
+/// link instead of filling it. A retry budget of zero would read as "retry,
+/// but never" — the checkbox beside it is what turns retries off.
+pub const FILES_AT_ONCE: std::ops::RangeInclusive<u32> = 1..=16;
+pub const QUEUE_RETRIES: std::ops::RangeInclusive<u32> = 1..=99;
+
+/// A typed number pinned into the range its field accepts.
+pub fn clamp_to(v: u32, range: std::ops::RangeInclusive<u32>) -> u32 {
+    v.clamp(*range.start(), *range.end())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Schedule {

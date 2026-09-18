@@ -1288,6 +1288,7 @@ pub enum Message {
     SchField(SchField),
     SchStartNow,
     SchStop,
+    SchSave,
     SchNewQueue,
     SchDeleteQueue,
     SchDragStart(DlId),
@@ -5885,6 +5886,15 @@ impl App {
                 self.set_queue_running(&name, false);
                 Task::none()
             }
+            Message::SchSave => {
+                // The fields write through as they are edited, so there is
+                // nothing here to commit — what this does is put the queue on
+                // disk now instead of at the next tick, and close the window,
+                // which is the acknowledgement a dialog that saves as you
+                // type otherwise never gives.
+                self.flush_saves();
+                self.close_window(WinKind::Scheduler)
+            }
             Message::SchNewQueue => {
                 let n = self.cfg.queues.len() + 1;
                 let name = format!("{} {n}", i18n::tr("Queue"));
@@ -7296,8 +7306,8 @@ impl App {
             SchField::StopAt(v) => s.stop_at = v,
             SchField::RetriesEnabled(b) => s.retries_enabled = b,
             SchField::Retries(v) => {
-                if let Ok(n) = v.parse() {
-                    s.retries = n;
+                if let Ok(n) = v.parse::<u32>() {
+                    s.retries = crate::model::clamp_to(n, crate::model::QUEUE_RETRIES);
                 }
             }
             SchField::OpenFileEnabled(b) => s.open_file_enabled = b,
@@ -7307,7 +7317,7 @@ impl App {
             SchField::ShutdownAction(a) => s.shutdown_action = a,
             SchField::FilesAtOnce(v) => {
                 if let Ok(n) = v.parse::<u32>() {
-                    q.files_at_once = n.clamp(1, 16);
+                    q.files_at_once = crate::model::clamp_to(n, crate::model::FILES_AT_ONCE);
                 }
             }
         }
@@ -9723,6 +9733,44 @@ mod tests {
         assert_eq!(d.error, None);
         assert_eq!(d.part_path, None);
         assert_eq!(d.held, vec![(0, 4095)], "4 KiB already fetched is 4 KiB");
+    }
+
+    /// The spin arrows send their step through the same field message a
+    /// typed digit takes, so the range has to be enforced where the value
+    /// lands rather than beside the arrows: a held arrow, a pasted number and
+    /// a hand-edited config all arrive here.
+    #[test]
+    fn a_queue_number_settles_inside_the_range_its_field_offers() {
+        let mut app = App::default();
+        app.cfg.queues = crate::model::default_queues();
+        app.sch.queue = app.cfg.queues[0].name.clone();
+        let files = crate::model::FILES_AT_ONCE;
+        let retries = crate::model::QUEUE_RETRIES;
+
+        let _ = app.update(Message::SchField(SchField::FilesAtOnce("99".into())));
+        assert_eq!(app.cfg.queues[0].files_at_once, *files.end());
+        let _ = app.update(Message::SchField(SchField::FilesAtOnce("0".into())));
+        assert_eq!(app.cfg.queues[0].files_at_once, *files.start());
+
+        // Turning retries off is the checkbox's job; a budget of zero here
+        // would be a queue that retries, but never.
+        let _ = app.update(Message::SchField(SchField::Retries("0".into())));
+        assert_eq!(app.cfg.queues[0].schedule.retries, *retries.start());
+        let _ = app.update(Message::SchField(SchField::Retries("500".into())));
+        assert_eq!(app.cfg.queues[0].schedule.retries, *retries.end());
+    }
+
+    /// Save is the acknowledgement a dialog that writes through as you type
+    /// otherwise never gives: the press puts the queue on disk and takes the
+    /// window away. Nothing is pending on a freshly built app, so this asserts
+    /// the dismissal without putting a config file anywhere.
+    #[test]
+    fn saving_the_scheduler_dismisses_it() {
+        let mut app = App::default();
+        app.windows
+            .insert(iced::window::Id::unique(), WinKind::Scheduler);
+        let _ = app.update(Message::SchSave);
+        assert!(app.win_of(WinKind::Scheduler).is_none());
     }
 
     #[cfg(target_os = "linux")]
