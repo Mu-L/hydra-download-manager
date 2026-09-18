@@ -364,7 +364,6 @@ pub fn ensure_registered(portable_capture: bool) {
             #[cfg(target_os = "windows")]
             {
                 register_windows(&host);
-                return;
             }
 
             #[cfg(not(target_os = "windows"))]

@@ -31,6 +31,7 @@ mod macos_surface;
 mod menubus;
 mod model;
 mod nmhost;
+mod picker;
 mod proxy;
 mod scan;
 mod sounds;

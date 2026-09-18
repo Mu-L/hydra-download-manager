@@ -17,6 +17,8 @@
 //! `/select,` with a space in it, an unencoded `file://` URI) be checked
 //! without a file-manager window opening on a test runner.
 
+use iced::window;
+use iced::Task;
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -121,32 +123,42 @@ fn file_uri(path: &Path) -> String {
 /// Ask the user which application should open `path`, and open it with that
 /// one — without changing what the file type opens with by default.
 ///
-/// Windows and macOS each ship a system chooser for exactly this, so those
-/// use it. Linux has no such dialog to call, so there the application is
-/// picked with the same native file picker "Browse..." uses; that picker
-/// blocks the caller, like every other one in this app.
-pub fn open_with(path: &Path) {
+/// Windows and macOS each ship a system chooser for exactly this, and it is
+/// a process to start: there is nothing left to wait for, so the [`Task`] is
+/// empty and `owner` goes unused.
+#[cfg(not(target_os = "linux"))]
+pub fn open_with<T: Send + 'static>(owner: Option<window::Id>, path: &Path) -> Task<T> {
+    let _ = owner;
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         spawn(open_with_command(path));
     }
-    #[cfg(target_os = "linux")]
-    {
-        // Applications live in .desktop files here, and the desktops differ
-        // on whether they will open one at all, so the picker starts where
-        // they are kept and takes either shape.
-        let picked = rfd::FileDialog::new()
-            .set_title(crate::i18n::tr("Open with..."))
-            .set_directory("/usr/share/applications")
-            .pick_file();
-        if let Some(app) = picked {
-            spawn(open_with_command(path, &app));
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = path;
     }
+    Task::none()
+}
+
+/// Ask the user which application should open `path`, and open it with that
+/// one — without changing what the file type opens with by default.
+///
+/// Linux ships no application chooser to call, so the application is chosen
+/// with the same native panel "Browse..." uses, which is why this one has a
+/// [`Task`] to hand back. Applications live in .desktop files, and the
+/// desktops differ on whether they will launch one at all, so the panel
+/// starts where they are kept and takes either shape.
+#[cfg(target_os = "linux")]
+pub fn open_with<T: Send + 'static>(owner: Option<window::Id>, path: &Path) -> Task<T> {
+    let ask = crate::picker::Ask {
+        title: Some(crate::i18n::tr("Open with...")),
+        ..crate::picker::Ask::in_dir("/usr/share/applications")
+    };
+    let path = path.to_path_buf();
+    crate::picker::file(owner, ask).and_then(move |app| {
+        spawn(open_with_command(&path, &app));
+        Task::none()
+    })
 }
 
 /// The Windows "Open with" dialog. Shipped with the shell, and the only way

@@ -8,6 +8,7 @@ use crate::model::{
     self, categorize, CategoryDef, Column, ColumnPref, ConfigFile, DlId, DlQuota, DlState,
     DownloadItem, PowerAction, ProxyChoice, ProxyMode, ProxyPick, SiteLogin, StateFile, ThemeMode,
 };
+use crate::picker::{self, Ask};
 use crate::sounds;
 use crate::{fmt, i18n};
 use iced::window;
@@ -1202,7 +1203,11 @@ pub enum Message {
     FiSaveAs(String),
     FiBgToggle(bool),
     FiBrowse,
-    FiPathPicked(Option<String>),
+    /// The Save As path chosen for download `.0`. Carries the download
+    /// because the panel no longer freezes the app while it is up: a browser
+    /// capture arriving in the meantime supersedes the File Info dialog, and
+    /// the late answer must not land on the one that replaced it.
+    FiPathPicked(DlId, String),
     FiDescription(String),
     FiRemember(bool),
     FiUrl(String),
@@ -1313,6 +1318,7 @@ pub enum Message {
     BatchHideHtml(bool),
     BatchHideDups(bool),
     BatchBrowseDir,
+    BatchDirPicked(String),
     // generic dialog buttons
     ConfirmYes,
     ConfirmRemoveFile(bool),
@@ -1323,6 +1329,11 @@ pub enum Message {
     DupResume,
     DupOpen,
     DupNew,
+    /// Where the "Move/Rename..." panel said the finished file should go.
+    MoveRenameTo(DlId, std::path::PathBuf),
+    /// The folder the user chose after a download failed for want of write
+    /// permission on the one it had.
+    SaveDirRegranted(DlId, std::path::PathBuf),
     CloseThis(window::Id),
 }
 
@@ -1406,6 +1417,7 @@ pub enum OptField {
     LoginRemove,
     Sound(usize, bool),
     SoundBrowse(usize),
+    SoundPicked(usize, String),
     SoundPlay(usize),
 }
 
@@ -1872,14 +1884,20 @@ impl App {
         if d.state != DlState::Complete || !from.is_file() {
             return Task::none();
         }
-        let mut dlg = rfd::FileDialog::new().set_file_name(&d.file_name);
-        if !d.save_dir.is_empty() {
-            dlg = dlg.set_directory(&d.save_dir);
-        }
-        // The native dialog asks about overwriting on its own, which is why
+        // The native panel asks about overwriting on its own, which is why
         // the save picker is the right one here rather than a folder picker
         // plus a name box: moving and renaming are one gesture in it.
-        let Some(to) = dlg.save_file() else {
+        let ask = Ask {
+            file_name: Some(d.file_name.clone()),
+            ..Ask::in_dir(&d.save_dir)
+        };
+        picker::save(self.win_of(WinKind::Main), ask)
+            .and_then(move |to| Task::done(Message::MoveRenameTo(id, to)))
+    }
+
+    /// Carry out the move the "Move/Rename..." panel asked for.
+    fn move_rename_to(&mut self, id: DlId, to: std::path::PathBuf) -> Task<Message> {
+        let Some(from) = self.item(id).map(|d| d.full_path()) else {
             return Task::none();
         };
         if to == from {
@@ -3760,30 +3778,6 @@ impl App {
                         }
                     }
                 }
-                if permission_denied {
-                    // OS-native consent instead of sudo or manual settings:
-                    // a folder chosen through the system panel is implicitly
-                    // granted, so offer the picker and resume right there.
-                    let start_dir = self.item(id).map(|d| d.save_dir.clone());
-                    let mut dlg = rfd::FileDialog::new();
-                    if let Some(dir) = &start_dir {
-                        dlg = dlg.set_directory(dir);
-                    }
-                    if let Some(picked) = dlg.pick_folder() {
-                        let picked = picked.to_string_lossy().into_owned();
-                        crate::log::info(&format!("#{id} folder re-granted: {picked}"));
-                        if let Some(d) = self.item_mut(id) {
-                            d.save_dir = picked;
-                            d.part_path = None;
-                            d.state = DlState::Paused;
-                            if !held.is_empty() {
-                                d.held = held.clone();
-                            }
-                        }
-                        self.save_state();
-                        return self.start_download(id, false);
-                    }
-                }
                 if let Some(d) = self.item_mut(id) {
                     d.state = DlState::Error;
                     if !held.is_empty() {
@@ -3805,9 +3799,49 @@ impl App {
                     );
                 }
                 self.save_state();
-                self.queue_tick()
+                let tick = self.queue_tick();
+                if !permission_denied {
+                    return tick;
+                }
+                // OS-native consent instead of sudo or manual settings: a
+                // folder chosen through the system panel is implicitly
+                // granted, so offer the picker and resume right there. The
+                // row carries the failure while the panel is up, because the
+                // panel no longer holds the event loop and the user can see
+                // the list behind it.
+                let start = self
+                    .item(id)
+                    .map(|d| d.save_dir.clone())
+                    .unwrap_or_default();
+                let owner = self
+                    .win_of(WinKind::Progress(id))
+                    .or_else(|| self.win_of(WinKind::FileInfo(id)))
+                    .or_else(|| self.win_of(WinKind::Main));
+                let ask = Ask::in_dir(&start);
+                let regrant = picker::folder(owner, ask)
+                    .and_then(move |dir| Task::done(Message::SaveDirRegranted(id, dir)));
+                Task::batch([tick, regrant])
             }
         }
+    }
+
+    /// File `id` under the folder the permission panel granted, ready to be
+    /// started again.
+    ///
+    /// The transfer keeps the bytes it already has: `held` was written to the
+    /// item when the failure came in, and only the `.part` path is dropped,
+    /// because it named a file under the folder that could not be written.
+    fn save_dir_regranted(&mut self, id: DlId, dir: std::path::PathBuf) {
+        let dir = picker::into_string(dir);
+        crate::log::info(&format!("#{id} folder re-granted: {dir}"));
+        let Some(d) = self.item_mut(id) else {
+            return;
+        };
+        d.save_dir = dir;
+        d.part_path = None;
+        d.state = DlState::Paused;
+        d.error = None;
+        self.save_state();
     }
 
     // -------------------------------------------------------------- update
@@ -5069,18 +5103,22 @@ impl App {
                 Task::none()
             }
             Message::FiBrowse => {
-                let mut dlg = rfd::FileDialog::new().set_file_name(&self.file_info.file_name);
-                if !self.file_info.save_dir.is_empty() {
-                    dlg = dlg.set_directory(&self.file_info.save_dir);
-                }
-                let path = dlg.save_file().map(|p| p.to_string_lossy().into_owned());
-                self.update(Message::FiPathPicked(path))
+                let dl = self.file_info.dl;
+                picker::save(
+                    self.win_of(WinKind::FileInfo(dl)),
+                    Ask {
+                        file_name: Some(self.file_info.file_name.clone()),
+                        ..Ask::in_dir(&self.file_info.save_dir)
+                    },
+                )
+                .and_then(move |p| Task::done(Message::FiPathPicked(dl, picker::into_string(p))))
             }
-            Message::FiPathPicked(Some(path)) => {
-                self.file_info.set_save_as(&path);
+            Message::FiPathPicked(dl, path) => {
+                if self.file_info.dl == dl {
+                    self.file_info.set_save_as(&path);
+                }
                 Task::none()
             }
-            Message::FiPathPicked(None) => Task::none(),
             Message::FiDescription(s) => {
                 self.file_info.description = s;
                 Task::none()
@@ -6135,14 +6173,15 @@ impl App {
                 self.batch.hide_dups = b;
                 Task::none()
             }
-            Message::BatchBrowseDir => {
-                // Synchronous picker on purpose: AppKit dialogs must run on
-                // the main thread — the async variant on a worker hangs.
-                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                    self.batch.dir = p.to_string_lossy().into_owned();
-                    self.batch.to_dir = true;
-                    self.batch.to_category = false;
-                }
+            Message::BatchBrowseDir => picker::folder(self.win_of(WinKind::Batch), Ask::default())
+                .and_then(|p| Task::done(Message::BatchDirPicked(picker::into_string(p)))),
+            // Choosing a folder is also what says where the batch goes: the
+            // "to this folder" mode is what the user meant by browsing, not
+            // a second checkbox to remember afterwards.
+            Message::BatchDirPicked(dir) => {
+                self.batch.dir = dir;
+                self.batch.to_dir = true;
+                self.batch.to_category = false;
                 Task::none()
             }
             Message::BatchOk => {
@@ -6431,6 +6470,11 @@ impl App {
                     Task::batch([close, self.start_download(id, true)])
                 }
             }
+            Message::MoveRenameTo(id, to) => self.move_rename_to(id, to),
+            Message::SaveDirRegranted(id, dir) => {
+                self.save_dir_regranted(id, dir);
+                self.start_download(id, false)
+            }
             Message::CloseThis(id) => {
                 match self.windows.remove(&id) {
                     Some(WinKind::Confirm) => {
@@ -6597,13 +6641,16 @@ impl App {
                 self.batch = BatchState::default();
                 self.batch.category = model::DEFAULT_CATEGORY.into();
                 let open = self.open_window(WinKind::Batch);
-                // Synchronous picker on purpose: AppKit dialogs must run on
-                // the main thread — the async variant on a worker hangs.
-                let text = rfd::FileDialog::new()
-                    .add_filter("Text", &["txt", "text", "lst"])
-                    .pick_file()
-                    .and_then(|f| std::fs::read_to_string(f).ok());
-                Task::batch([open, self.update(Message::BatchLoaded(text))])
+                let ask = Ask {
+                    filter: Some(("Text", &["txt", "text", "lst"])),
+                    ..Ask::default()
+                };
+                let pick = picker::file(self.win_of(WinKind::Batch), ask)
+                    .map(|p| Message::BatchLoaded(p.and_then(|p| std::fs::read_to_string(p).ok())));
+                // Chained, not batched: the list window owns the picker, and
+                // `open_window` has only reserved its id at this point — the
+                // window itself arrives when the runtime has created it.
+                open.chain(pick)
             }
             MenuAction::SiteGrabber | MenuAction::DropTarget | MenuAction::Find => Task::none(),
             MenuAction::ExportList => {
@@ -6914,12 +6961,10 @@ impl App {
                 }
                 Task::none()
             }
-            MenuAction::OpenWithSel => {
-                if let Some(d) = self.selected_item() {
-                    crate::files::open_with(&d.full_path());
-                }
-                Task::none()
-            }
+            MenuAction::OpenWithSel => match self.selected_item() {
+                Some(d) => crate::files::open_with(self.win_of(WinKind::Main), &d.full_path()),
+                None => Task::none(),
+            },
             MenuAction::MoveRenameSel => self.move_rename_selected(),
             MenuAction::Properties => {
                 let fi = self.selected_item().map(|d| FileInfoState {
@@ -7047,10 +7092,8 @@ impl App {
             OptField::VirusScanner(v) => s.virus_scanner = v,
             OptField::VirusArgs(v) => s.virus_args = v,
             OptField::BrowseVirus => {
-                let p = rfd::FileDialog::new()
-                    .pick_file()
-                    .map(|p| p.to_string_lossy().into_owned());
-                return self.on_opt_field(OptField::VirusPicked(p));
+                return picker::file(self.win_of(WinKind::Options), Ask::default())
+                    .map(|p| Message::OptDraft(OptField::VirusPicked(p.map(picker::into_string))));
             }
             OptField::VirusPicked(Some(p)) => s.virus_scanner = p,
             OptField::VirusPicked(None) => {}
@@ -7151,10 +7194,9 @@ impl App {
                 }
             }
             OptField::BrowseCatDir => {
-                let p = rfd::FileDialog::new()
-                    .pick_folder()
-                    .map(|p| p.to_string_lossy().into_owned());
-                return self.on_opt_field(OptField::CatDirPicked(p));
+                return picker::folder(self.win_of(WinKind::Options), Ask::default()).map(|p| {
+                    Message::OptDraft(OptField::CatDirPicked(p.map(picker::into_string)))
+                });
             }
             OptField::CatDirPicked(Some(p)) => {
                 let sel = self.options.sel_category.clone();
@@ -7200,13 +7242,20 @@ impl App {
                 }
             }
             OptField::SoundBrowse(i) => {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("Audio", &["wav", "ogg"])
-                    .pick_file()
-                {
-                    if let Some(row) = s.sounds.get_mut(i) {
-                        row.file = p.to_string_lossy().into_owned();
-                    }
+                let ask = Ask {
+                    filter: Some(("Audio", &["wav", "ogg"])),
+                    ..Ask::default()
+                };
+                return picker::file(self.win_of(WinKind::Options), ask).and_then(move |p| {
+                    Task::done(Message::OptDraft(OptField::SoundPicked(
+                        i,
+                        picker::into_string(p),
+                    )))
+                });
+            }
+            OptField::SoundPicked(i, p) => {
+                if let Some(row) = s.sounds.get_mut(i) {
+                    row.file = p;
                 }
             }
             OptField::SoundPlay(i) => {
@@ -9542,6 +9591,93 @@ mod tests {
             .unwrap();
         assert!(compressed.exts.contains(&"z".to_string()));
         assert!(!compressed.exts.contains(&"zip".to_string()));
+    }
+
+    /// The reported bug: the native panel ran the platform's modal loop on
+    /// the event-loop thread, so browsing for a save folder froze the app —
+    /// and on Windows left the panel itself sharing its message pump with
+    /// every running transfer. The answer now arrives as a message, which is
+    /// what these three cover: the path still lands where it used to.
+    #[test]
+    fn a_save_as_answer_reaches_the_dialog_that_asked_for_it() {
+        let mut app = App {
+            file_info: FileInfoState {
+                dl: 7,
+                save_dir: "/tmp/old".into(),
+                file_name: "x.zip".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _ = app.update(Message::FiPathPicked(7, "/tmp/new/y.zip".into()));
+        assert_eq!(app.file_info.save_dir, "/tmp/new");
+        assert_eq!(app.file_info.file_name, "y.zip");
+    }
+
+    /// A panel that no longer freezes the app is a panel the app can outlive:
+    /// a browser capture arriving while it is up supersedes the File Info
+    /// dialog, and the answer to the question the old dialog asked must not
+    /// redirect the download that replaced it.
+    #[test]
+    fn a_save_as_answer_for_a_superseded_dialog_is_dropped() {
+        let mut app = App {
+            file_info: FileInfoState {
+                dl: 7,
+                save_dir: "/tmp/old".into(),
+                file_name: "x.zip".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let _ = app.update(Message::FiPathPicked(3, "/tmp/new/y.zip".into()));
+        assert_eq!(app.file_info.save_dir, "/tmp/old");
+        assert_eq!(app.file_info.file_name, "x.zip");
+    }
+
+    /// Browsing to a folder in the batch dialog is also the answer to where
+    /// the batch goes: the mode has to follow the folder, or the list files
+    /// itself by category anyway and the folder just chosen is ignored.
+    #[test]
+    fn a_browsed_batch_folder_is_where_the_batch_goes() {
+        let mut app = App::default();
+        app.batch.to_category = true;
+        let _ = app.update(Message::BatchDirPicked("/tmp/iso".into()));
+        assert_eq!(app.batch.dir, "/tmp/iso");
+        assert!(app.batch.to_dir);
+        assert!(!app.batch.to_category);
+    }
+
+    /// A transfer that lost its folder shows the failure while the permission
+    /// panel is up — the list is no longer frozen behind it — and picking a
+    /// folder has to clear that failure along with the `.part` path, which
+    /// named a file under the folder that could not be written. The bytes
+    /// already on disk are not among the things that reset.
+    #[test]
+    fn a_re_granted_folder_clears_the_failure_and_keeps_the_bytes() {
+        let mut app = App::default();
+        let id = app.add_item("https://a.b/x.iso".into(), None, None);
+        if let Some(d) = app.item_mut(id) {
+            d.save_dir = "/read-only".into();
+            d.part_path = Some("/read-only/x.iso.part".into());
+        }
+        let _ = app.update(Message::Engine(engine::Event::Failed {
+            id,
+            error: "permission denied".into(),
+            done: 0,
+            held: vec![(0, 4095)],
+            permission_denied: true,
+        }));
+        let d = app.item(id).expect("the row stays in the list");
+        assert_eq!(d.state, DlState::Error);
+        assert_eq!(d.held, vec![(0, 4095)]);
+
+        app.save_dir_regranted(id, "/tmp/grantedsomewhere".into());
+        let d = app.item(id).expect("the row stays in the list");
+        assert_eq!(d.save_dir, "/tmp/grantedsomewhere");
+        assert_eq!(d.state, DlState::Paused);
+        assert_eq!(d.error, None);
+        assert_eq!(d.part_path, None);
+        assert_eq!(d.held, vec![(0, 4095)], "4 KiB already fetched is 4 KiB");
     }
 
     #[cfg(target_os = "linux")]
