@@ -15,8 +15,8 @@ download capture, right-click "Download with Hydra", "Download all links",
 a floating "Download with Hydra" button when you highlight links on a page
 (single link downloads directly, several open the batch box), per-tab media
 sniffing with a badge counter, HLS/DASH stream detection with quality
-selection, a floating "Download this video" bar over players, and a welcome
-page on first install.
+selection, a floating "Download this video" bar over players, optional hand-over of the
+browser's own proxy, and a welcome page on first install.
 
 ## How it works
 
@@ -144,7 +144,7 @@ is the only path that can **launch** the app.
 
 Requests are JSON objects: `ping`, `config`, `open`,
 `download {url, filename?, cookies?, referer?, user_agent?, size?, mime?,
-tab_url?}`, `links {urls}`. An `id` is echoed back so replies can be
+tab_url?, proxy?}`, `links {urls}`. An `id` is echoed back so replies can be
 matched. Replies: `{ok, capture, auto_types, dont_start_sites, version,
 id?, error?}`.
 
@@ -165,6 +165,26 @@ id?, error?}`.
   everyone with *Ask where to save each file* enabled. `suggest()` is still
   called exactly once on every path — releasing a declined download, and
   harmlessly landing on a cancelled one.
+- **The browser's proxy** (popup: *Use this browser's proxy*): a file behind
+  a tunnel is unreachable by an app that has never heard of the tunnel, so
+  the proxy the browser is using for that URL travels with the capture as
+  `proxy` and becomes **that download's** route — Hydra's own
+  Options > Proxy/Socks is never touched, because the browser's setting can
+  change tomorrow and the user's answer in Hydra must not have been
+  overwritten today. The entry for the URL's scheme is the one that is sent,
+  the browser's bypass list (`bypassList` / `passthrough`, including
+  `<local>`) is honoured, and no credentials are involved: neither browser's
+  API exposes them. Two settings are deliberately *not* passed on, because
+  neither browser will say what they resolve to: following the **machine's**
+  proxy (`system` / `autoDetect`) and a **PAC script**, which is a program
+  neither the extension nor Hydra runs. Both leave the download on whatever
+  Hydra's Options say. The read is capped at 1.5 s, because a capture awaits
+  it and a browser that answers neither way would leave the download parked
+  on a question about a proxy. `proxy` is an **optional permission** and *is* the
+  switch — the API does not exist until the checkbox grants it, so there is
+  no second flag to fall out of step with it, and no existing install is
+  disabled at its next update. Safari has no proxy API; the row stays hidden
+  there.
 - **Single instance**: launching hydra-gui while another instance runs now
   just surfaces the running instance's window and exits — the extension
   always talks to the instance that owns `ipc.json`.

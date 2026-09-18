@@ -54,6 +54,11 @@ pub struct ExtDownload {
     /// Page the download started from (shown nowhere yet; logged).
     #[serde(default)]
     pub tab_url: Option<String>,
+    /// The proxy the BROWSER is using for this URL, as a full specification
+    /// (`socks5://host:port`), when the extension was allowed to read it.
+    /// Applied to this download alone — see [`ExtStream::proxy`].
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 /// One rendition of a stream, as the extension read it out of the manifest.
@@ -104,6 +109,12 @@ pub struct ExtStream {
     pub tab_url: Option<String>,
     #[serde(default)]
     pub live: bool,
+    /// The browser's own proxy, as a full specification. It is the route for
+    /// this recording only: Options is the user's own answer to the same
+    /// question, and a browser setting that changes tomorrow must not have
+    /// overwritten it today.
+    #[serde(default)]
+    pub proxy: Option<String>,
     /// Seconds, when the manifest stated one.
     #[serde(default)]
     pub duration: Option<f64>,
@@ -460,6 +471,22 @@ pub fn start() {
 /// taken by something else.
 const WS_PORTS: &[u16] = &[6799, 16799];
 
+/// A proxy specification with any `user:pass@` removed, for the log.
+///
+/// Nothing sends one today — neither browser's proxy API exposes credentials
+/// — but this is the one place a specification from outside the app is
+/// written to a file, and a log that can hold a password is not a thing to
+/// leave to the good manners of every future caller.
+fn without_credentials(spec: &str) -> String {
+    match spec.rsplit_once('@') {
+        Some((head, tail)) => match head.split_once("://") {
+            Some((scheme, _)) => format!("{scheme}://{tail}"),
+            None => tail.to_string(),
+        },
+        None => spec.to_string(),
+    }
+}
+
 /// Handle one authenticated request; the reply always carries the capture
 /// settings and echoes any `id` (the WebSocket path multiplexes on it).
 /// `trusted` is true for the token-bearing line protocol only — the
@@ -484,12 +511,16 @@ fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
                 // (`DownloadItem::referer`); user_agent and size are logged
                 // for support, the transfer using the configured agent.
                 crate::log::info(&format!(
-                    "extbus: capture {} (mime={} size={} referer={} ua={} from={})",
+                    "extbus: capture {} (mime={} size={} referer={} ua={} proxy={} from={})",
                     dl.url,
                     dl.mime.as_deref().unwrap_or("-"),
                     dl.size.map(|s| s.to_string()).as_deref().unwrap_or("-"),
                     dl.referer.as_deref().unwrap_or("-"),
                     dl.user_agent.as_deref().unwrap_or("-"),
+                    dl.proxy
+                        .as_deref()
+                        .map(without_credentials)
+                        .unwrap_or("-".into()),
                     dl.tab_url.as_deref().unwrap_or("-"),
                 ));
                 let (tx, receipt) = std::sync::mpsc::channel();
@@ -524,7 +555,11 @@ fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
                     s.tab_url.as_deref().unwrap_or("-"),
                 ));
                 crate::log::debug(&format!(
-                    "extbus: stream codecs={} duration={} ua={}",
+                    "extbus: stream proxy={} codecs={} duration={} ua={}",
+                    s.proxy
+                        .as_deref()
+                        .map(without_credentials)
+                        .unwrap_or("-".into()),
                     s.variant
                         .as_ref()
                         .and_then(|v| v.codecs.as_deref())
@@ -842,5 +877,43 @@ mod tests {
         // whole timeout.
         drop(rx.blocking_recv());
         assert!(!ok(replying.join().expect("dispatch thread")));
+    }
+
+    /// The browser's proxy is the route for THAT download, so it has to
+    /// survive the wire — and an extension too old to send one still parses.
+    #[test]
+    fn a_capture_carries_the_browsers_proxy() {
+        let with = serde_json::json!({
+            "type": "download",
+            "url": "https://example.invalid/f.zip",
+            "proxy": "socks5://127.0.0.1:10808",
+        });
+        let dl: ExtDownload = serde_json::from_value(with).expect("a download request");
+        assert_eq!(dl.proxy.as_deref(), Some("socks5://127.0.0.1:10808"));
+
+        let without =
+            serde_json::json!({"type": "download", "url": "https://example.invalid/f.zip"});
+        let dl: ExtDownload = serde_json::from_value(without).expect("a download request");
+        assert_eq!(dl.proxy, None);
+    }
+
+    /// The log is the one place a specification from outside the app is
+    /// written to a file.
+    #[test]
+    fn a_logged_proxy_never_carries_its_password() {
+        assert_eq!(
+            without_credentials("socks5://joe:hunter2@10.0.0.1:1080"),
+            "socks5://10.0.0.1:1080"
+        );
+        // A password may itself contain '@'; the credentials end at the last.
+        assert_eq!(
+            without_credentials("http://joe:a@b@proxy.example:8080"),
+            "http://proxy.example:8080"
+        );
+        assert_eq!(
+            without_credentials("socks5://127.0.0.1:10808"),
+            "socks5://127.0.0.1:10808"
+        );
+        assert_eq!(without_credentials("joe:pw@proxy.example"), "proxy.example");
     }
 }

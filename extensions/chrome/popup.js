@@ -192,6 +192,53 @@ function renderStreams(streams) {
   }
 }
 
+// ---------------------------------------------------------- browser proxy
+//
+// The `proxy` permission IS the switch: the API does not exist until it has
+// been granted, so there is no second stored flag to fall out of step with
+// it — including when the permission is revoked from the browser's own
+// add-on settings. A browser that cannot offer the API at all (Safari) does
+// not declare it, and the row stays hidden rather than offering a tick that
+// could only fail.
+const PROXY_OPTIONAL = (chrome.runtime.getManifest().optional_permissions || []).includes(
+  "proxy"
+);
+
+// Set, but to something the browser will not spell out for us.
+const PROXY_OPAQUE =
+  "This browser is set to follow the machine's proxy, or a configuration script. Neither says what it resolves to, so downloads take whatever Hydra's Options say.";
+
+async function refreshProxy() {
+  if (!PROXY_OPTIONAL) return;
+  $("proxy-row").hidden = false;
+  let granted = false;
+  try {
+    granted = await chrome.permissions.contains({ permissions: ["proxy"] });
+  } catch {}
+  $("browser-proxy").checked = granted;
+  const note = $("proxy-note");
+  note.hidden = !granted;
+  if (!granted) return;
+  const { spec } = (await chrome.runtime.sendMessage({ type: "proxy-status" })) || {};
+  note.firstElementChild.textContent = spec ? `Downloads go via ${spec}` : "No proxy to pass on";
+  note.title = spec ? "" : PROXY_OPAQUE;
+}
+
+$("browser-proxy").addEventListener("change", async (e) => {
+  const want = e.target.checked;
+  try {
+    // Requesting is the whole opt-in: the browser asks, and a refusal must
+    // leave the tick where it was rather than claim a setting that is off.
+    const ok = want
+      ? await chrome.permissions.request({ permissions: ["proxy"] })
+      : !(await chrome.permissions.remove({ permissions: ["proxy"] }));
+    if (ok !== want) $("hint").textContent = want ? "Permission refused." : "Could not revoke it.";
+  } catch (err) {
+    $("hint").textContent = String(err?.message || err);
+  }
+  await refreshProxy();
+});
+
 async function refresh() {
   const { state, media, streams, tabUrl, connected } = await chrome.runtime.sendMessage({
     type: "get-state",
@@ -223,6 +270,8 @@ async function refresh() {
   } else {
     hint.textContent = "Alt+click a link to bypass capture once.";
   }
+
+  await refreshProxy();
 
   renderStreams(streams || []);
 

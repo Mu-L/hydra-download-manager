@@ -302,15 +302,9 @@ pub struct AddUrlState {
     pub login: String,
     pub password: String,
     pub error: Option<String>,
-    /// Cookie header captured by the browser extension; applied to the item
-    /// right after `add_item` so a background start already sends it.
-    pub capture_cookies: Option<String>,
-    /// Filename the browser had already resolved (Content-Disposition et
-    /// al.) — better than what the URL path implies.
-    pub capture_name: Option<String>,
-    /// Page the browser was on when it captured this file. A CDN with
-    /// hotlink protection answers `403` without it.
-    pub capture_referer: Option<String>,
+    /// What the browser knew about a captured download; applied to the item
+    /// right after `add_item` so a background start already has it.
+    pub capture: CaptureExtras,
     /// What the address turned out to be, when it is a manifest. A stream
     /// has to be asked which rendition BEFORE it starts — there is no
     /// changing your mind halfway through a hundred segments.
@@ -375,9 +369,42 @@ pub const METALINK_PANEL_ROWS: usize = 3;
 pub struct PendingAdd {
     pub url: String,
     pub auth: Option<(String, String)>,
+    pub capture: CaptureExtras,
+}
+
+/// What the browser knew about a captured download and Hydra cannot work out
+/// for itself.
+///
+/// One value rather than four `Option<String>`s in a row: they travel
+/// together from [`crate::extbus::ExtDownload`] through the duplicate dialog
+/// to the item, and four interchangeable strings as positional arguments is
+/// a swap that compiles.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureExtras {
+    /// Cookie header the extension assembled for this URL.
     pub cookies: Option<String>,
+    /// Filename the browser had already resolved (Content-Disposition et
+    /// al.) — better than what the URL path implies.
     pub name: Option<String>,
+    /// Page the browser was on when it captured this file. A CDN with
+    /// hotlink protection answers `403` without it.
     pub referer: Option<String>,
+    /// The proxy the browser itself is using, as a full specification.
+    pub proxy: Option<String>,
+}
+
+impl CaptureExtras {
+    /// The same fields with blanks dropped, which is what an extension that
+    /// had nothing to say sends.
+    fn taken(&mut self) -> Self {
+        let take = |v: &mut Option<String>| v.take().filter(|s| !s.is_empty());
+        Self {
+            cookies: take(&mut self.cookies),
+            name: take(&mut self.name),
+            referer: take(&mut self.referer),
+            proxy: take(&mut self.proxy),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2171,40 +2198,20 @@ impl App {
     /// `403` without the referer, whatever the cookies say. Renaming re-runs
     /// categorization because the URL-derived name may have had no extension
     /// at all.
-    fn apply_capture_extras(
-        &mut self,
-        id: DlId,
-        cookies: Option<String>,
-        name: Option<String>,
-        referer: Option<String>,
-    ) {
-        if cookies.is_none() && name.is_none() && referer.is_none() {
-            return;
-        }
+    fn apply_capture_extras(&mut self, id: DlId, extras: CaptureExtras) {
         // Resolved before the item is borrowed mutably, and through
         // `cat_dir` — the one accessor that honours Options > Save to > "Do
         // not create category folders". Reading the category's own `dir`
         // here ignored that setting, so `add_item` filed the download in the
         // single General folder the user asked for and this overwrote it
         // with a per-category folder they had switched off.
-        let cat = name.as_deref().map(|n| categorize(n, &self.cfg.categories));
-        let dir = cat.as_ref().and_then(|c| self.cat_dir(c.as_deref()));
+        let filing = extras.name.as_deref().map(|n| {
+            let cat = categorize(n, &self.cfg.categories);
+            let dir = self.cat_dir(cat.as_deref());
+            (cat, dir)
+        });
         if let Some(d) = self.item_mut(id) {
-            if let Some(c) = cookies {
-                d.cookies = Some(c);
-            }
-            if let Some(r) = referer {
-                d.referer = Some(r);
-            }
-            if let Some(n) = name {
-                d.file_name = n;
-                if let Some(c) = cat {
-                    d.category = c;
-                }
-                if let Some(dir) = dir {
-                    d.save_dir = dir;
-                }
-            }
+            write_capture_extras(d, extras, filing);
         }
     }
 
@@ -4712,7 +4719,7 @@ impl App {
                 self.add_url.stream_error = None;
                 self.add_url.stream_of = url.clone();
                 let ua = self.cfg.settings.user_agent.clone();
-                let cookies = self.add_url.capture_cookies.clone();
+                let cookies = self.add_url.capture.cookies.clone();
                 Task::perform(crate::engine::probe_stream(url, ua, cookies), |r| {
                     Message::AddrStreamProbed(Box::new(r))
                 })
@@ -4816,17 +4823,7 @@ impl App {
                     .iter()
                     .find(|d| d.url == url)
                     .map(|d| d.id);
-                let cap_cookies = self
-                    .add_url
-                    .capture_cookies
-                    .take()
-                    .filter(|s| !s.is_empty());
-                let cap_name = self.add_url.capture_name.take().filter(|s| !s.is_empty());
-                let cap_referer = self
-                    .add_url
-                    .capture_referer
-                    .take()
-                    .filter(|s| !s.is_empty());
+                let captured = self.add_url.capture.taken();
                 // A manifest that was inspected becomes a STREAM item: the
                 // chosen rendition and container decide the filename, which
                 // the URL path cannot.
@@ -4864,7 +4861,8 @@ impl App {
                         };
                         format!("{}.{ext}", stream_base_name(&url))
                     }
-                    None => cap_name
+                    None => captured
+                        .name
                         .clone()
                         .unwrap_or_else(|| engine::file_name_from_url(&url)),
                 };
@@ -4875,8 +4873,9 @@ impl App {
                     .unwrap_or_default();
                 // A capture name and a stream name are the name the file
                 // will really be saved under; so is a URL that names one.
-                let named =
-                    cap_name.is_some() || stream.is_some() || engine::url_file_name(&url).is_some();
+                let named = captured.name.is_some()
+                    || stream.is_some()
+                    || engine::url_file_name(&url).is_some();
                 let file = collision_file(&dir, &name, named);
                 if existing.is_some() || file.is_some() {
                     // Logged: the dialog names a path, and the report that
@@ -4893,9 +4892,7 @@ impl App {
                     self.pending_add = Some(PendingAdd {
                         url,
                         auth,
-                        cookies: cap_cookies,
-                        name: cap_name,
-                        referer: cap_referer,
+                        capture: captured,
                     });
                     self.confirm = Some(ConfirmKind::Duplicate { existing, file });
                     self.add_url = AddUrlState::default();
@@ -4903,7 +4900,7 @@ impl App {
                     return Task::batch([close, self.open_window(WinKind::Confirm)]);
                 }
                 let id = self.add_item(url, auth, None);
-                self.apply_capture_extras(id, cap_cookies, cap_name, cap_referer);
+                self.apply_capture_extras(id, captured);
                 if let Some(si) = stream {
                     let cat = crate::model::categorize(&name, &self.cfg.categories);
                     let dir = self
@@ -4987,9 +4984,12 @@ impl App {
                     self.capture_raise = true;
                     self.add_url = AddUrlState {
                         address: dl.url,
-                        capture_cookies: dl.cookies,
-                        capture_name: dl.filename,
-                        capture_referer: dl.referer,
+                        capture: CaptureExtras {
+                            cookies: dl.cookies,
+                            name: dl.filename,
+                            referer: dl.referer,
+                            proxy: dl.proxy,
+                        },
                         ..AddUrlState::default()
                     };
                     let task = self.update(Message::AddUrlOk);
@@ -5032,6 +5032,9 @@ impl App {
                         d.save_dir = save_dir;
                         d.cookies = s.cookies.clone();
                         d.size = s.size;
+                        if let Some(px) = captured_proxy(s.proxy.clone()) {
+                            d.proxy = px;
+                        }
                         // Resumable, but by whole segments rather than byte
                         // ranges: a paused stream carries on from the last
                         // segment that landed.
@@ -6437,7 +6440,7 @@ impl App {
                     return close;
                 };
                 let id = self.add_item(pending.url, pending.auth, None);
-                self.apply_capture_extras(id, pending.cookies, pending.name, pending.referer);
+                self.apply_capture_extras(id, pending.capture);
                 // `name_1.ext`, `name_2.ext`, ... until it collides with
                 // neither the disk nor another list entry. Locked, because
                 // this copy exists precisely so the file already on disk is
@@ -6546,7 +6549,11 @@ impl App {
             return self.start_download(id, false);
         }
         let ua = self.cfg.settings.user_agent.clone();
-        let (url, headers) = self
+        // The item's own route, not the app's: a capture that arrived with
+        // the browser's proxy is reachable through that proxy and nowhere
+        // else, and a probe that leaves by a different door reports a file
+        // of unknown size the transfer then downloads perfectly well.
+        let (url, headers, proxy) = self
             .item(id)
             .map(|d| {
                 (
@@ -6556,10 +6563,11 @@ impl App {
                         d.cookies.as_deref(),
                         d.referer.as_deref(),
                     ),
+                    d.proxy.clone(),
                 )
             })
             .unwrap_or_default();
-        Task::perform(engine::probe_link(url, ua, headers), move |meta| {
+        Task::perform(engine::probe_link(url, ua, headers, proxy), move |meta| {
             Message::InfoProbed(id, meta)
         })
     }
@@ -6588,9 +6596,12 @@ impl App {
                         Message::BatchMetalinkProbed(url.clone(), Box::new(r.ok()))
                     })
                 } else {
-                    Task::perform(engine::probe_link(url.clone(), ua, vec![]), move |meta| {
-                        Message::BatchProbed(url.clone(), meta)
-                    })
+                    // A pasted link has no item, so the app-wide route is the
+                    // only one there is.
+                    Task::perform(
+                        engine::probe_link(url.clone(), ua, vec![], ProxyChoice::Default),
+                        move |meta| Message::BatchProbed(url.clone(), meta),
+                    )
                 }
             })
             .collect();
@@ -7527,6 +7538,62 @@ pub fn auto_start_type(file_name: &str, url: &str, auto_types: &str) -> bool {
 /// get, against a download that could not have happened at all.
 pub(crate) fn expiring_soon(url: &str) -> bool {
     hya_net::signed::perishable(url, crate::fmt::now_unix().max(0) as u64)
+}
+
+/// Put what the browser knew onto the item, leaving whatever it did not say
+/// alone: a field the extension could not fill must not blank the one
+/// `add_item` derived from the URL.
+///
+/// `filing` is where the capture's own filename files it — the category it
+/// matches and that category's folder — because only a rename may move the
+/// download, and resolving it is the half that needs the app's category
+/// table.
+fn write_capture_extras(
+    d: &mut DownloadItem,
+    extras: CaptureExtras,
+    filing: Option<(Option<String>, Option<String>)>,
+) {
+    if let Some(c) = extras.cookies {
+        d.cookies = Some(c);
+    }
+    if let Some(r) = extras.referer {
+        d.referer = Some(r);
+    }
+    if let Some(p) = captured_proxy(extras.proxy) {
+        d.proxy = p;
+    }
+    if let Some(n) = extras.name {
+        d.file_name = n;
+        if let Some((cat, dir)) = filing {
+            d.category = cat;
+            if let Some(dir) = dir {
+                d.save_dir = dir;
+            }
+        }
+    }
+}
+
+/// The browser's own proxy, as this download's route.
+///
+/// `None` means "leave the item's choice alone", which is what an extension
+/// that is not allowed to read the setting — or a browser that only says it
+/// is following the machine — sends. An address that cannot be parsed is the
+/// same answer plus a log line, never an error: the download itself is fine,
+/// and refusing it over a setting the user made in a different program would
+/// be a capture that silently stopped working.
+fn captured_proxy(spec: Option<String>) -> Option<ProxyChoice> {
+    let spec = spec
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    match crate::proxy::spec_error(&spec) {
+        None => Some(ProxyChoice::Custom(spec)),
+        Some(why) => {
+            crate::log::warn(&format!(
+                "ext: ignoring the browser's proxy {spec:?}: {why}"
+            ));
+            None
+        }
+    }
 }
 
 /// Does this URL's host match an entry in the Options > File types
@@ -8791,6 +8858,108 @@ mod tests {
             .expect("valid timestamp")
             .format("%Y%m%dT%H%M%SZ")
             .to_string()
+    }
+
+    /// The extension fills in what it knows and says nothing about the rest;
+    /// "nothing" arrives as both `None` and `""`, and neither may reach the
+    /// item — a blank name would replace the one derived from the URL.
+    #[test]
+    fn a_capture_says_nothing_rather_than_saying_nothing_twice() {
+        let mut extras = CaptureExtras {
+            cookies: Some("sid=abc".into()),
+            name: Some(String::new()),
+            referer: None,
+            proxy: Some(String::new()),
+        };
+        let taken = extras.taken();
+        assert_eq!(taken.cookies.as_deref(), Some("sid=abc"));
+        assert_eq!(taken.name, None);
+        assert_eq!(taken.referer, None);
+        assert_eq!(taken.proxy, None);
+        // Taken, not copied: the dialog state must not hand the same cookies
+        // to a second download.
+        assert!(extras.cookies.is_none());
+    }
+
+    /// What the browser knew lands on the item; what it did not say leaves
+    /// the item's own value alone. A capture that arrives with the browser's
+    /// proxy is reachable through that proxy and nowhere else, so it becomes
+    /// this download's route — Options is never touched.
+    #[test]
+    fn a_capture_writes_only_what_the_browser_actually_knew() {
+        let mut d = item(1, "/downloads", "pack.zip", None, DlState::Queued);
+        d.cookies = Some("stale=1".into());
+        write_capture_extras(
+            &mut d,
+            CaptureExtras {
+                cookies: Some("sid=abc".into()),
+                name: Some("Setup.exe".into()),
+                referer: Some("https://page.example/".into()),
+                proxy: Some("socks5://127.0.0.1:10808".into()),
+            },
+            Some((Some("Programs".into()), Some("/downloads/programs".into()))),
+        );
+        assert_eq!(d.cookies.as_deref(), Some("sid=abc"));
+        assert_eq!(d.referer.as_deref(), Some("https://page.example/"));
+        assert_eq!(d.file_name, "Setup.exe");
+        assert_eq!(d.category.as_deref(), Some("Programs"));
+        assert_eq!(d.save_dir, "/downloads/programs");
+        assert_eq!(
+            d.proxy,
+            ProxyChoice::Custom("socks5://127.0.0.1:10808".into())
+        );
+
+        // An extension that knew nothing — or one too old to send a proxy —
+        // leaves every one of them as it found them.
+        write_capture_extras(&mut d, CaptureExtras::default(), None);
+        assert_eq!(d.cookies.as_deref(), Some("sid=abc"));
+        assert_eq!(d.file_name, "Setup.exe");
+        assert_eq!(d.save_dir, "/downloads/programs");
+        assert_eq!(
+            d.proxy,
+            ProxyChoice::Custom("socks5://127.0.0.1:10808".into())
+        );
+
+        // Only a rename may move the download: cookies alone must not refile
+        // it, which is what a `filing` resolved from the name means.
+        write_capture_extras(
+            &mut d,
+            CaptureExtras {
+                cookies: Some("sid=def".into()),
+                ..CaptureExtras::default()
+            },
+            None,
+        );
+        assert_eq!(d.save_dir, "/downloads/programs");
+        assert_eq!(d.category.as_deref(), Some("Programs"));
+    }
+
+    /// A proxy the browser reported is this download's own route. Anything
+    /// the transport cannot speak leaves the choice untouched rather than
+    /// failing the capture: the download is fine, and the setting was made
+    /// in a different program.
+    #[test]
+    fn a_captured_proxy_becomes_this_downloads_own_route() {
+        assert_eq!(
+            captured_proxy(Some("socks5://127.0.0.1:10808".into())),
+            Some(ProxyChoice::Custom("socks5://127.0.0.1:10808".into()))
+        );
+        assert_eq!(
+            captured_proxy(Some("  http://proxy.example:8080  ".into())),
+            Some(ProxyChoice::Custom("http://proxy.example:8080".into()))
+        );
+        assert_eq!(captured_proxy(None), None);
+        assert_eq!(captured_proxy(Some(String::new())), None);
+        assert_eq!(captured_proxy(Some("   ".into())), None);
+        // A scheme the transport does not speak, and a port that is not one.
+        assert_eq!(
+            captured_proxy(Some("quic://proxy.example:443".into())),
+            None
+        );
+        assert_eq!(
+            captured_proxy(Some("http://proxy.example:ohno".into())),
+            None
+        );
     }
 
     #[test]

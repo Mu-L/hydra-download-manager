@@ -61,6 +61,14 @@ overwritten on every sync.
   `browser_specific_settings.gecko`) — native messaging allow-lists Firefox
   add-ons by id (`allowed_extensions`), not by an extension-origin URL the
   way Chromium does.
+- **The proxy setting is readable, but only per browser.** `proxy.settings`
+  answers with Firefox's own object (`proxyType`, `http`/`ssl`/`ftp`,
+  `socks` + `socksVersion`, `passthrough`) rather than Chromium's, and the
+  shared core reads whichever it is handed. Only *Manual proxy
+  configuration* names an address; "Use system proxy settings" and an
+  automatic configuration URL do not, and are passed on as nothing. Reading
+  the setting needs no private-browsing access — only `set()` does, and this
+  extension never sets anything.
 - **Site access can be switched off.** Firefox grants `host_permissions`
   at install (127+), but a user can revoke them from `about:addons` → Hydra
   → Permissions; if cookies stop being attached, that is where to look.

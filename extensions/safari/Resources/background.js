@@ -359,6 +359,192 @@ async function altBypassed() {
   return Date.now() - altTs < 3000;
 }
 
+// ------------------------------------------------------------------- proxy
+//
+// The proxy the BROWSER is using, handed over with the download so Hydra
+// leaves by the same door. Without it a file that only the tunnel can reach
+// is fetched by an app that has never heard of the tunnel, and the address
+// has to be retyped into Hydra's Options by hand.
+//
+// It travels as ONE download's proxy, not as a change to Options: it is the
+// browser's setting, it can change without telling us, and a user who has
+// deliberately pointed Hydra somewhere else must keep that.
+//
+// The `proxy` permission is OPTIONAL and doubles as the feature switch —
+// granted means on, and the API itself is absent until it is. An extension
+// that already asks for `downloads`, `cookies` and every host must not also
+// be disabled at its next update over a setting most people never turn on,
+// and a second stored flag beside the permission could only ever disagree
+// with it.
+//
+// Two things are deliberately NOT captured. A browser following the machine's
+// proxy ("system" / "autoDetect") will not say what that is, and a PAC script
+// is a program neither this extension nor Hydra runs — see the same note in
+// hydra-gui's proxy.rs. Both resolve to "no proxy known", which leaves the
+// download on whatever Options says, exactly as if this were switched off.
+
+// A local settings read answers in microseconds. The ceiling is not about
+// slowness: a capture AWAITS this, and a browser whose namespace neither
+// calls the callback nor returns a promise would park the download forever
+// on a question about a proxy. Answering "no proxy known" is the same thing
+// the feature does when it is switched off.
+const PROXY_READ_TIMEOUT_MS = 1500;
+
+/// The browser's proxy configuration, or null when the permission has not
+/// been granted (or the API does not exist at all, as in Safari).
+function proxyConfig() {
+  return new Promise((resolve) => {
+    const api = chrome.proxy?.settings;
+    if (!api?.get) return resolve(null);
+    const timer = setTimeout(() => resolve(null), PROXY_READ_TIMEOUT_MS);
+    const settle = (v) => {
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const done = (got) => settle(chrome.runtime.lastError ? null : (got?.value ?? null));
+    const failed = () => settle(null);
+    try {
+      // Both dialects, like `native()` above: Chromium takes a callback and
+      // reports failure through lastError, a promise-only namespace returns
+      // one. Reading it twice would be harmless — it is a read — but only
+      // one of the two ever answers.
+      const ret = api.get({}, done);
+      if (ret && typeof ret.then === "function") ret.then(done, failed);
+    } catch {
+      // A namespace strict enough to reject the trailing callback as an
+      // unexpected argument: ask again the way it wants to be asked, rather
+      // than reporting "no proxy" for what is really a calling convention.
+      try {
+        Promise.resolve(api.get({})).then(done, failed);
+      } catch {
+        failed();
+      }
+    }
+  });
+}
+
+// What Hydra's `Proxy::parse` accepts. QUIC — which Chromium can name — is
+// not among them, and a proxy it cannot speak is better left unsaid than
+// sent as something it is not.
+const PROXY_PORTS = { http: 80, https: 443, socks4: 1080, socks4a: 1080, socks5: 1080 };
+
+/// `scheme://host:port`, or null when there is nothing usable to say.
+///
+/// Credentials are never part of it, and neither browser offers any:
+/// Chromium's `ProxyServer` has no such fields and Firefox keeps proxy
+/// logins in the password manager. A proxy that needs a login is finished
+/// in Hydra's own Options.
+function proxySpec(scheme, hostport) {
+  const raw = String(hostport ?? "").trim();
+  if (!raw) return null;
+  // Firefox stores a bare `host:port`, but its own documented example stores
+  // `http://proxy.org:8080`: a scheme the value states wins over the field
+  // it was read from.
+  const at = raw.indexOf("://");
+  let kind = String(at < 0 ? scheme || "http" : raw.slice(0, at)).toLowerCase();
+  if (kind === "socks") kind = "socks5"; // the bare word means 5 everywhere
+  if (!(kind in PROXY_PORTS)) return null;
+  const rest = (at < 0 ? raw : raw.slice(at + 3)).replace(/\/+$/, "");
+  if (!rest) return null;
+  // A port is optional in Chromium's ProxyServer and defaults PER SCHEME
+  // there, while Hydra's parser defaults 8080 for HTTP. State it rather than
+  // let the two disagree about what `http://proxy` means.
+  const ported = /:\d+$/.test(rest) || (rest.startsWith("[") && !rest.endsWith("]"));
+  return ported ? `${kind}://${rest}` : `${kind}://${rest}:${PROXY_PORTS[kind]}`;
+}
+
+/// A host the browser would NOT send through its proxy. Chromium publishes
+/// the list as `bypassList`, Firefox as `passthrough`, and the two pattern
+/// languages agree on everything that turns up in practice: a host, a
+/// `.suffix` or `*.suffix`, and `<local>` for the dotless names an intranet
+/// uses. A port or scheme attached to a pattern is ignored — narrowing a
+/// bypass to one port is vanishingly rare, and reading it wrong sends
+/// intranet traffic to a proxy that will refuse it.
+function proxyBypassed(list, url) {
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return []
+    .concat(list ?? [])
+    .join(",")
+    .toLowerCase()
+    .split(/[\s,;]+/)
+    .filter(Boolean)
+    .some((pat) => {
+      // `<-loopback>` REMOVES the implicit loopback bypass; it never adds one.
+      if (pat === "<-loopback>") return false;
+      if (pat === "<local>") return !host.includes(".");
+      const bare = pat.replace(/^[a-z0-9+.-]+:\/\//, "").replace(/:\d+$/, "");
+      if (!bare) return false;
+      if (bare.startsWith(".")) return host.endsWith(bare);
+      if (!bare.includes("*")) return host === bare;
+      const rx = new RegExp(`^${bare.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);
+      return rx.test(host);
+    });
+}
+
+/// The scheme the origin is reached by, as the proxy settings spell it.
+function urlScheme(url) {
+  try {
+    return new URL(url).protocol.replace(":", "").toLowerCase();
+  } catch {
+    return "http";
+  }
+}
+
+/// Chromium's `ProxyConfig`. Only `fixed_servers` names an address we can
+/// read; every other mode is either direct or something the browser keeps
+/// to itself.
+function chromiumProxy(cfg, url) {
+  if (cfg.mode !== "fixed_servers") return null;
+  const rules = cfg.rules || {};
+  if (proxyBypassed(rules.bypassList, url)) return null;
+  const scheme = urlScheme(url);
+  const pick =
+    rules.singleProxy ||
+    (scheme === "https"
+      ? rules.proxyForHttps
+      : scheme === "ftp"
+        ? rules.proxyForFtp
+        : rules.proxyForHttp) ||
+    rules.fallbackProxy;
+  if (!pick?.host) return null;
+  return proxySpec(pick.scheme, pick.port ? `${pick.host}:${pick.port}` : pick.host);
+}
+
+/// Firefox's proxy settings. The per-protocol fields are HTTP proxies;
+/// `socks` is the fallback for everything they do not cover, which is how
+/// Firefox itself routes a request.
+function geckoProxy(cfg, url) {
+  if (cfg.proxyType !== "manual") return null;
+  if (proxyBypassed(cfg.passthrough, url)) return null;
+  const scheme = urlScheme(url);
+  const perScheme = cfg.httpProxyAll
+    ? cfg.http
+    : scheme === "https"
+      ? cfg.ssl
+      : scheme === "ftp"
+        ? cfg.ftp
+        : cfg.http;
+  return (
+    proxySpec("http", perScheme) ||
+    proxySpec(cfg.socksVersion === 4 ? "socks4" : "socks5", cfg.socks)
+  );
+}
+
+/// The proxy to hand over with this URL, or null for "Hydra decides".
+async function captureProxy(url) {
+  const cfg = await proxyConfig();
+  if (!cfg) return null;
+  // The two browsers answer with different objects; each names itself.
+  if (typeof cfg.proxyType === "string") return geckoProxy(cfg, url);
+  if (typeof cfg.mode === "string") return chromiumProxy(cfg, url);
+  return null;
+}
+
 // ----------------------------------------------------------------- cookies
 
 async function cookieHeader(url) {
@@ -430,6 +616,7 @@ async function sendToHydra(url, extras = {}) {
     url,
     cookies: await cookieHeader(url),
     user_agent: navigator.userAgent,
+    proxy: await captureProxy(url),
     ...extras,
   });
 }
@@ -1076,6 +1263,9 @@ async function sendStreamToHydra(entry, variant, opts = {}) {
         : null,
     cookies: await cookieHeader(entry.url),
     user_agent: navigator.userAgent,
+    // The manifest's proxy, not the variant's: segments are served from the
+    // same origin, and one route has to carry the whole recording.
+    proxy: await captureProxy(entry.url),
     referer: entry.pageUrl || null,
     tab_url: entry.pageUrl || null,
     mime: entry.mime || null,
@@ -1278,6 +1468,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           videoPanel: state.enabled && state.videoPanel,
           panelTimeout: clampPanelTimeout(state.panelTimeout),
         });
+        break;
+      }
+      case "proxy-status": {
+        // Resolved against the page in front: a proxy can be named per
+        // scheme and bypassed per host, so an answer for some other URL
+        // would not be the one a download from here gets.
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        const url = /^https?:/i.test(tab?.url || "") ? tab.url : "https://example.com/";
+        sendResponse({ spec: await captureProxy(url) });
         break;
       }
       case "ping":
