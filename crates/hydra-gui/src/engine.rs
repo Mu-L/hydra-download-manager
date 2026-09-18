@@ -594,15 +594,22 @@ pub struct LinkMeta {
 /// Bounded: a pasted 500-link batch must not open 500 concurrent
 /// handshakes (fd limits, origin rate limiting). A small global gate keeps
 /// the fan-out polite; the shared connector reuses connections per host.
-pub async fn probe_link(url: String, user_agent: String, headers: Vec<String>) -> Option<LinkMeta> {
+pub async fn probe_link(
+    url: String,
+    user_agent: String,
+    headers: Vec<String>,
+    proxy: crate::model::ProxyChoice,
+) -> Option<LinkMeta> {
     static GATE: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let gate = GATE
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(6)))
         .clone();
     let _permit = gate.acquire_owned().await.ok()?;
-    // A pasted link has no item yet: the app-wide route is the only one there
-    // is to take.
-    let route = crate::proxy::active();
+    // The route the transfer itself will take — `Default` for a link that has
+    // no item yet, which is the app-wide one. A probe is a request for the
+    // same object, and it must not be the one request that leaves by another
+    // door.
+    let route = crate::proxy::for_choice(&proxy).ok()?;
     let connector = connector_for(route.socks()).ok()?;
     let (url, p) = resolve_link(connector.as_ref(), url, &user_agent, &headers, &route).await?;
     // Nothing to describe: a redirect that could not be followed, an error, or

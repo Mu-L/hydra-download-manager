@@ -27,6 +27,18 @@
       <span>seconds (0 = never)</span>
     </label>
 
+    <label
+      class="row toggle"
+      id="proxy-row"
+      hidden
+      title="Hand each captured download the proxy this browser is using, for that download only. Hydra's own Options are left alone."
+    >
+      <input type="checkbox" id="browser-proxy" />
+      <span>Use this browser's proxy</span>
+    </label>
+
+    <div class="row field" id="proxy-note" hidden><span></span></div>
+
     <div class="actions">
       <button id="open-hydra">Open Hydra</button>
       <button id="all-links">Download all links</button>

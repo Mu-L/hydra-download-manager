@@ -18,7 +18,7 @@ const check = (label, cond, extra = "") => {
 };
 const tick = (n = 3) => new Promise((r) => { let i = 0; const f = () => (++i >= n ? r() : setImmediate(f)); setImmediate(f); });
 
-function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = null } = {}) {
+function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = null, proxy, proxyStyle = "callback" } = {}) {
   const sent = [];          // messages that reached "Hydra"
   const calls = [];         // downloads API calls
   const listeners = {};
@@ -70,6 +70,28 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
       create: () => {}, onRemoved: ev(), onUpdated: ev(),
     },
     cookies: { getAll: async () => [{ name: "sid", value: "abc" }] },
+    // `proxy` is an OPTIONAL permission, and an ungranted one leaves the API
+    // undefined — which is also every Safari build. `undefined` here is that
+    // state, and the tests below depend on the difference.
+    ...(proxy === undefined
+      ? {}
+      : {
+          proxy: {
+            settings: {
+              get: (_d, cb) => {
+                const got = { value: proxy, levelOfControl: "controlled_by_this_extension" };
+                // A promise-only namespace refuses the trailing callback as
+                // an unexpected argument rather than ignoring it.
+                if (proxyStyle === "promise") {
+                  if (cb) throw new Error("Incorrect argument types");
+                  return Promise.resolve(got);
+                }
+                if (proxyStyle === "silent") return undefined; // answers neither way
+                return cb(got);
+              },
+            },
+          },
+        }),
     webRequest: {
       onResponseStarted: {
         addListener: (fn, filter) => {
@@ -651,6 +673,156 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
     (await h.send({ type: "set-panel-timeout", seconds: "" }))?.seconds === 10);
   check("panel timeout: so does nonsense",
     (await h.send({ type: "set-panel-timeout", seconds: "soon" }))?.seconds === 10);
+}
+
+// ------------------------------------------- 10. the browser's own proxy
+//
+// A file behind a tunnel is unreachable by an app that has never heard of the
+// tunnel. The proxy travels with the download so Hydra leaves by the same
+// door — as THAT download's route, never as a change to Hydra's Options.
+{
+  // Chromium, one proxy for everything.
+  const h = build({
+    proxy: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "127.0.0.1", port: 10808 } } },
+  });
+  await tick(4);
+  await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  const dl = h.sent.find((m) => m.type === "download");
+  check("proxy: a fixed proxy rides along with the capture",
+    dl?.proxy === "socks5://127.0.0.1:10808", JSON.stringify(dl?.proxy));
+}
+{
+  // Per-protocol rules: an https download must take the https entry, not
+  // whatever the http one happens to be.
+  const h = build({
+    proxy: {
+      mode: "fixed_servers",
+      rules: {
+        proxyForHttp: { scheme: "http", host: "plain.example", port: 3128 },
+        proxyForHttps: { scheme: "http", host: "secure.example", port: 8888 },
+        bypassList: ["<local>", "*.intranet.example"],
+      },
+    },
+  });
+  await tick(4);
+  await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  check("proxy: the entry for the URL's own scheme is the one that is sent",
+    h.sent.at(-1)?.proxy === "http://secure.example:8888", JSON.stringify(h.sent.at(-1)?.proxy));
+
+  await h.send({ type: "download-url", url: "http://cdn.example/pack.zip" });
+  check("proxy: and http takes the http entry",
+    h.sent.at(-1)?.proxy === "http://plain.example:3128", JSON.stringify(h.sent.at(-1)?.proxy));
+
+  // A bypassed host is one the BROWSER fetches directly; sending it through
+  // the proxy anyway routes intranet traffic to a proxy that will refuse it.
+  await h.send({ type: "download-url", url: "https://files.intranet.example/pack.zip" });
+  check("proxy: a bypassed host is handed over with no proxy at all",
+    h.sent.at(-1)?.proxy === null, JSON.stringify(h.sent.at(-1)?.proxy));
+  await h.send({ type: "download-url", url: "https://fileserver/pack.zip" });
+  check("proxy: <local> covers the dotless names an intranet uses",
+    h.sent.at(-1)?.proxy === null, JSON.stringify(h.sent.at(-1)?.proxy));
+}
+{
+  // Chromium states no port for a proxy on its scheme's default. Hydra's
+  // parser defaults 8080 for HTTP, so leaving it unsaid makes the two
+  // disagree about what `http://proxy` means.
+  const h = build({
+    proxy: { mode: "fixed_servers", rules: { singleProxy: { scheme: "http", host: "proxy.example" } } },
+  });
+  await tick(4);
+  await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  check("proxy: a port the browser left implicit is spelled out",
+    h.sent.at(-1)?.proxy === "http://proxy.example:80", JSON.stringify(h.sent.at(-1)?.proxy));
+}
+{
+  // "system" is the browser saying it follows the machine and will not say
+  // what that is; a PAC script is a program neither side runs. Both leave
+  // the download on whatever Hydra's Options say.
+  for (const mode of ["system", "direct", "auto_detect", "pac_script"]) {
+    const h = build({ proxy: { mode, rules: { singleProxy: { scheme: "socks5", host: "h", port: 1 } } } });
+    await tick(4);
+    await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+    check(`proxy: "${mode}" names nothing we can pass on`,
+      h.sent.at(-1)?.proxy === null, JSON.stringify(h.sent.at(-1)?.proxy));
+  }
+}
+{
+  // Firefox's own shape, and the SOCKS fallback for a scheme its per-protocol
+  // fields do not cover.
+  const h = build({
+    gecko: true,
+    proxy: { proxyType: "manual", socks: "127.0.0.1:9050", socksVersion: 5, passthrough: "localhost, .corp.example" },
+  });
+  await tick(4);
+  await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  check("proxy: Firefox's SOCKS entry carries a scheme it has no field for",
+    h.sent.at(-1)?.proxy === "socks5://127.0.0.1:9050", JSON.stringify(h.sent.at(-1)?.proxy));
+  await h.send({ type: "download-url", url: "https://files.corp.example/pack.zip" });
+  check("proxy: Firefox's passthrough list is a bypass list",
+    h.sent.at(-1)?.proxy === null, JSON.stringify(h.sent.at(-1)?.proxy));
+}
+{
+  // Firefox stores a bare `host:port`, but its own documentation stores
+  // `http://proxy.org:8080`. A scheme the value states wins over the field.
+  const h = build({
+    gecko: true,
+    proxy: { proxyType: "manual", ssl: "http://secure.example:8080", socks: "127.0.0.1:9050", socksVersion: 4 },
+  });
+  await tick(4);
+  await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  check("proxy: an https download prefers the ssl entry over SOCKS",
+    h.sent.at(-1)?.proxy === "http://secure.example:8080", JSON.stringify(h.sent.at(-1)?.proxy));
+  await h.send({ type: "download-url", url: "ftp://cdn.example/pack.zip" });
+  check("proxy: a scheme with no entry of its own falls back to SOCKS, at its version",
+    h.sent.at(-1)?.proxy === "socks4://127.0.0.1:9050", JSON.stringify(h.sent.at(-1)?.proxy));
+}
+{
+  // A namespace that answers with a promise and REFUSES the callback: the
+  // proxy is still read, rather than a calling convention being reported as
+  // "this browser has no proxy".
+  const h = build({
+    proxyStyle: "promise",
+    proxy: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "127.0.0.1", port: 10808 } } },
+  });
+  await tick(4);
+  await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  check("proxy: a promise-only settings API is read too",
+    h.sent.at(-1)?.proxy === "socks5://127.0.0.1:10808", JSON.stringify(h.sent.at(-1)?.proxy));
+}
+{
+  // A namespace that answers neither way. A capture AWAITS the proxy read,
+  // so without a ceiling the download would be parked forever on a question
+  // about a proxy — the browser's copy is paused and nothing ever resumes
+  // it. The answer after the ceiling is the same one the feature gives when
+  // it is switched off.
+  const h = build({
+    proxyStyle: "silent",
+    proxy: { mode: "fixed_servers", rules: { singleProxy: { scheme: "socks5", host: "127.0.0.1", port: 10808 } } },
+  });
+  await tick(4);
+  const sent = h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  const raced = await Promise.race([sent.then(() => "answered"), new Promise((r) => setTimeout(() => r("hung"), 4000))]);
+  check("proxy: a settings API that never answers does not park the download",
+    raced === "answered" && h.sent.at(-1)?.proxy === null,
+    JSON.stringify([raced, h.sent.at(-1)?.proxy]));
+}
+{
+  // The permission IS the switch: ungranted, the API is not there, and the
+  // capture is exactly what it was before this feature existed.
+  const h = build();
+  await tick(4);
+  await h.send({ type: "download-url", url: "https://cdn.example/pack.zip" });
+  check("proxy: without the optional permission nothing is passed on",
+    h.sent.at(-1)?.proxy === null, JSON.stringify(h.sent.at(-1)?.proxy));
+
+  const manifest = JSON.parse(readFileSync("extensions/chrome/manifest.json", "utf8"));
+  check("proxy: the permission is optional, so no install is disabled for it",
+    (manifest.optional_permissions || []).includes("proxy") &&
+      !(manifest.permissions || []).includes("proxy"),
+    JSON.stringify(manifest.optional_permissions));
+  const safari = JSON.parse(readFileSync("extensions/safari/manifest.json", "utf8"));
+  check("proxy: Safari has no proxy API, so it does not ask for one",
+    !(safari.optional_permissions || []).includes("proxy"));
 }
 
 // ------------------------------------------- 7. what the Firefox manifest pins

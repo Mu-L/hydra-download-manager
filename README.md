@@ -300,7 +300,7 @@ The compiled binary will be located at `target/release/hydra`. To build the GUI 
 
 ### Browser Extension
 
-Hydra integrates directly with web browsers to automatically capture downloads, provide right-click context menu options, and intercept media streams.
+Hydra integrates directly with web browsers to automatically capture downloads, provide right-click context menu options, and intercept media streams. The extension popup can also hand each captured download the proxy the browser itself is using, for that download only.
 
 #### Official Store Listings (Recommended)
 
