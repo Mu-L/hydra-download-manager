@@ -2548,24 +2548,27 @@ impl App {
         find_login(url, &self.cfg.settings.logins).map(|l| (l.user.clone(), l.pass.clone()))
     }
 
-    /// The cap this download is actually running under: its own if it set one,
-    /// otherwise the global Speed Limiter's while that is switched on. This is
-    /// the figure the engine was handed, so it is also the one the views may
-    /// present as the transfer's ceiling.
+    /// The ceiling this download cannot exceed on its own: the lower of its
+    /// own cap and the Speed Limiter's, for the views to present.
+    ///
+    /// Not what the engine is handed. The Speed Limiter is an aggregate over
+    /// every running transfer, so the rate a single download may actually
+    /// reach is this figure or less, depending on what else is running.
     pub(crate) fn effective_limit(&self, d: &DownloadItem) -> Option<u64> {
-        d.speed_limit.or_else(|| self.cfg.settings.global_limit())
+        match (d.speed_limit, self.cfg.settings.global_limit()) {
+            (Some(own), Some(global)) => Some(own.min(global)),
+            (own, global) => own.or(global),
+        }
     }
 
-    /// Hand every running transfer the cap it should now be under.
+    /// Put the Speed Limiter's cap in force.
     ///
-    /// A download without a cap of its own inherits the global one, so a
-    /// change to the Speed Limiter has to reach the transfers already in
-    /// flight: a limit that only applied to the next download would miss the
-    /// case it exists for — freeing bandwidth while something large runs.
-    fn push_speed_limits(&self) {
-        for d in self.state.downloads.iter().filter(|d| d.state.is_active()) {
-            engine::send(Cmd::SetLimit(d.id, self.effective_limit(d)));
-        }
+    /// One call, not one per transfer: the engine holds a single bucket every
+    /// download draws from, and it binds the transfers already in flight —
+    /// which is the case the setting exists for, freeing bandwidth while
+    /// something large runs.
+    fn apply_speed_limiter(&self) {
+        engine::set_global_limit(self.cfg.settings.global_limit());
     }
 
     // ------------------------------------------------- download limit
@@ -2691,7 +2694,9 @@ impl App {
             .map(|d| self.conns_for(&d.url))
             .unwrap_or_default();
         // Same source the ranged path uses, read before the mutable borrow.
-        let stream_limit = self.item(id).and_then(|d| self.effective_limit(d));
+        // The transfer's own cap only — the Speed Limiter reaches it as an
+        // aggregate the engine already holds.
+        let stream_limit = self.item(id).and_then(|d| d.speed_limit);
         // Re-downloading over a file a scan flagged: the old verdict and its
         // log describe bytes that are being replaced.
         crate::scan::skip(id);
@@ -2798,7 +2803,7 @@ impl App {
             proxy: d.proxy.clone(),
         };
         let url = d.url.clone();
-        let limit = self.effective_limit(self.item(id).unwrap());
+        let limit = self.item(id).and_then(|d| d.speed_limit);
         let spec = StartSpec {
             conns: self.conns_for(&url),
             limit,
@@ -5494,7 +5499,7 @@ impl App {
                 if let Some(d) = self.item_mut(id) {
                     d.speed_limit = on.then_some(kb * 1024);
                 }
-                let lim = self.item(id).and_then(|d| self.effective_limit(d));
+                let lim = self.item(id).and_then(|d| d.speed_limit);
                 engine::send(Cmd::SetLimit(id, lim));
                 Task::none()
             }
@@ -5620,7 +5625,7 @@ impl App {
                 // The Speed Limiter is editable here as well as from the
                 // toolbar, and the transfers it applies to are running while
                 // this window is open.
-                self.push_speed_limits();
+                self.apply_speed_limiter();
                 // The profile list feeds the native menu's Speed limit
                 // submenu, so a renamed or deleted profile has to rebuild it.
                 self.refresh_native_menu();
@@ -6739,7 +6744,7 @@ impl App {
                 if self.cfg.settings.global_speed_limit.is_none() {
                     self.cfg.settings.global_speed_limit = Some(128 * 1024);
                 }
-                self.push_speed_limits();
+                self.apply_speed_limiter();
                 self.save_config();
                 self.sync_native_menu();
                 Task::none()
@@ -6762,7 +6767,7 @@ impl App {
                 if limit.is_some() {
                     self.cfg.settings.global_speed_limit = limit;
                 }
-                self.push_speed_limits();
+                self.apply_speed_limiter();
                 self.save_config();
                 self.sync_native_menu();
                 Task::none()
@@ -8504,6 +8509,46 @@ mod tests {
             name_locked: false,
             proxy: ProxyChoice::default(),
         }
+    }
+
+    /// What a row may present as its ceiling is the tighter of the two caps.
+    ///
+    /// The Speed Limiter used to be handed to the transfer as its own cap,
+    /// which made "the limit in force" a single number to look up. It is an
+    /// aggregate now, so a download under both caps cannot exceed either, and
+    /// a row claiming its own 500 KB/s under a 128 KB/s app-wide limit would
+    /// be promising bandwidth no transfer can get.
+    #[test]
+    fn a_row_shows_the_tighter_of_the_download_and_app_wide_caps() {
+        let mut app = App::default();
+        let mut d = item(1, "/tmp", "x.zip", None, DlState::Receiving);
+
+        assert_eq!(app.effective_limit(&d), None, "neither cap is set");
+
+        app.cfg.settings.global_speed_limit = Some(128 * 1024);
+        app.cfg.settings.speed_limiter_on = true;
+        assert_eq!(app.effective_limit(&d), Some(128 * 1024));
+
+        d.speed_limit = Some(500 * 1024);
+        assert_eq!(
+            app.effective_limit(&d),
+            Some(128 * 1024),
+            "the app-wide cap is the tighter one"
+        );
+
+        d.speed_limit = Some(64 * 1024);
+        assert_eq!(
+            app.effective_limit(&d),
+            Some(64 * 1024),
+            "the download's own cap is the tighter one"
+        );
+
+        app.cfg.settings.speed_limiter_on = false;
+        assert_eq!(
+            app.effective_limit(&d),
+            Some(64 * 1024),
+            "switching the Speed Limiter off leaves the download's own cap"
+        );
     }
 
     /// "Start Download As New" over a finished file, and Redownload, both go

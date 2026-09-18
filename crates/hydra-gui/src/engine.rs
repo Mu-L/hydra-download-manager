@@ -19,7 +19,7 @@
 use crate::model::{ConnRow, DlId};
 use crate::proxy::Route;
 use hya_core::{Capability, Scheduler, Source};
-use hya_net::polite::RateLimiter;
+use hya_net::polite::{Pace, RateLimiter};
 use hya_net::{probe_resilient, Probe, SparseSink, Target, TlsCapableConnector};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,7 +48,9 @@ pub struct StartSpec {
     /// A CDN with hotlink protection refuses the object without it, whatever
     /// the cookies say.
     pub referer: Option<String>,
-    /// Aggregate cap in bytes/sec; `None` = unlimited (can be changed live).
+    /// This transfer's OWN cap in bytes/sec; `None` = unlimited (can be
+    /// changed live). The Speed Limiter's aggregate is separate and applies on
+    /// top of it — see [`set_global_limit`].
     pub limit: Option<u64>,
     /// Start at one connection and let the in-band ramp admit more while
     /// they pay for themselves; `conns` becomes a ceiling, not a target.
@@ -158,10 +160,10 @@ pub struct StreamSpec {
     /// A live stream has no end of its own, so without this the only way to
     /// get a file is to sit and press Stop.
     pub max_seconds: Option<u64>,
-    /// Aggregate cap in bytes/sec; `None` = unlimited. Carried on the spec
-    /// for the same reason `StartSpec` carries it: a limit configured BEFORE
-    /// the transfer starts has to apply from the first segment, not only
-    /// once someone opens the Speed Limiter tab and triggers `SetLimit`.
+    /// This recording's OWN cap in bytes/sec; `None` = unlimited. Carried on
+    /// the spec for the same reason `StartSpec` carries it: a limit configured
+    /// BEFORE the transfer starts has to apply from the first segment, not
+    /// only once someone opens the Speed Limiter tab and triggers `SetLimit`.
     pub limit: Option<u64>,
     /// Which proxy every manifest and segment request takes.
     pub proxy: crate::model::ProxyChoice,
@@ -209,6 +211,9 @@ pub enum Cmd {
     /// Pause and Cancel are one engine operation (stop the sockets, report the
     /// snapshot); the GUI decides whether the item is "Paused" or removed.
     Stop(DlId),
+    /// Change ONE transfer's own cap. The Speed Limiter's aggregate does not
+    /// travel this way — it is one bucket, not a number copied per download.
+    /// See [`set_global_limit`].
     SetLimit(DlId, Option<u64>),
     /// Re-aim where the finished file lands. The File Info dialog edits the
     /// name/directory while the transfer is already running in the
@@ -272,8 +277,42 @@ pub enum Event {
 
 struct Live {
     cancel: Arc<AtomicBool>,
+    /// This transfer's own cap, the one `SetLimit` moves. The Speed Limiter's
+    /// aggregate is [`global_limiter`] and is not per-transfer.
     limiter: Arc<RateLimiter>,
     final_path: Arc<Mutex<String>>,
+}
+
+/// The Speed Limiter's cap: ONE bucket every transfer in the process draws
+/// from, so the figure means the same thing whether one download is running or
+/// six.
+///
+/// It has to be aggregate to be worth anything. A per-download copy of the
+/// number — which is what handing each transfer its own limiter amounts to —
+/// delivers `limit x running`, so the setting that exists to leave bandwidth
+/// for the rest of the machine takes more of it with every download started.
+/// A per-download ceiling is a separate control (the progress window's), and
+/// both bind at once through [`Pace::pair`].
+fn global_limiter() -> &'static Arc<RateLimiter> {
+    static GLOBAL: OnceLock<Arc<RateLimiter>> = OnceLock::new();
+    GLOBAL.get_or_init(|| Arc::new(RateLimiter::unlimited()))
+}
+
+/// What one transfer answers to: the app-wide cap and its own, both live.
+///
+/// Neither subsumes the other — whichever is tighter at that instant binds —
+/// and both are held even while they are at 0 (unlimited), so a cap switched
+/// on mid-transfer binds the transfer without restarting it.
+fn pace_for(own: &Arc<RateLimiter>) -> Pace {
+    Pace::pair(global_limiter().clone(), own.clone())
+}
+
+/// Set the aggregate cap; `None` = unlimited.
+///
+/// Takes effect on transfers already running, without restarting them: `Pace`
+/// reads the rate on every read, so the Speed Limiter binds what is in flight.
+pub fn set_global_limit(bytes_per_sec: Option<u64>) {
+    global_limiter().set_rate(bytes_per_sec.unwrap_or(0));
 }
 
 static POWER_SAVE: AtomicBool = AtomicBool::new(false);
@@ -387,11 +426,12 @@ fn spawn_engine() -> UnboundedSender<Cmd> {
                     match cmd {
                         Cmd::Start(spec) => {
                             let cancel = Arc::new(AtomicBool::new(false));
-                            // 0 = unlimited. The limiter is handed to the
-                            // transfer either way: `Pace` reads its rate live,
-                            // so Speed Limiter switched on mid-download binds
+                            // 0 = unlimited. Both limiters are handed to
+                            // the transfer either way: `Pace` reads their rates
+                            // live, so a cap switched on mid-download binds
                             // this transfer without restarting it.
                             let limiter = Arc::new(RateLimiter::new(spec.limit.unwrap_or(0)));
+                            let pace = pace_for(&limiter);
                             let final_path = Arc::new(Mutex::new(spec.final_path.clone()));
                             live.insert(
                                 spec.id,
@@ -411,7 +451,7 @@ fn spawn_engine() -> UnboundedSender<Cmd> {
                             tokio::spawn(async move {
                                 let id = spec.id;
                                 let flag = cancel.clone();
-                                run_download(*spec, cancel, limiter, final_path, tx).await;
+                                run_download(*spec, cancel, pace, final_path, tx).await;
                                 let _ = done_tx.send(Cmd::Done(id, flag));
                             });
                         }
@@ -419,7 +459,7 @@ fn spawn_engine() -> UnboundedSender<Cmd> {
                             let cancel = Arc::new(AtomicBool::new(false));
                             let limiter = Arc::new(RateLimiter::new(spec.limit.unwrap_or(0)));
                             let final_path = Arc::new(Mutex::new(spec.final_path.clone()));
-                            let pace_limiter = limiter.clone();
+                            let pace = pace_for(&limiter);
                             live.insert(
                                 spec.id,
                                 Live {
@@ -437,7 +477,7 @@ fn spawn_engine() -> UnboundedSender<Cmd> {
                             tokio::spawn(async move {
                                 let id = spec.id;
                                 let flag = cancel.clone();
-                                run_stream(*spec, cancel, pace_limiter, final_path, tx).await;
+                                run_stream(*spec, cancel, pace, final_path, tx).await;
                                 let _ = done_tx.send(Cmd::Done(id, flag));
                             });
                         }
@@ -1716,7 +1756,7 @@ async fn cancellable<F: std::future::Future>(fut: F, cancel: &AtomicBool) -> Opt
 async fn run_download(
     mut spec: StartSpec,
     cancel: Arc<AtomicBool>,
-    limiter: Arc<RateLimiter>,
+    pace: Pace,
     final_path: Arc<Mutex<String>>,
     tx: UnboundedSender<Event>,
 ) {
@@ -1774,7 +1814,7 @@ async fn run_download(
     // object streams sequentially from one source.
     if let Ok(u) = parse_url(&spec.url) {
         if u.ftp {
-            run_ftp_download(&spec, &u, &cancel, &limiter, &connector, &route, &tx).await;
+            run_ftp_download(&spec, &u, &cancel, &pace, &connector, &route, &tx).await;
             return;
         }
     }
@@ -2036,7 +2076,7 @@ async fn run_download(
                     // Re-enter with the document's sources in hand. Boxed
                     // because this is a recursive `async fn` and its future
                     // would otherwise have to contain itself.
-                    return Box::pin(run_download(spec, cancel, limiter, final_path, tx)).await;
+                    return Box::pin(run_download(spec, cancel, pace, final_path, tx)).await;
                 }
                 Err(e) => {
                     ev(Event::Failed {
@@ -2139,7 +2179,6 @@ async fn run_download(
         // "Receiving data..." at 0 B with Pause and Stop doing nothing at all.
         // The byte counter and the cancel flag are what the loop is for.
         let written = Arc::new(AtomicU64::new(0));
-        let pace = hya_net::polite::Pace::shared(limiter);
         let fut = hya_net::fetch_streaming_observed(
             connector.as_ref(),
             &target,
@@ -2406,7 +2445,6 @@ async fn run_download(
         }
     };
 
-    let pace = hya_net::polite::Pace::shared(limiter);
     let t0 = std::time::Instant::now();
     let tick_ms = if POWER_SAVE.load(Ordering::Relaxed) {
         80
@@ -2516,7 +2554,7 @@ async fn run_ftp_download(
     spec: &StartSpec,
     u: &ParsedUrl,
     cancel: &Arc<AtomicBool>,
-    limiter: &Arc<RateLimiter>,
+    pace: &Pace,
     connector: &Arc<TlsCapableConnector>,
     route: &Route,
     tx: &UnboundedSender<Event>,
@@ -2550,11 +2588,10 @@ async fn run_ftp_download(
     );
     // The shared connector rather than a bare TCP one: it carries the SOCKS
     // proxy, and both the control channel and every PASV data connection have
-    // to take it. The same limiter the HTTP path answers to, so Speed Limiter
+    // to take it. The same caps the HTTP path answers to, so Speed Limiter
     // means the same thing on an ftp:// download — including switched on
     // mid-transfer.
-    let fetcher = hya_net::ftp::FtpFetcher::new(connector.clone())
-        .with_pace(hya_net::polite::Pace::shared(limiter.clone()));
+    let fetcher = hya_net::ftp::FtpFetcher::new(connector.clone()).with_pace(pace.clone());
 
     // Login and SIZE, answerable to Stop: an FTP control channel that accepts
     // the connection and then stalls on the greeting is the same dead wait as a
@@ -3673,6 +3710,62 @@ mod tests {
             }
         }
     }
+
+    /// The Speed Limiter caps the APP, not each download.
+    ///
+    /// Reported: at 128 KB/s with two transfers running the app took 256 KB/s,
+    /// because every transfer was handed its own limiter carrying the global
+    /// number. The setting then took more bandwidth the more downloads it was
+    /// asked to hold back, which is the opposite of what it is for.
+    ///
+    /// Two transfers are paced through the same construction `Cmd::Start`
+    /// uses, and together they must take a full second's worth of the cap to
+    /// move one second's worth of bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_speed_limiter_caps_the_app_not_each_download() {
+        use hya_net::polite::RateLimiter;
+        use std::sync::Arc;
+
+        const RATE: u64 = 4 * 1024 * 1024;
+        // A quarter of the cap's worth each: half a second of bytes between
+        // the two, which the bug moved in a quarter.
+        const EACH: u64 = 1024 * 1024;
+        const READ: u64 = 64 * 1024;
+
+        // Built BEFORE the cap is set, as a transfer already running is: the
+        // limiter is read per read, so switching the Speed Limiter on has to
+        // bind what is in flight.
+        let a = super::pace_for(&Arc::new(RateLimiter::unlimited()));
+        let b = super::pace_for(&Arc::new(RateLimiter::unlimited()));
+        assert!(!a.is_limited(), "nothing is capped until the limiter is on");
+
+        super::set_global_limit(Some(RATE));
+        assert!(a.is_limited() && b.is_limited());
+
+        let push = |pace: hya_net::polite::Pace| async move {
+            let mut sent = 0;
+            while sent < EACH {
+                pace.wait(READ).await;
+                sent += READ;
+            }
+        };
+        let t0 = std::time::Instant::now();
+        tokio::join!(push(a), push(b));
+        let elapsed = t0.elapsed().as_secs_f64();
+        super::set_global_limit(None);
+
+        let ideal = (2 * EACH) as f64 / RATE as f64;
+        assert!(
+            elapsed > ideal * 0.8,
+            "{elapsed:.3}s to move {ideal:.3}s of bytes: the cap is being \
+             applied per download, so N downloads get N times the limit"
+        );
+        assert!(
+            elapsed < ideal * 3.0,
+            "{elapsed:.3}s against {ideal:.3}s at the cap: the aggregate is \
+             throttling far below what it states"
+        );
+    }
 }
 
 // ------------------------------------------------------------ streams
@@ -3962,26 +4055,26 @@ fn spawn_ticker(
 fn segment_fetcher(
     spec: &StreamSpec,
     connector: &Arc<TlsCapableConnector>,
-    limiter: &Arc<RateLimiter>,
+    pace: &Pace,
     cancel: &Arc<AtomicBool>,
     route: &Route,
 ) -> impl hya_stream::Fetcher {
-    let (connector, ck, rf, ua, limiter, cancel, route) = (
+    let (connector, ck, rf, ua, pace, cancel, route) = (
         connector.clone(),
         spec.cookies.clone(),
         spec.referer.clone(),
         spec.user_agent.clone(),
-        limiter.clone(),
+        pace.clone(),
         cancel.clone(),
         route.clone(),
     );
     move |seg: hya_stream::Segment, dest: String, counter: Arc<AtomicU64>| -> hya_stream::FetchSeg {
-        let (connector, ck, rf, ua, limiter, cancel, route) = (
+        let (connector, ck, rf, ua, pace, cancel, route) = (
             connector.clone(),
             ck.clone(),
             rf.clone(),
             ua.clone(),
-            limiter.clone(),
+            pace.clone(),
             cancel.clone(),
             route.clone(),
         );
@@ -3999,7 +4092,6 @@ fn segment_fetcher(
                 // hundreds of small objects on ONE origin, so the socket is kept
                 // and reused. Otherwise every segment pays a fresh TCP and TLS
                 // handshake, which on a distant origin is most of the wall clock.
-                let pace = hya_net::polite::Pace::shared(limiter.clone());
                 let pool = hya_net::Connector::pool(connector.as_ref());
                 match hya_net::fetch_object(
                     connector.as_ref(),
@@ -4193,7 +4285,7 @@ async fn record_live(
     source: LiveSource,
     primed: Option<(Vec<Window>, bool, std::time::Duration)>,
     connector: &Arc<TlsCapableConnector>,
-    limiter: &Arc<RateLimiter>,
+    pace: &Pace,
     cancel: &Arc<AtomicBool>,
     final_path: &Arc<Mutex<String>>,
     route: &Route,
@@ -4239,7 +4331,7 @@ async fn record_live(
     // from an atomic rather than behind a lock.
     let media_ms = Arc::new(AtomicU64::new(0));
     let ticker = spawn_ticker(id, &meter, tx, cancel, None, 0, Some(media_ms.clone()));
-    let fetch = segment_fetcher(spec, connector, limiter, cancel, route);
+    let fetch = segment_fetcher(spec, connector, pace, cancel, route);
     let t0 = std::time::Instant::now();
 
     // Seconds of media PLANNED per track. Kept per track because video and
@@ -4723,7 +4815,7 @@ impl Assembly {
 async fn run_stream(
     spec: StreamSpec,
     cancel: Arc<AtomicBool>,
-    limiter: Arc<RateLimiter>,
+    pace: Pace,
     final_path: Arc<Mutex<String>>,
     tx: UnboundedSender<Event>,
 ) {
@@ -4848,7 +4940,7 @@ async fn run_stream(
                 source,
                 primed,
                 &connector,
-                &limiter,
+                &pace,
                 &cancel,
                 &final_path,
                 &route,
@@ -4976,7 +5068,7 @@ async fn run_stream(
                 source,
                 primed,
                 &connector,
-                &limiter,
+                &pace,
                 &cancel,
                 &final_path,
                 &route,
@@ -5166,7 +5258,7 @@ async fn run_stream(
         None,
     );
 
-    let fetch = segment_fetcher(&spec, &connector, &limiter, &cancel, &route);
+    let fetch = segment_fetcher(&spec, &connector, &pace, &cancel, &route);
 
     let mut parts: Vec<String> = Vec::new();
     let mut outcome = Ok(());
@@ -5543,7 +5635,7 @@ mod stream_tests {
         run_stream(
             spec.clone(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(RateLimiter::new(0)),
+            Pace::unlimited(),
             Arc::new(Mutex::new(spec.final_path.clone())),
             tx,
         )
@@ -5623,7 +5715,7 @@ mod stream_tests {
         run_stream(
             spec.clone(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(RateLimiter::new(0)),
+            Pace::unlimited(),
             Arc::new(Mutex::new(spec.final_path.clone())),
             tx,
         )
@@ -5674,7 +5766,7 @@ mod stream_tests {
         run_stream(
             spec.clone(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(RateLimiter::new(0)),
+            Pace::unlimited(),
             Arc::new(Mutex::new(spec.final_path.clone())),
             tx,
         )
@@ -5706,7 +5798,7 @@ mod stream_tests {
         run_stream(
             spec.clone(),
             cancel,
-            Arc::new(RateLimiter::new(0)),
+            Pace::unlimited(),
             Arc::new(Mutex::new(spec.final_path.clone())),
             tx,
         )
@@ -6681,7 +6773,7 @@ mod stream_tests {
         run_stream(
             spec.clone(),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(RateLimiter::new(0)),
+            Pace::unlimited(),
             Arc::new(Mutex::new(spec.final_path.clone())),
             tx,
         )
@@ -7364,7 +7456,7 @@ x-amzn-waf-action: challenge\r\nConnection: close\r\n\r\n",
                     run_download(
                         spec,
                         cancel,
-                        Arc::new(RateLimiter::new(0)),
+                        Pace::unlimited(),
                         Arc::new(Mutex::new(final_path)),
                         tx,
                     ),
@@ -7415,7 +7507,7 @@ x-amzn-waf-action: challenge\r\nConnection: close\r\n\r\n",
                 run_download(
                     spec,
                     Arc::new(AtomicBool::new(false)),
-                    Arc::new(RateLimiter::new(0)),
+                    Pace::unlimited(),
                     Arc::new(Mutex::new(final_path)),
                     tx,
                 )
@@ -7470,7 +7562,7 @@ x-amzn-waf-action: challenge\r\nConnection: close\r\n\r\n",
                 run_download(
                     spec,
                     Arc::new(AtomicBool::new(false)),
-                    Arc::new(RateLimiter::new(0)),
+                    Pace::unlimited(),
                     Arc::new(Mutex::new(final_path)),
                     tx,
                 )

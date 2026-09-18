@@ -159,6 +159,9 @@ fn boot() -> (App, Task<Message>) {
     // its event receiver.
     engine::ensure_started();
     engine::set_power_save(cfg.settings.power_save);
+    // The Speed Limiter's cap lives in the engine, not on the specs, so a
+    // limiter left switched on has to be put back in force at startup.
+    engine::set_global_limit(cfg.settings.global_limit());
     proxy::apply(&cfg.settings);
 
     // Browser-extension bridge: publish capture settings, then listen for
