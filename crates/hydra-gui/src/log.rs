@@ -214,7 +214,11 @@ pub fn redact(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{os_release, redact};
+    // `os_release` is only reached by the test below it, and that test only
+    // runs where the release is discoverable.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::os_release;
+    use super::redact;
 
     /// The banner's whole value is being specific, so a platform that
     /// silently reports "unknown release" is worth catching here rather

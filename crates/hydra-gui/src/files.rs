@@ -124,37 +124,41 @@ fn file_uri(path: &Path) -> String {
 /// one — without changing what the file type opens with by default.
 ///
 /// Windows and macOS each ship a system chooser for exactly this, and it is
-/// a process to start, so those are done by the time this returns. Linux has
-/// no such dialog to call, so there the application is chosen with the same
-/// native picker "Browse..." uses — hence the [`Task`], which is empty on
-/// the other two.
+/// a process to start: there is nothing left to wait for, so the [`Task`] is
+/// empty and `owner` goes unused.
+#[cfg(not(target_os = "linux"))]
 pub fn open_with<T: Send + 'static>(owner: Option<window::Id>, path: &Path) -> Task<T> {
+    let _ = owner;
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
-        let _ = owner;
         spawn(open_with_command(path));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        // Applications live in .desktop files here, and the desktops differ
-        // on whether they will open one at all, so the picker starts where
-        // they are kept and takes either shape.
-        let ask = crate::picker::Ask {
-            title: Some(crate::i18n::tr("Open with...")),
-            ..crate::picker::Ask::in_dir("/usr/share/applications")
-        };
-        let path = path.to_path_buf();
-        return crate::picker::file(owner, ask).and_then(move |app| {
-            spawn(open_with_command(&path, &app));
-            Task::none()
-        });
+        let _ = path;
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-    {
-        let _ = (owner, path);
-    }
-    #[cfg(not(target_os = "linux"))]
     Task::none()
+}
+
+/// Ask the user which application should open `path`, and open it with that
+/// one — without changing what the file type opens with by default.
+///
+/// Linux ships no application chooser to call, so the application is chosen
+/// with the same native panel "Browse..." uses, which is why this one has a
+/// [`Task`] to hand back. Applications live in .desktop files, and the
+/// desktops differ on whether they will launch one at all, so the panel
+/// starts where they are kept and takes either shape.
+#[cfg(target_os = "linux")]
+pub fn open_with<T: Send + 'static>(owner: Option<window::Id>, path: &Path) -> Task<T> {
+    let ask = crate::picker::Ask {
+        title: Some(crate::i18n::tr("Open with...")),
+        ..crate::picker::Ask::in_dir("/usr/share/applications")
+    };
+    let path = path.to_path_buf();
+    crate::picker::file(owner, ask).and_then(move |app| {
+        spawn(open_with_command(&path, &app));
+        Task::none()
+    })
 }
 
 /// The Windows "Open with" dialog. Shipped with the shell, and the only way
