@@ -7571,7 +7571,7 @@ fn fit_to_display(size: (f32, f32), display: iced::Size, scale: f32) -> (f32, f3
 /// The link a pasted line carries, or `None` when it carries none.
 ///
 /// A list copied from a page or exported by another manager rarely holds bare
-/// URLs: IDM writes `title|http://host/file`, numbered lists prefix `1. `, and
+/// URLs: writes `title|http://host/file`, numbered lists prefix `1. `, and
 /// markup leaves quotes around the address. Take the first scheme that appears
 /// and read to the first character no URL can hold, rather than asking the
 /// whole line to parse.
@@ -8584,7 +8584,7 @@ mod tests {
         );
     }
 
-    /// The reported bug: a list in IDM's own clipboard format, every line a
+    /// The reported bug: a list in own clipboard format, every line a
     /// title, a bar and the address. Requiring the whole line to parse threw
     /// all of it away and opened an empty table.
     #[test]
