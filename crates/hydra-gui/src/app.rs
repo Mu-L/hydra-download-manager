@@ -910,6 +910,14 @@ pub struct BatchState {
     pub hide_html: bool,
     /// Show each distinct URL once, however often it was pasted.
     pub hide_dups: bool,
+    /// Rows highlighted for "Check Selected", as indices into `checks`.
+    ///
+    /// The same identity the checkboxes use, so sorting or hiding rows can
+    /// never move a highlight onto another link.
+    pub sel: std::collections::HashSet<usize>,
+    /// Where a Shift-click measures its run from. Held across clicks, so
+    /// shrinking a range by Shift-clicking nearer the anchor works.
+    pub sel_anchor: Option<usize>,
 }
 
 impl Default for BatchState {
@@ -930,6 +938,8 @@ impl Default for BatchState {
             stream_container: String::new(),
             metalinks: Default::default(),
             sort: None,
+            sel: Default::default(),
+            sel_anchor: None,
             hide_html: false,
             // A duplicate never adds a second download, so hiding it is the
             // sensible default — the same one  ships with.
@@ -1341,6 +1351,11 @@ pub enum Message {
     InfoProbed(DlId, Option<engine::LinkMeta>),
     BatchCheck(usize, bool),
     BatchCheckAll(bool),
+    /// A click anywhere on a batch row but its checkbox: selects it, and
+    /// extends or toggles the selection under Shift / Cmd-Ctrl.
+    BatchRowClick(usize),
+    /// Check or uncheck every highlighted row.
+    BatchCheckSel(bool),
     BatchSaveMode(u8),
     BatchCategory(String),
     BatchDir(String),
@@ -6161,6 +6176,48 @@ impl App {
                 }
                 Task::none()
             }
+            Message::BatchRowClick(i) => {
+                if self.mods.command() || self.mods.control() {
+                    if !self.batch.sel.remove(&i) {
+                        self.batch.sel.insert(i);
+                    }
+                    self.batch.sel_anchor = Some(i);
+                    return Task::none();
+                }
+                let order: Vec<usize> = self.batch_rows().iter().map(|r| r.idx).collect();
+                if self.mods.shift() {
+                    // Run between the anchor and the click in the order the
+                    // table is showing, which is what the user is pointing at:
+                    // sorted by size, a range is a size range.
+                    //
+                    // A filter can have hidden the anchor since it was set;
+                    // the click then starts a run of its own rather than
+                    // silently selecting nothing.
+                    let anchor = self
+                        .batch
+                        .sel_anchor
+                        .filter(|a| order.contains(a))
+                        .unwrap_or(i);
+                    let a = order.iter().position(|x| *x == anchor);
+                    let b = order.iter().position(|x| *x == i);
+                    if let (Some(a), Some(b)) = (a, b) {
+                        self.batch.sel = order[a.min(b)..=a.max(b)].iter().copied().collect();
+                        self.batch.sel_anchor = Some(anchor);
+                    }
+                    return Task::none();
+                }
+                self.batch.sel = std::iter::once(i).collect();
+                self.batch.sel_anchor = Some(i);
+                Task::none()
+            }
+            Message::BatchCheckSel(b) => {
+                for i in self.batch.sel.clone() {
+                    if let Some(c) = self.batch.checks.get_mut(i) {
+                        c.1 = b;
+                    }
+                }
+                Task::none()
+            }
             Message::BatchSaveMode(m) => {
                 self.batch.to_category = m == 1;
                 self.batch.to_dir = m == 2;
@@ -6192,10 +6249,12 @@ impl App {
             }
             Message::BatchHideHtml(b) => {
                 self.batch.hide_html = b;
+                self.batch_prune_sel();
                 Task::none()
             }
             Message::BatchHideDups(b) => {
                 self.batch.hide_dups = b;
+                self.batch_prune_sel();
                 Task::none()
             }
             Message::BatchBrowseDir => picker::folder(self.win_of(WinKind::Batch), Ask::default())
@@ -6640,7 +6699,29 @@ impl App {
                 )
             })
             .collect();
+        // A highlight is a position in this list, so a line added or removed
+        // above it would leave it pointing at another link. Checked state does
+        // survive the edit: it is carried over by URL, just above.
+        if self
+            .batch
+            .checks
+            .iter()
+            .map(|(u, _)| u)
+            .ne(existing.iter().map(|(u, _)| u))
+        {
+            self.batch.sel.clear();
+            self.batch.sel_anchor = None;
+        }
         self.batch.parsed = true;
+    }
+
+    /// Drop from the batch selection every row the table is no longer
+    /// showing: "Check Selected" must not reach a link hidden behind a
+    /// filter, the same rule "Check All" already follows.
+    fn batch_prune_sel(&mut self) {
+        let shown: std::collections::HashSet<usize> =
+            self.batch_rows().iter().map(|r| r.idx).collect();
+        self.batch.sel.retain(|i| shown.contains(i));
     }
 
     // ------------------------------------------------------------ menu bar
@@ -8397,6 +8478,22 @@ mod tests {
         }
     }
 
+    /// The batch selection, in index order — a `HashSet` has none of its own.
+    fn sel(app: &App) -> Vec<usize> {
+        let mut v: Vec<usize> = app.batch.sel.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    fn checked(app: &App) -> Vec<&str> {
+        app.batch
+            .checks
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(u, _)| u.as_str())
+            .collect()
+    }
+
     fn shown(st: &BatchState) -> Vec<usize> {
         batch_rows(st, |_| "d".into(), |_| false)
             .iter()
@@ -8557,6 +8654,154 @@ mod tests {
         assert_eq!(rows[1].save_to, "/dl/none.zip");
         assert!(rows[1].blocked && !rows[0].blocked);
         assert_eq!(rows[0].kind, "ZIP archive");
+    }
+
+    /// Four links, sorted by size. The workflow the multi-row selection was
+    /// asked for: click the first row of a run, Shift-click the last, check
+    /// exactly that run and nothing above it.
+    #[test]
+    fn a_shift_click_checks_the_run_between_the_two_clicks() {
+        let mut app = App::default();
+        app.batch.checks = vec![
+            ("https://a.b/huge.iso".into(), false),
+            ("https://a.b/small.zip".into(), false),
+            ("https://a.b/mid.zip".into(), false),
+            ("https://a.b/tiny.txt".into(), false),
+        ];
+        app.batch.parsed = true;
+        for (u, n) in [
+            ("https://a.b/huge.iso", 900_000_000),
+            ("https://a.b/small.zip", 20_000_000),
+            ("https://a.b/mid.zip", 90_000_000),
+            ("https://a.b/tiny.txt", 1_000),
+        ] {
+            app.batch.sizes.insert(u.into(), n);
+        }
+        app.batch.sort = Some((BatchSortKey::Size, true));
+        assert_eq!(shown(&app.batch), vec![3, 1, 2, 0], "smallest first");
+
+        let _ = app.update(Message::BatchRowClick(3));
+        app.mods = iced::keyboard::Modifiers::SHIFT;
+        let _ = app.update(Message::BatchRowClick(2));
+        assert_eq!(sel(&app), vec![1, 2, 3], "the run is taken in table order");
+
+        // Shift-clicking back towards the anchor shrinks the same run rather
+        // than starting a new one from the last click.
+        let _ = app.update(Message::BatchRowClick(1));
+        assert_eq!(sel(&app), vec![1, 3]);
+        app.mods = iced::keyboard::Modifiers::default();
+
+        let _ = app.update(Message::BatchCheckSel(true));
+        assert_eq!(
+            checked(&app),
+            vec!["https://a.b/small.zip", "https://a.b/tiny.txt"],
+            "the files above the run stay out of the batch"
+        );
+        let _ = app.update(Message::BatchCheckSel(false));
+        assert!(checked(&app).is_empty());
+    }
+
+    /// Cmd/Ctrl-click adds and removes one row at a time, leaving the rest of
+    /// the selection where it was.
+    #[test]
+    fn a_command_click_toggles_one_row_of_the_selection() {
+        let mut app = App::default();
+        app.batch.checks = vec![
+            ("https://a.b/x.zip".into(), false),
+            ("https://a.b/y.zip".into(), false),
+            ("https://a.b/z.zip".into(), false),
+        ];
+        app.batch.parsed = true;
+        let _ = app.update(Message::BatchRowClick(0));
+        app.mods = iced::keyboard::Modifiers::COMMAND;
+        let _ = app.update(Message::BatchRowClick(2));
+        assert_eq!(sel(&app), vec![0, 2]);
+        let _ = app.update(Message::BatchRowClick(2));
+        assert_eq!(sel(&app), vec![0], "the second click takes it back out");
+        app.mods = iced::keyboard::Modifiers::default();
+        // A plain click is a fresh selection, not another addition.
+        let _ = app.update(Message::BatchRowClick(1));
+        assert_eq!(sel(&app), vec![1]);
+    }
+
+    /// A row that a filter hides leaves the selection with it: "Check
+    /// Selected" must not opt in a link the table is not showing, the same
+    /// rule "Check All" follows.
+    #[test]
+    fn hiding_a_row_drops_it_from_the_selection() {
+        let mut app = App::default();
+        app.batch.checks = vec![
+            ("https://a.b/x.zip".into(), false),
+            ("https://a.b/index.html".into(), false),
+            ("https://a.b/y.iso".into(), false),
+        ];
+        app.batch.parsed = true;
+        let _ = app.update(Message::BatchRowClick(0));
+        app.mods = iced::keyboard::Modifiers::SHIFT;
+        let _ = app.update(Message::BatchRowClick(2));
+        assert_eq!(sel(&app), vec![0, 1, 2]);
+        app.mods = iced::keyboard::Modifiers::default();
+
+        let _ = app.update(Message::BatchHideHtml(true));
+        assert_eq!(sel(&app), vec![0, 2]);
+        let _ = app.update(Message::BatchCheckSel(true));
+        assert_eq!(
+            checked(&app),
+            vec!["https://a.b/x.zip", "https://a.b/y.iso"],
+            "the hidden page was never checked"
+        );
+    }
+
+    /// The same rule for the other filter: a repeat of a link is a row of its
+    /// own while duplicates are shown, and goes with them when they are hidden.
+    #[test]
+    fn hiding_duplicates_drops_the_repeat_from_the_selection() {
+        let mut app = App::default();
+        app.batch.checks = vec![
+            ("https://a.b/x.zip".into(), false),
+            ("https://a.b/x.zip".into(), false),
+            ("https://a.b/y.iso".into(), false),
+        ];
+        app.batch.parsed = true;
+        let _ = app.update(Message::BatchHideDups(false));
+        let _ = app.update(Message::BatchRowClick(0));
+        app.mods = iced::keyboard::Modifiers::SHIFT;
+        let _ = app.update(Message::BatchRowClick(2));
+        assert_eq!(sel(&app), vec![0, 1, 2]);
+        app.mods = iced::keyboard::Modifiers::default();
+
+        let _ = app.update(Message::BatchHideDups(true));
+        assert_eq!(sel(&app), vec![0, 2]);
+        let _ = app.update(Message::BatchCheckSel(true));
+        assert_eq!(
+            checked(&app),
+            vec!["https://a.b/x.zip", "https://a.b/y.iso"]
+        );
+    }
+
+    /// Editing the box re-numbers the rows, so a highlight made before the
+    /// edit no longer points at the link it was drawn on. Checked state is
+    /// carried over by URL and does survive.
+    #[test]
+    fn editing_the_url_box_drops_a_selection_made_before_it() {
+        let mut app = App::default();
+        let paste = |t: &str| {
+            Message::BatchEdit(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new(t.to_string()),
+            )))
+        };
+        let _ = app.update(paste("https://a.b/x.zip\nhttps://a.b/y.zip\n"));
+        let _ = app.update(Message::BatchRowClick(1));
+        let _ = app.update(Message::BatchCheckSel(false));
+        assert_eq!(sel(&app), vec![1]);
+
+        let _ = app.update(paste("https://a.b/z.zip\n"));
+        assert!(sel(&app).is_empty() && app.batch.sel_anchor.is_none());
+        assert_eq!(
+            checked(&app),
+            vec!["https://a.b/x.zip", "https://a.b/z.zip"],
+            "unchecking y.zip outlived the edit"
+        );
     }
 
     /// A background transfer that finishes while File Info is still open must
