@@ -1115,11 +1115,11 @@ pub type FetchSeg =
 /// What a caller must supply: fetch this segment (honouring its byte range,
 /// if it has one) into `dest`, updating the counter as bytes arrive.
 pub trait Fetcher:
-    Fn(Segment, String, std::sync::Arc<AtomicU64>) -> FetchSeg + Send + Sync + Clone + 'static
+    Fn(Segment, String, Arc<AtomicU64>) -> FetchSeg + Send + Sync + Clone + 'static
 {
 }
 impl<F> Fetcher for F where
-    F: Fn(Segment, String, std::sync::Arc<AtomicU64>) -> FetchSeg + Send + Sync + Clone + 'static
+    F: Fn(Segment, String, Arc<AtomicU64>) -> FetchSeg + Send + Sync + Clone + 'static
 {
 }
 
