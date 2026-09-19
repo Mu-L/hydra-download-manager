@@ -74,7 +74,7 @@ pub fn view(app: &App) -> El<'_> {
 
     let mut list = column![].spacing(1);
     for r in &rows {
-        list = list.push(row_el(r));
+        list = list.push(row_el(r, st.sel.contains(&r.idx)));
     }
     let table = column![
         header(st, &rows),
@@ -162,9 +162,20 @@ pub fn view(app: &App) -> El<'_> {
     .spacing(8)
     .width(Length::Fill);
 
+    // Grey while nothing is highlighted: the pair only means anything once a
+    // click, Shift-click or Cmd-click has marked rows out.
+    let has_sel = !st.sel.is_empty();
     let side = column![
         dlg_btn(tr("Check All"), Some(Message::BatchCheckAll(true))),
         dlg_btn(tr("Uncheck All"), Some(Message::BatchCheckAll(false))),
+        dlg_btn(
+            tr("Check Selected"),
+            has_sel.then_some(Message::BatchCheckSel(true))
+        ),
+        dlg_btn(
+            tr("Uncheck Selected"),
+            has_sel.then_some(Message::BatchCheckSel(false))
+        ),
         checkbox(st.hide_html)
             .label(tr("Hide HTML files"))
             .on_toggle(Message::BatchHideHtml)
@@ -259,7 +270,10 @@ fn header<'a>(st: &BatchState, rows: &[BatchRow]) -> El<'a> {
     r.into()
 }
 
-fn row_el<'a>(r: &BatchRow) -> El<'a> {
+/// One table row. `selected` is the highlight, which is not the checkbox:
+/// the highlight says what "Check Selected" would act on, the checkbox says
+/// what OK would add.
+fn row_el<'a>(r: &BatchRow, selected: bool) -> El<'a> {
     let blocked_color = iced::Color::from_rgb8(0xC0, 0x2B, 0x2B);
     let from: El<'a> = if r.blocked {
         text(format!("{} ({})", r.url, tr("blocked site")))
@@ -274,7 +288,7 @@ fn row_el<'a>(r: &BatchRow) -> El<'a> {
             .into()
     };
     let idx = r.idx;
-    row![
+    let content = row![
         container(
             checkbox(r.checked)
                 .on_toggle(move |b| Message::BatchCheck(idx, b))
@@ -294,8 +308,15 @@ fn row_el<'a>(r: &BatchRow) -> El<'a> {
         cell(plain(r.save_to.clone()), Some(SAVE_W)),
     ]
     .spacing(0)
-    .align_y(iced::Alignment::Center)
-    .into()
+    .align_y(iced::Alignment::Center);
+    // `mouse_area` hands the event to its child first, so a click that lands
+    // on the checkbox toggles that one link and leaves the highlight alone.
+    // Hover is not tracked here — the main list only needs it because rows
+    // there are drag-selected; a dialog row has nothing to follow.
+    mouse_area(container(content).style(theme::row_cell(selected, false)))
+        .interaction(iced::mouse::Interaction::Idle)
+        .on_press(Message::BatchRowClick(idx))
+        .into()
 }
 
 fn plain<'a>(s: String) -> El<'a> {
