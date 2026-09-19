@@ -1045,6 +1045,9 @@ pub struct Settings {
     /// upgrade must not silently move a user off the palette they picked.
     pub dark_mode: Option<bool>,
     pub show_categories: bool,
+    /// View > Hide toolbar text. Off, the toolbar draws icons alone and each
+    /// one carries its label as a hover tooltip instead.
+    pub show_toolbar_labels: bool,
     /// View > Scale, in percent of the size the layout was drawn at; see
     /// [`crate::theme::ui_scale`].
     pub ui_scale_pct: u16,
@@ -1150,6 +1153,7 @@ impl Default for Settings {
             theme_mode: None,
             dark_mode: None,
             show_categories: true,
+            show_toolbar_labels: true,
             ui_scale_pct: 100,
             font_size: None,
             global_speed_limit: None,
@@ -2167,6 +2171,16 @@ mod tests {
         assert!(PowerAction::Shutdown.ends_session());
         assert!(PowerAction::LogOff.ends_session());
         assert!(!PowerAction::Sleep.ends_session());
+    }
+
+    #[test]
+    fn a_config_written_before_the_toolbar_toggle_keeps_its_labels() {
+        // The toolbar has always drawn its labels; an upgrade must not empty
+        // it out because the new key is absent from the file.
+        let old: Settings = toml::from_str("show_categories = true\n").unwrap();
+        assert!(old.show_toolbar_labels);
+        let hidden: Settings = toml::from_str("show_toolbar_labels = false\n").unwrap();
+        assert!(!hidden.show_toolbar_labels);
     }
 
     #[test]

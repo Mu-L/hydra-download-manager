@@ -22,6 +22,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu
 pub struct MenuState {
     pub theme_mode: crate::model::ThemeMode,
     pub show_categories: bool,
+    pub show_toolbar_labels: bool,
     pub ui_scale_pct: u16,
     pub language: String,
     pub speed_limiter: bool,
@@ -36,6 +37,7 @@ struct Installed {
     /// these wrappers, and a language switch rebuilds from here.
     _menu: Menu,
     hide_categories: CheckMenuItem,
+    hide_toolbar_text: CheckMenuItem,
     speed_limiter: CheckMenuItem,
     speed_profiles: Vec<CheckMenuItem>,
     themes: Vec<(crate::model::ThemeMode, CheckMenuItem)>,
@@ -190,6 +192,12 @@ pub fn reinstall(
         !state.show_categories,
     );
     let _ = view.append(&hide_categories);
+    let hide_toolbar_text = check(
+        "Hide toolbar text",
+        MenuAction::HideToolbarText,
+        !state.show_toolbar_labels,
+    );
+    let _ = view.append(&hide_toolbar_text);
     let _ = view.append(&item("Columns", MenuAction::ManageColumns));
     let arrange = Submenu::new(tr("Arrange files"), true);
     // Q holds an icon, not a value a reader can arrange by.
@@ -254,6 +262,7 @@ pub fn reinstall(
         *c.borrow_mut() = Some(Installed {
             _menu: menu,
             hide_categories,
+            hide_toolbar_text,
             speed_limiter,
             speed_profiles,
             themes,
@@ -282,6 +291,9 @@ pub fn sync(state: &MenuState) -> bool {
         installed
             .hide_categories
             .set_checked(!state.show_categories);
+        installed
+            .hide_toolbar_text
+            .set_checked(!state.show_toolbar_labels);
         installed.speed_limiter.set_checked(state.speed_limiter);
         for (i, item) in installed.speed_profiles.iter().enumerate() {
             item.set_checked(state.speed_profile == Some(i));
