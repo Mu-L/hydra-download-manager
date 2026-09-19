@@ -204,6 +204,8 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
         MenuBarKind::View => vec![
             Entry::item(tr("Hide categories"), MenuAction::HideCategories)
                 .check(!app.cfg.settings.show_categories),
+            Entry::item(tr("Hide toolbar text"), MenuAction::HideToolbarText)
+                .check(!app.cfg.settings.show_toolbar_labels),
             Entry::item(tr("Columns"), MenuAction::ManageColumns),
             Entry::sub(
                 tr("Arrange files"),

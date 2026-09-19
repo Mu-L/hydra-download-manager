@@ -109,6 +109,9 @@ pub enum MenuAction {
     /// Options, opened straight on the Extensions page (toolbar shortcut).
     Extensions,
     HideCategories,
+    /// View > Hide toolbar text: toolbar icons keep their labels or trade
+    /// them for hover tooltips.
+    HideToolbarText,
     ArrangeBy(Column),
     /// View > Columns, and the header menu's own entry: the manage dialog.
     ManageColumns,
@@ -177,6 +180,7 @@ impl MenuAction {
             MenuAction::Options => "options".into(),
             MenuAction::Extensions => "extensions".into(),
             MenuAction::HideCategories => "hide_cats".into(),
+            MenuAction::HideToolbarText => "hide_toolbar_text".into(),
             MenuAction::ArrangeBy(k) => format!("arrange:{}", k.id()),
             MenuAction::ManageColumns => "columns".into(),
             MenuAction::ToggleColumn(c) => format!("col_show:{}", c.id()),
@@ -272,6 +276,7 @@ impl MenuAction {
             "options" => MenuAction::Options,
             "extensions" => MenuAction::Extensions,
             "hide_cats" => MenuAction::HideCategories,
+            "hide_toolbar_text" => MenuAction::HideToolbarText,
             "columns" => MenuAction::ManageColumns,
             "homepage" => MenuAction::HomePage,
             "contribute" => MenuAction::Contribute,
@@ -1986,6 +1991,7 @@ impl App {
         crate::macos_menu::MenuState {
             theme_mode: self.cfg.settings.theme(),
             show_categories: self.cfg.settings.show_categories,
+            show_toolbar_labels: self.cfg.settings.show_toolbar_labels,
             ui_scale_pct: self.cfg.settings.ui_scale_pct,
             language: {
                 let l = self.cfg.language.clone().unwrap_or_else(|| "en".into());
@@ -3879,6 +3885,7 @@ impl App {
                     let state = crate::macos_menu::MenuState {
                         theme_mode: self.cfg.settings.theme(),
                         show_categories: self.cfg.settings.show_categories,
+                        show_toolbar_labels: self.cfg.settings.show_toolbar_labels,
                         ui_scale_pct: self.cfg.settings.ui_scale_pct,
                         language: self.cfg.language.clone().unwrap_or_else(|| "en".into()),
                         speed_limiter: self.cfg.settings.speed_limiter_on,
@@ -6814,6 +6821,12 @@ impl App {
                 self.sync_native_menu();
                 Task::none()
             }
+            MenuAction::HideToolbarText => {
+                self.cfg.settings.show_toolbar_labels = !self.cfg.settings.show_toolbar_labels;
+                self.save_config();
+                self.sync_native_menu();
+                Task::none()
+            }
             MenuAction::ArrangeBy(key) => self.update(Message::SortBy(key)),
             MenuAction::ManageColumns => self.open_window(WinKind::Columns),
             MenuAction::ToggleColumn(col) => self.update(Message::ColToggle(col)),
@@ -8270,6 +8283,47 @@ mod tests {
             MenuAction::from_id(&MenuAction::SpeedLimitSettings.id()),
             Some(MenuAction::SpeedLimitSettings)
         );
+    }
+
+    /// View > Hide toolbar text is clicked in the native macOS bar, which
+    /// carries actions as strings: an id that does not come back is an entry
+    /// that does nothing there.
+    #[test]
+    fn the_toolbar_text_toggle_comes_back_from_its_menu_id() {
+        assert_eq!(
+            MenuAction::from_id(&MenuAction::HideToolbarText.id()),
+            Some(MenuAction::HideToolbarText)
+        );
+    }
+
+    /// The View entry is a checkbox over a setting, not a counter of clicks:
+    /// it has to flip the setting, keep it for the next launch, and show the
+    /// tick the setting says it should.
+    #[test]
+    // The toggle syncs the native menu bar, and muda builds an NSMenu on the
+    // main thread only — which a test thread is not. Linux/Windows, where CI
+    // runs the suite, have no native bar to sync.
+    #[cfg_attr(target_os = "macos", ignore = "muda needs the main thread")]
+    fn hiding_the_toolbar_text_flips_the_setting_and_its_tick() {
+        let ticked = |app: &App| {
+            crate::ui::menu::entries(MenuBarKind::View, app)
+                .into_iter()
+                .find(|e| e.action == Some(MenuAction::HideToolbarText))
+                .expect("View offers the toolbar-text toggle")
+                .checked
+        };
+        let mut app = App::default();
+        assert!(app.cfg.settings.show_toolbar_labels);
+        assert!(!ticked(&app));
+
+        let _ = app.update(Message::Menu(MenuAction::HideToolbarText));
+        assert!(!app.cfg.settings.show_toolbar_labels);
+        assert!(app.cfg_dirty, "the choice has to outlive the session");
+        assert!(ticked(&app));
+
+        let _ = app.update(Message::Menu(MenuAction::HideToolbarText));
+        assert!(app.cfg.settings.show_toolbar_labels);
+        assert!(!ticked(&app));
     }
 
     /// Removing the row the user picked must leave the others alone — and must
