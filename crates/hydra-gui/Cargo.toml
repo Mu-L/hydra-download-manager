@@ -78,7 +78,14 @@ png = "0.18"
 # libappindicator -> gtk -> glib into Cargo.lock for every platform
 # (RUSTSEC-2024-0429: unsound `glib::VariantStrIter`, unfixable while the
 # discontinued gtk3 bindings pin glib < 0.20), so keep them off.
-tray-icon = { version = "0.24", default-features = false }
+#
+# 0.25 is a floor, not a preference. Up to 0.24 the macOS backend left the
+# menu attached to the NSStatusItem, and AppKit then swallowed the left
+# mouse-down before the view that reports clicks ever saw it — so
+# `with_menu_on_left_click(false)` in tray/muda.rs suppressed the menu and
+# got nothing in its place, leaving the icon dead to a left click (#140).
+# 0.25 attaches the menu only for the duration of the pop-up.
+tray-icon = { version = "0.25", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux tray: StatusNotifierItem over D-Bus, in pure Rust. Display-server
