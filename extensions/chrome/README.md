@@ -68,6 +68,13 @@ extension ──────────┤                                     
   and segments are kept out of the direct-media list. A manifest that
   declares Widevine, PlayReady, FairPlay or common encryption is shown as
   unsupported and is never sent — Hydra does not circumvent DRM.
+- The selection pill is the same bargain as the video bar: handy on a release
+  page where the files are a highlighted column, in the way on a page of prose
+  that happens to be linked. **Download button on selected links** in the popup
+  chooses when it shows — *Always*, *Only several links* (a lone one is already
+  served by the right-click menu, so the batch is what is left), or *Never*.
+  The page obeys the new choice at once rather than on the next reload, and a
+  pill the choice forbids is taken back rather than left on screen.
 - Hold **Alt** while clicking a link to bypass capture once.
 
 ## Install

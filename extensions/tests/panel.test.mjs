@@ -364,6 +364,49 @@ eq(
   );
 }
 
+// ---- when the selection pill is offered ---------------------------------
+//
+// Dismissing it only closes the one that is up; the next selection brings it
+// back. The setting is the thing that decides whether there is a next one.
+{
+  const show = src.slice(src.indexOf("function showPill"));
+  const body = show.slice(0, show.indexOf("\n}"));
+  eq(
+    "switched off, it never even measures the selection",
+    /^\s*if \(pillMode === "never"\) return hidePill\(\);/m.test(body),
+    true
+  );
+  // The count comes from linksInSelection, so the test of it has to follow
+  // the collection rather than short-circuit ahead of it.
+  eq(
+    "on batches only, a lone link is left to the right-click menu",
+    /pillMode === "multi" && urls\.length < 2/.test(body) &&
+      body.indexOf("linksInSelection") < body.indexOf('pillMode === "multi"'),
+    true
+  );
+  eq(
+    "the popup's choice reaches the page with the rest of the settings",
+    /if \(r\.selectionPill\) pillMode = r\.selectionPill/.test(src),
+    true
+  );
+  // Narrowing the setting has to take back a pill that is ALREADY up, not
+  // merely stop the next one — otherwise the one on screen outlives the
+  // choice that forbade it.
+  eq(
+    "and a pill the new setting forbids goes away at once",
+    /if \(pillMode === "never" \|\| \(pillMode === "multi" && pillUrls\.length < 2\)\) hidePill\(\)/.test(src),
+    true
+  );
+  // Without this the choice only took effect on tabs opened afterwards,
+  // which reads as the setting not working at all.
+  eq(
+    "an open page is told the moment the setting changes",
+    /storage\?\.onChanged\?\.addListener/.test(src) &&
+      /PAGE_SETTINGS\.some\(\(k\) => k in changes\)/.test(src),
+    true
+  );
+}
+
 // The name every row used to repeat is shown once, above them.
 {
   const render = src.slice(src.indexOf("function renderRows"));

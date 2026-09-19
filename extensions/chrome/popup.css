@@ -84,6 +84,26 @@ header {
   opacity: 0.45;
 }
 
+/* The label and the choices do not fit together on a 300px line, so the
+   picker takes the next one and lines up under the labels above it. */
+.row.pick {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.row.pick > span:first-child {
+  flex: 1 0 100%;
+}
+.row.pick select {
+  margin-left: 22px;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 4px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
 .actions {
   display: flex;
   gap: 8px;

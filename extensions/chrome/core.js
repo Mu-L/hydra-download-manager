@@ -135,6 +135,17 @@ const MEDIA_PER_TAB = 25;
 const PANEL_TIMEOUT_DEFAULT = 10;
 const PANEL_TIMEOUT_MAX = 600;
 
+// When the selection pill is offered. "multi" is the middle answer the
+// reports asked for: on a release page a highlighted column of files is
+// exactly the batch the pill is for, while a single link is already served by
+// the right-click menu and by Alt+click.
+const PILL_MODES = ["always", "multi", "never"];
+const PILL_MODE_DEFAULT = "always";
+
+function clampPillMode(v) {
+  return PILL_MODES.includes(v) ? v : PILL_MODE_DEFAULT;
+}
+
 function clampPanelTimeout(v) {
   // An empty field is "I have not chosen", not "never hide it" — and
   // Number("") is 0, which would quietly mean the latter.
@@ -151,6 +162,7 @@ async function getState() {
     autoTypes: DEFAULT_TYPES,
     skipSites: DEFAULT_SKIP,
     videoPanel: true, // the floating Download button over <video> elements
+    selectionPill: PILL_MODE_DEFAULT, // when the pill is offered beside selected links
     panelTimeout: PANEL_TIMEOUT_DEFAULT, // seconds it lingers; 0 = until dismissed
     hydraSeen: false, // ever completed a round-trip
   });
@@ -1431,6 +1443,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case "get-state": {
         const state = await getState();
+        state.selectionPill = clampPillMode(state.selectionPill);
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
         const media = tab?.id != null ? await tabMedia(tab.id) : [];
         const streams = tab?.id != null ? await tabStreams(tab.id) : [];
@@ -1452,6 +1465,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.local.set({ videoPanel: !!msg.on });
         sendResponse({ ok: true });
         break;
+      case "set-selection-pill": {
+        const mode = clampPillMode(msg.mode);
+        await chrome.storage.local.set({ selectionPill: mode });
+        sendResponse({ ok: true, mode });
+        break;
+      }
       case "set-panel-timeout": {
         const seconds = clampPanelTimeout(msg.seconds);
         await chrome.storage.local.set({ panelTimeout: seconds });
@@ -1466,6 +1485,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           streams: id != null ? await tabStreams(id) : [],
           media: id != null ? await tabMedia(id) : [],
           videoPanel: state.enabled && state.videoPanel,
+          selectionPill: state.enabled ? clampPillMode(state.selectionPill) : "never",
           panelTimeout: clampPanelTimeout(state.panelTimeout),
         });
         break;
