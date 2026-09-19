@@ -537,3 +537,54 @@ pub fn info() -> svg::Handle {
     ))
     .clone()
 }
+
+#[cfg(test)]
+mod tests {
+    /// Windows accepts PNG-compressed icon images only at 256x256; below that
+    /// the entry has to be a BITMAPINFOHEADER DIB. An all-PNG .ico still looks
+    /// right in Explorer and the Start menu, which decode through the shell,
+    /// but the small-icon GDI path draws nothing — which is how the app came
+    /// to have a blank row in Task Manager.
+    #[test]
+    fn windows_icon_is_dib_below_256px() {
+        const ICO: &[u8] = include_bytes!("../../../scripts/windows/hydra.ico");
+        const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\x0a";
+
+        let count = u16::from_le_bytes([ICO[4], ICO[5]]) as usize;
+        assert!(count > 0);
+
+        let mut sizes = Vec::new();
+        for i in 0..count {
+            let e = &ICO[6 + i * 16..][..16];
+            let width = if e[0] == 0 { 256 } else { e[0] as u32 };
+            let len = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
+            let off = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
+            let image = &ICO[off..off + len];
+            sizes.push(width);
+
+            if width >= 256 {
+                continue;
+            }
+            assert_ne!(&image[..8], PNG_MAGIC, "{width}px entry is PNG-compressed");
+            let header_size = u32::from_le_bytes([image[0], image[1], image[2], image[3]]);
+            let dib_width = i32::from_le_bytes([image[4], image[5], image[6], image[7]]);
+            let dib_height = i32::from_le_bytes([image[8], image[9], image[10], image[11]]);
+            let bit_count = u16::from_le_bytes([image[14], image[15]]);
+            let compression = u32::from_le_bytes([image[16], image[17], image[18], image[19]]);
+            assert_eq!(header_size, 40, "{width}px entry is not a BITMAPINFOHEADER");
+            assert_eq!(dib_width, width as i32);
+            // The DIB stacks the colour image on the AND mask, so it is twice
+            // as tall as the icon it draws.
+            assert_eq!(dib_height, width as i32 * 2, "{width}px entry has no mask");
+            assert_eq!(bit_count, 32);
+            assert_eq!(compression, 0, "{width}px entry is compressed");
+
+            let stride = width.div_ceil(32) * 4;
+            assert_eq!(len, 40 + (width * width * 4 + stride * width) as usize);
+        }
+
+        for want in [16, 32, 48, 256] {
+            assert!(sizes.contains(&want), "no {want}px entry");
+        }
+    }
+}
