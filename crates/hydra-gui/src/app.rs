@@ -6685,8 +6685,7 @@ impl App {
             .text
             .text()
             .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && engine::parse_url(l).is_ok())
+            .filter_map(url_in_line)
             .map(|l| {
                 let prev = existing.iter().find(|(u, _)| u == l).map(|(_, b)| *b);
                 // A link whose host is on the "don't start downloading
@@ -7567,6 +7566,24 @@ fn fit_to_display(size: (f32, f32), display: iced::Size, scale: f32) -> (f32, f3
         size.0.min(display.width * USABLE_W / scale),
         size.1.min(display.height * USABLE_H / scale),
     )
+}
+
+/// The link a pasted line carries, or `None` when it carries none.
+///
+/// A list copied from a page or exported by another manager rarely holds bare
+/// URLs: writes `title|http://host/file`, numbered lists prefix `1. `, and
+/// markup leaves quotes around the address. Take the first scheme that appears
+/// and read to the first character no URL can hold, rather than asking the
+/// whole line to parse.
+pub fn url_in_line(line: &str) -> Option<&str> {
+    const SCHEMES: [&str; 3] = ["http://", "https://", "ftp://"];
+    let at = SCHEMES.iter().filter_map(|s| line.find(s)).min()?;
+    let rest = &line[at..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '|' | '\\'))
+        .unwrap_or(rest.len());
+    let url = &rest[..end];
+    engine::parse_url(url).is_ok().then_some(url)
 }
 
 /// Does this clipboard line look like a download link? Two signals, either
@@ -8564,6 +8581,47 @@ mod tests {
             app.batch.probing.len(),
             2,
             "a link nothing was sent out for can only ever show an empty Size"
+        );
+    }
+
+    /// The reported bug: a list in own clipboard format, every line a
+    /// title, a bar and the address. Requiring the whole line to parse threw
+    /// all of it away and opened an empty table.
+    #[test]
+    fn a_titled_list_line_still_yields_its_link() {
+        let mut app = App::default();
+        let list = "15、 TYPE-C和 MICRO HDMI模块|http://z.example/a/15%E3%80%81.sdrm\n\
+                    1. https://z.example/b.zip\n\
+                    <a href=\"https://z.example/c.zip\">c</a>\n\
+                    没有链接\n";
+        let _ = app.update(Message::BatchLoaded(Some(list.into())));
+        assert_eq!(
+            app.batch
+                .checks
+                .iter()
+                .map(|(u, _)| u.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "http://z.example/a/15%E3%80%81.sdrm",
+                "https://z.example/b.zip",
+                "https://z.example/c.zip",
+            ],
+            "a prefix, a number or surrounding markup must not hide the link"
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_usable_address_yields_nothing() {
+        assert_eq!(url_in_line("https://a.b/x.zip"), Some("https://a.b/x.zip"));
+        assert_eq!(url_in_line("  ftp://a.b/x.zip\r"), Some("ftp://a.b/x.zip"));
+        assert_eq!(url_in_line(""), None);
+        assert_eq!(url_in_line("just some prose"), None);
+        assert_eq!(url_in_line("mailto:someone@a.b"), None);
+        assert_eq!(url_in_line("see http:// for details"), None);
+        assert_eq!(
+            url_in_line("a|http://a.b/x.zip|b"),
+            Some("http://a.b/x.zip"),
+            "the bar that opened the address also closes it"
         );
     }
 
