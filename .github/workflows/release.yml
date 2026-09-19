@@ -573,14 +573,24 @@ jobs:
           scripts/package-flatpak.sh --bundle --version "$VERSION" --out dist
           ls -lh dist/
 
+      # Headless, so only the paths that do not need a display are exercised.
+      # The default command is hydra-gui, and a runner has no display server
+      # for it; what a sandbox without one cannot exercise is the compositor,
+      # not the loader, so the CLI, the native-messaging host and hydra-gui's
+      # own library list answer the question. That last check is the point of
+      # a Flatpak smoke test: the build linked against the SDK, users get the
+      # Platform runtime, and a library in one and not the other shows up
+      # here rather than on a desktop.
       - name: Smoke-test Flatpak bundle
         run: |
           set -euo pipefail
           BUNDLE=$(readlink -f "$(ls -1 dist/*.flatpak | head -1)")
           flatpak install --user -y "$BUNDLE"
-          flatpak run io.github.ja7ad.hydra --version
-          flatpak run --command=hydra-host io.github.ja7ad.hydra --help
-          flatpak run --command=hydra-updater io.github.ja7ad.hydra --help
+          flatpak run --command=hydra io.github.ja7ad.hydra --version
+          flatpak run --command=hydra-host io.github.ja7ad.hydra </dev/null
+          MISSING=$(flatpak run --command=sh io.github.ja7ad.hydra \
+            -c 'LD_TRACE_LOADED_OBJECTS=1 /app/bin/hydra-gui' | grep 'not found' || true)
+          [ -z "$MISSING" ] || { echo "hydra-gui misses: $MISSING" >&2; exit 1; }
           flatpak uninstall --user -y io.github.ja7ad.hydra
 
       - name: Upload Flatpak artifact
@@ -613,9 +623,11 @@ jobs:
           set -euo pipefail
           BUNDLE=$(readlink -f "$(ls -1 dist/*.flatpak | head -1)")
           flatpak install --user -y "$BUNDLE"
-          flatpak run io.github.ja7ad.hydra --version
-          flatpak run --command=hydra-host io.github.ja7ad.hydra --help
-          flatpak run --command=hydra-updater io.github.ja7ad.hydra --help
+          flatpak run --command=hydra io.github.ja7ad.hydra --version
+          flatpak run --command=hydra-host io.github.ja7ad.hydra </dev/null
+          MISSING=$(flatpak run --command=sh io.github.ja7ad.hydra \
+            -c 'LD_TRACE_LOADED_OBJECTS=1 /app/bin/hydra-gui' | grep 'not found' || true)
+          [ -z "$MISSING" ] || { echo "hydra-gui misses: $MISSING" >&2; exit 1; }
           flatpak uninstall --user -y io.github.ja7ad.hydra
 
   # ---------------------------------------------------------------- libhydra
