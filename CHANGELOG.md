@@ -5,6 +5,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.6.0] - 2026-09-19
+
+### Added
+
+- **File Actions, Percentage UI Scale & Portable Browser-Capture Handoff (`hydra-gui`)**:
+  - Added *Show in Folder*, *Open With...* and *Move file* actions to the download row context menu, each with a native, platform-specific implementation (Explorer `/select,`, macOS `open -R` / AppleScript chooser, Linux `dbus-send`/`gio`).
+  - Replaced the point-size *View → Font* setting with a percentage-based *View → Scale* (50%, 67%, 75%, 80%, 90%, 100%, 110%, 125%, 150%, 175%, 200%), scaling the entire interface — text, rows, buttons and dialogs — together instead of just the type size.
+  - Added *Options → Extensions → "Let this copy handle browser capture"* for portable installs (`hydra-gui --config <dir>`), registering that copy's native-messaging host so browser downloads reach the running portable profile instead of any ordinary install on the same account.
+- **Flatpak Packaging & Flathub Release (`packaging/flatpak`, CI)**:
+  - Added a Flatpak manifest, desktop entry and AppStream metadata, with a GitHub Actions job that builds and validates the bundle and publishes it to Flathub as `io.github.ja7ad.hydra`.
+  - Installable with `flatpak install flathub io.github.ja7ad.hydra`.
+- **Video Panel Quality-Led Rows & Auto-Hide Timeout (browser extensions)**:
+  - Each row in the "Download this video" bar now leads with what distinguishes it from its neighbors (e.g. `1080p HD · MP4 · 4.8 Mbps`), with the page title heading the list once instead of repeating on every row.
+  - The bar now clears itself once its player scrolls out of view and reappears over the next one on screen — useful for a feed of clips.
+  - Added a *Hide it after* setting in the popup (10 seconds by default, `0` to leave it up until dismissed).
+- **Browser's Own Proxy Hand-off for Captured Downloads (browser extensions, `hydra-gui`)**:
+  - Added a *Use this browser's proxy* option in the popup: the proxy the browser is using for a captured URL now travels with that single download as its own route, without touching Hydra's own Options → Proxy/Socks settings.
+  - Honors the browser's proxy bypass list; system-wide/auto-detect proxies and PAC scripts are intentionally left alone (neither browser exposes what they resolve to), so those downloads fall back to Hydra's own settings.
+  - Requires no credentials and no extra permission grant beyond the existing capture optional permission; Safari has no proxy API, so the option stays hidden there.
+- **Toolbar Text Visibility Toggle (`hydra-gui`)**:
+  - Added *View → Hide toolbar text*, collapsing the toolbar to icons only, with the label available as a hover tooltip. The Speed Limiter button keeps its active cap visible in the tooltip (e.g. "Speed Limit — 5 MB/s") so a forgotten limit stays discoverable.
+- **Selection-Pill Visibility Control (browser extensions)**:
+  - Added *Download button on selected links* in the popup, choosing when the floating batch-download pill appears over a text selection: *Always*, *Only several links*, or *Never*. Takes effect immediately on the page, without a reload.
+- **Multi-Row Selection & Bulk Actions in the Batch Download Table (`hydra-gui`)**:
+  - Added click, Shift-click and Cmd/Ctrl-click multi-row selection to the batch download dialog's link table.
+  - Added *Check Selected* and *Uncheck Selected* buttons alongside the existing *Check All*/*Uncheck All*, enabled only while a selection is active.
+- **Scheduler Queue Field Spin Arrows & Save (`hydra-gui`)**:
+  - Added up/down spin arrows next to the Scheduler's numeric fields (retries, files-at-once) so values can be nudged without retyping them, and values below the field's floor can be stepped back into range.
+  - Added a *Save* button to the Scheduler dialog to persist queue changes without starting or stopping it.
+
+### Fixed
+
+- **Firefox Capture Split & Blocked WebSocket (`extensions/firefox`)**:
+  - Split the shared extension code into a browser-neutral `core.js` and a per-browser `background.js`, giving Firefox its own capture path (Firefox has no `onDeterminingFilename`, so capture happens at the response instead of after the download is already created, which is what previously left orphaned "Canceled" rows in Firefox's native download list).
+  - Fixed Firefox's default Manifest V3 content-security-policy silently upgrading the extension's `ws://127.0.0.1:6799` connection to `wss://`, which the app does not speak — the socket never connected, every capture fell through to slower `hydra-host` spawning, and the toolbar reported the app as down even while it was running.
+- **Chromium Save Dialog Race (`extensions/chrome`)**:
+  - Fixed Chromium's native *"Save as"* dialog popping up alongside Hydra's own *New Download* window for users with *Ask where to save each file* enabled, by deferring the filename `suggest()` callback until after Hydra has decided whether to capture the download.
+- **HLS Alternate Audio Rendition Fetch (`hydra-stream`, `hydra-cli`, `hydra-gui`)**:
+  - Fixed downloaded HLS streams coming out silent when a variant's audio is a separate `#EXT-X-MEDIA` rendition rather than muxed into the video segments (a pattern several streaming CDNs use). Hydra now parses alternate audio renditions, picks the one a player would (`DEFAULT`, then `AUTOSELECT`, then the first listed), and fetches it alongside the video.
+- **CLI Percent-Escape Decoding for Suggested Filenames (`hydra-cli`)**:
+  - Fixed downloaded filenames derived from a URL (when `-O` is not given) keeping raw percent-escapes, e.g. saving `Elementor%20Pro.zip` instead of `Elementor Pro.zip`.
+  - Query strings are now stripped before the filename is derived, so a redirect parameter containing its own `/` (`?redirect=/a/b.zip`) no longer hijacks the suggested name.
+- **Batch Dialog URL List Scrolling (`hydra-gui`)**:
+  - Fixed the batch download dialog's URL text box clipping pasted lists instead of scrolling, which could hide the first or last links in a large paste with no visible indication that more content existed.
+- **Batch Clipboard Link Recognition & Probing (`hydra-gui`)**:
+  - Fixed links pasted in "titled list" formats (e.g. IDM's `title|url`, numbered lists, HTML anchor markup) being dropped entirely instead of added to the batch table.
+  - Fixed the batch dialog re-probing every link on each keystroke after a large paste; links are now probed once each, debounced until typing pauses.
+- **App-Wide Speed Limiter Cap (`hydra-gui`)**:
+  - Fixed the Speed Limiter applying its cap per download instead of as a single shared aggregate, which let overall bandwidth usage multiply with the number of simultaneously active downloads.
+- **Non-Blocking File & Folder Pickers (`hydra-gui`)**:
+  - Fixed native *Save As* / folder-picker dialogs freezing the whole application (including progress repaints for other active downloads) while open, by moving them onto the platform's own async panel APIs instead of `rfd`'s blocking call.
+- **Windows Task Manager Blank Icon (`hydra-gui`)**:
+  - Fixed the app icon appearing blank in Windows Task Manager and other small-icon contexts by storing icon images below 256×256 as uncompressed DIB entries instead of PNG-compressed ones, which Windows' small-icon GDI path cannot decode.
+- **macOS Tray Icon Left-Click (`hydra-gui`)**:
+  - Fixed left-clicking the macOS menu-bar tray icon doing nothing on some systems, by updating the `tray-icon` dependency to 0.25, which stops AppKit from swallowing the click before it reaches Hydra.
+- **File Properties Start Button Caption (`hydra-gui`)**:
+  - The *Start Download* button in the *File Properties* dialog is now captioned by state: *Resume Download* when bytes are already held, *Start Download As New* for a completed file, or *Show Progress* for one already running.
+  - Fixed re-downloading a completed file (or redownloading from the list) potentially writing the new data into a stale `.part` file left over from the previous transfer.
+
+---
+
 ## [0.5.0] - 2026-09-13
 
 ### Added
