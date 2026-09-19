@@ -94,6 +94,12 @@ function linksInSelection() {
 let pillHost = null;
 let pillLabel = null;
 let pillUrls = [];
+// When to offer the pill: "always", "multi" (only a selection holding more
+// than one link) or "never". Selecting text is an ordinary reading gesture, so
+// on a page whose prose is linked the pill kept answering selections that were
+// never about downloading anything — while a highlighted column of release
+// files is the batch it exists for.
+let pillMode = "always";
 
 // Why a protected stream cannot be fetched.
 //
@@ -225,8 +231,12 @@ function hidePill() {
 }
 
 function showPill() {
+  if (pillMode === "never") return hidePill();
   const urls = linksInSelection();
   if (!urls.length) return hidePill();
+  // One link is already served by the right-click menu, which costs the
+  // reader nothing until they ask for it.
+  if (pillMode === "multi" && urls.length < 2) return hidePill();
   const sel = window.getSelection();
   const rect = sel.getRangeAt(sel.rangeCount - 1).getBoundingClientRect();
   if (!rect || (rect.width === 0 && rect.height === 0)) return hidePill();
@@ -930,8 +940,10 @@ async function refreshPageItems() {
     if (r) {
       pageItems = { streams: r.streams || [], media: r.media || [] };
       panelEnabled = r.videoPanel !== false;
+      if (r.selectionPill) pillMode = r.selectionPill;
       if (Number.isFinite(r.panelTimeout)) panelLingerMs = r.panelTimeout * 1000;
       if (!panelEnabled) hidePanel();
+      if (pillMode === "never" || (pillMode === "multi" && pillUrls.length < 2)) hidePill();
     }
   } catch {
     // Background asleep or extension reloaded; keep what we had.
@@ -1041,6 +1053,16 @@ document.addEventListener("keydown", (e) => {
 // coordinates and would be stranded behind it.
 document.addEventListener("fullscreenchange", () => {
   if (document.fullscreenElement) hidePanel();
+});
+
+// A change in the popup has to reach pages that are already open: settings ride
+// the `page-media` reply, so re-asking for it is the whole update. Only these
+// keys change what the page shows — the rest of the stored state (capture
+// types, `hydraSeen`) is written on every reply from the app, and waking every
+// tab for those would be noise.
+const PAGE_SETTINGS = ["enabled", "videoPanel", "selectionPill", "panelTimeout"];
+chrome.storage?.onChanged?.addListener((changes, area) => {
+  if (area === "local" && PAGE_SETTINGS.some((k) => k in changes)) refreshPageItems();
 });
 
 // Both at load: the sniffed list, and where this site's bar was last put.

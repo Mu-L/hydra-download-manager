@@ -247,6 +247,7 @@ async function refresh() {
   $("video-panel").checked = state.videoPanel !== false;
   $("panel-timeout").value = state.panelTimeout;
   $("panel-timeout").disabled = !$("video-panel").checked;
+  $("selection-pill").value = state.selectionPill;
 
   // Liveness: the live WebSocket is the truth; probe only if it looks down
   // (never launches the app).
@@ -307,6 +308,15 @@ $("video-panel").addEventListener("change", async (e) => {
   // How long a button that is switched off stays up is not a question.
   $("panel-timeout").disabled = !e.target.checked;
   await chrome.runtime.sendMessage({ type: "set-video-panel", on: e.target.checked });
+});
+
+$("selection-pill").addEventListener("change", async (e) => {
+  const r = await chrome.runtime.sendMessage({
+    type: "set-selection-pill",
+    mode: e.target.value,
+  });
+  // Show what was actually stored, the way the timeout field does.
+  if (r && r.mode) e.target.value = r.mode;
 });
 
 // `change`, not `input`: a field being typed into passes through states the

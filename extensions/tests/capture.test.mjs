@@ -675,6 +675,45 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
     (await h.send({ type: "set-panel-timeout", seconds: "soon" }))?.seconds === 10);
 }
 
+// ------------------------- 7. when the two in-page buttons are offered
+//
+// Both ride the same reply as the list they offer, and both are answers about
+// what the PAGE shows, so the master capture switch takes them with it.
+{
+  const h = build();
+  await tick(4);
+  const fresh = await h.send({ type: "page-media" });
+  check("pill: offered on any selection until told otherwise",
+    fresh.selectionPill === "always", JSON.stringify(fresh));
+
+  check("pill: the popup's choice is stored and echoed",
+    (await h.send({ type: "set-selection-pill", mode: "multi" }))?.mode === "multi");
+  check("pill: and reaches the page",
+    (await h.send({ type: "page-media" })).selectionPill === "multi");
+  check("pill: choosing when it shows leaves the video bar alone",
+    (await h.send({ type: "page-media" })).videoPanel === true);
+
+  check("pill: it can be switched off outright",
+    (await h.send({ type: "set-selection-pill", mode: "never" }))?.mode === "never" &&
+      (await h.send({ type: "page-media" })).selectionPill === "never");
+
+  // The popup renders the stored value straight into a <select>; a value no
+  // option carries would show as no choice at all.
+  check("pill: a mode nobody offers falls back to the default",
+    (await h.send({ type: "set-selection-pill", mode: "sometimes" }))?.mode === "always");
+  check("pill: so does a missing one",
+    (await h.send({ type: "set-selection-pill" }))?.mode === "always");
+
+  // Capture off means the extension stands aside; a button inviting it back
+  // onto every selection would be arguing with that.
+  await h.send({ type: "set-enabled", enabled: false });
+  const off = await h.send({ type: "page-media" });
+  check("pill: capture off takes both in-page buttons with it",
+    off.selectionPill === "never" && off.videoPanel === false, JSON.stringify(off));
+  check("pill: and the popup is still shown the mode it will return to",
+    (await h.send({ type: "get-state" })).state.selectionPill === "always");
+}
+
 // ------------------------------------------- 10. the browser's own proxy
 //
 // A file behind a tunnel is unreachable by an app that has never heard of the
