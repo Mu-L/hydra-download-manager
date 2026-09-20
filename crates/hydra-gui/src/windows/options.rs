@@ -340,6 +340,11 @@ fn downloads(app: &App) -> El<'_> {
             check(s.remove_completed, tr("Remove completed downloads from the list")).on_toggle(|b| o(OptField::RemoveCompleted(b))),
             tr("A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept."),
         ),
+        section(tr("Open folder")),
+        hinted(
+            check(s.select_in_file_manager, tr("Select the downloaded file in the file manager")).on_toggle(|b| o(OptField::SelectInFileManager(b))),
+            tr("Off = the folder opens without the file highlighted, through whatever the system opens folders with. Turn it off on Windows if a replacement for Explorer should get the window."),
+        ),
         section(tr("Virus checking")),
         text(tr("Virus scanner program")).size(theme::FONT_SIZE),
         row![

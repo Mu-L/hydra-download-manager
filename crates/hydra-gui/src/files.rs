@@ -36,18 +36,20 @@ fn spawn(mut cmd: Command) -> bool {
         .is_ok()
 }
 
-/// Open the folder holding `path` with `path` itself selected.
+/// Open the folder holding `path`, with `path` itself selected when
+/// `select`.
 ///
-/// "Open folder" on a download that landed in `~/Downloads` next to nine
-/// hundred other files is only useful if the file is the one highlighted
-/// when the window comes up. Falls back to opening the containing folder,
-/// which is what every platform did before.
-pub fn reveal(path: &Path) {
-    if path.is_file() {
-        if let Some(cmd) = reveal_command(path) {
-            if spawn(cmd) {
-                return;
-            }
+/// Highlighting the file is what makes this useful in a folder with nine
+/// hundred downloads in it, but selecting an item names one file manager —
+/// Explorer, Finder — where opening a folder goes through the shell. So a
+/// user running a replacement turns `select` off and gets their own window
+/// without the highlight: Directory Opus and friends hook the folder call
+/// and nothing `explorer /select,` takes. The folder is the fallback too,
+/// for a path with nothing to select and a command that would not start.
+pub fn reveal(path: &Path, select: bool) {
+    if let Some(cmd) = reveal_command(path, select) {
+        if spawn(cmd) {
+            return;
         }
     }
     if let Some(dir) = path.parent() {
@@ -55,9 +57,13 @@ pub fn reveal(path: &Path) {
     }
 }
 
-/// The platform's "select this item in its folder", or `None` where there is
-/// no such thing to run.
-fn reveal_command(path: &Path) -> Option<Command> {
+/// The platform's "select this item in its folder", or `None` when the user
+/// asked for the folder alone, there is no file to point at, or the
+/// platform has no such thing to run.
+fn reveal_command(path: &Path, select: bool) -> Option<Command> {
+    if !select || !path.is_file() {
+        return None;
+    }
     #[cfg(target_os = "windows")]
     {
         // explorer.exe exits non-zero even when it did open the window, so
@@ -95,7 +101,6 @@ fn reveal_command(path: &Path) -> Option<Command> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        let _ = path;
         None
     }
 }
@@ -238,6 +243,17 @@ mod tests {
         )
     }
 
+    /// A real downloaded file, since a reveal command is only built for a
+    /// path that is one. Its own directory per test, so the cleanups do not
+    /// race each other.
+    fn a_downloaded_file(test: &str, name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hydra-reveal-{}-{test}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let file = dir.join(name);
+        std::fs::write(&file, b"payload").expect("downloaded file");
+        file
+    }
+
     #[test]
     fn a_move_lands_the_bytes_and_leaves_nothing_behind() {
         let dir = std::env::temp_dir().join(format!("hydra-files-{}", std::process::id()));
@@ -267,20 +283,33 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_selects_the_item_in_one_argument() {
-        let cmd = reveal_command(Path::new(r"D:\Downloads\My File.zip")).expect("a command");
+        let file = a_downloaded_file("win-select", "My File.zip");
+        let cmd = reveal_command(&file, true).expect("a command");
         let (program, args) = spelling(&cmd);
         assert_eq!(program, "explorer");
-        assert_eq!(args, [r"/select,D:\Downloads\My File.zip"]);
+        let [arg] = args.as_slice() else {
+            panic!("the item travels as ONE argument, not two: {args:?}");
+        };
+        assert!(
+            arg.starts_with("/select,"),
+            "no space after the comma: {arg}"
+        );
+        assert!(arg.ends_with("My File.zip"), "lost the item: {arg}");
+
+        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_reveals_rather_than_opening() {
-        let cmd = reveal_command(Path::new("/Users/a/Downloads/My File.zip")).expect("a command");
+        let file = a_downloaded_file("mac-reveal", "My File.zip");
+        let cmd = reveal_command(&file, true).expect("a command");
         let (program, args) = spelling(&cmd);
         assert_eq!(program, "open");
         // -R selects the file in Finder; without it `open` would RUN it.
-        assert_eq!(args, ["-R", "/Users/a/Downloads/My File.zip"]);
+        assert_eq!(args, ["-R", &file.to_string_lossy()]);
+
+        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
     }
 
     /// The chooser has to be handed the file as an argument, never spliced
@@ -304,16 +333,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_asks_the_file_manager_for_a_uri_it_can_read() {
-        let cmd = reveal_command(Path::new("/home/a/My Downloads/naïve (1).zip")).expect("cmd");
+        let file = a_downloaded_file("linux-showitems", "naïve (1).zip");
+        let cmd = reveal_command(&file, true).expect("cmd");
         let (program, args) = spelling(&cmd);
         assert_eq!(program, "dbus-send");
         assert!(args.contains(&"org.freedesktop.FileManager1.ShowItems".to_string()));
-        assert!(args.contains(
-            &"array:string:file:///home/a/My%20Downloads/na%C3%AFve%20%281%29.zip".to_string()
-        ));
+        assert!(args.contains(&format!("array:string:{}", file_uri(&file))));
+        assert!(args.iter().any(|a| a.contains("na%C3%AFve%20%281%29.zip")));
         // ShowItems takes a startup id as its second argument; an empty one
         // is still an argument, and omitting it fails the call.
         assert_eq!(args.last().map(String::as_str), Some("string:"));
+
+        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
     }
 
     #[cfg(target_os = "linux")]
@@ -345,5 +376,24 @@ mod tests {
         let (program, args) = spelling(&open_with_command(file, Path::new("/usr/bin/xpdf")));
         assert_eq!(program, "/usr/bin/xpdf");
         assert_eq!(args, ["/home/a/Downloads/x.pdf"]);
+    }
+
+    /// The bug this setting exists for: with it off nothing is asked of a
+    /// named file manager, so the folder goes to the shell — the call a
+    /// replacement for Explorer has hooked.
+    #[test]
+    fn the_folder_alone_names_no_file_manager() {
+        let file = a_downloaded_file("folder-only", "My File.zip");
+        assert!(reveal_command(&file, false).is_none());
+
+        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
+    }
+
+    /// A file that is not there has nothing to highlight, whatever the
+    /// setting says — a moved or deleted download still opens its folder.
+    #[test]
+    fn a_missing_download_has_nothing_to_select() {
+        let gone = std::env::temp_dir().join("hydra-reveal-nothing-here.bin");
+        assert!(reveal_command(&gone, true).is_none());
     }
 }

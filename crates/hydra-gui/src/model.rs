@@ -1000,6 +1000,11 @@ pub struct Settings {
     /// complete dialog is closed, when that dialog is enabled. Only the row
     /// goes; the downloaded file stays where it was saved.
     pub remove_completed: bool,
+    /// "Open folder" opens the file manager with the download highlighted.
+    /// Off, it asks the shell to open the containing folder instead: that
+    /// is the call a replacement for Explorer takes over, where selecting
+    /// an item runs `explorer.exe` by name and always lands in Explorer.
+    pub select_in_file_manager: bool,
     pub user_agent: String,
     pub virus_scanner: String,
     pub virus_args: String,
@@ -1116,6 +1121,7 @@ impl Default for Settings {
             show_conn_details: true,
             show_complete_dialog: true,
             remove_completed: false,
+            select_in_file_manager: true,
             user_agent: format!("hydra-gui/{}", env!("CARGO_PKG_VERSION")),
             virus_scanner: String::new(),
             virus_args: String::new(),
@@ -2181,6 +2187,16 @@ mod tests {
         assert!(old.show_toolbar_labels);
         let hidden: Settings = toml::from_str("show_toolbar_labels = false\n").unwrap();
         assert!(!hidden.show_toolbar_labels);
+    }
+
+    #[test]
+    fn a_config_written_before_the_file_manager_toggle_keeps_the_highlight() {
+        // Selecting the download is what "Open folder" has always done; an
+        // upgrade must not drop the highlight because the key is absent.
+        let old: Settings = toml::from_str("remove_completed = false\n").unwrap();
+        assert!(old.select_in_file_manager);
+        let folder_only: Settings = toml::from_str("select_in_file_manager = false\n").unwrap();
+        assert!(!folder_only.select_in_file_manager);
     }
 
     #[test]
