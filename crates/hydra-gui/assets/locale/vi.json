@@ -299,6 +299,8 @@
   "Record": "Ghi",
   "Recorded": "Đã ghi",
   "Recording, segments:": "Đang ghi, số đoạn:",
+  "Redirect loop": "Vòng lặp chuyển hướng",
+  "Redirect loop (the server expects a cookie)": "Vòng lặp chuyển hướng (máy chủ cần một cookie)",
   "Redownload": "Tải lại",
   "Refresh": "Làm mới",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Đăng ký Hydra là mục khởi động cùng hệ thống để các lượt tải và hàng đợi tiếp tục sau khi khởi động lại máy.",

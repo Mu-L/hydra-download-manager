@@ -299,6 +299,8 @@
   "Record": "Rögzítés",
   "Recorded": "Rögzítve",
   "Recording, segments:": "Rögzítés, szegmensek:",
+  "Redirect loop": "Átirányítási hurok",
+  "Redirect loop (the server expects a cookie)": "Átirányítási hurok (a kiszolgáló sütit vár)",
   "Redownload": "Újbóli letöltés",
   "Refresh": "Frissítés",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Bejelentkezési elemként regisztrálja a Hydrát, hogy a letöltések és várólisták újraindítás után is folytatódjanak.",

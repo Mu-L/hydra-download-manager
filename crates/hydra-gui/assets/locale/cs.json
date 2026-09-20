@@ -299,6 +299,8 @@
   "Record": "Nahrávat",
   "Recorded": "Nahráno",
   "Recording, segments:": "Nahrávání, segmenty:",
+  "Redirect loop": "Smyčka přesměrování",
+  "Redirect loop (the server expects a cookie)": "Smyčka přesměrování (server očekává cookie)",
   "Redownload": "Stáhnout znovu",
   "Refresh": "Obnovit",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Zaregistruje Hydru jako položku při přihlášení, aby stahování a fronty pokračovaly i po restartu.",

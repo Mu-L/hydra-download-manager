@@ -1769,7 +1769,8 @@ pub(crate) async fn fetch_range_following<C: Connector>(
     pool: Option<crate::pool::SharedPool<C::Stream>>,
 ) -> io::Result<()> {
     let mut t = t;
-    for hop in 0..crate::polite::MAX_REDIRECTS {
+    let mut chain = crate::polite::RedirectChain::new(&t.url());
+    for _ in 0..crate::polite::MAX_REDIRECTS {
         let out = fetch_range(
             c.clone(),
             conn,
@@ -1793,7 +1794,11 @@ pub(crate) async fn fetch_range_following<C: Connector>(
             .unwrap_or_default()
             .to_string();
         match retarget(&t, &loc) {
-            Some(next) => t = next,
+            Some(next) if chain.advance(&next.url()) => t = next,
+            // A hop back to an address already asked for is a loop, and the
+            // remaining budget cannot break it — only spend round trips and
+            // then misreport the reason. See `polite::RedirectChain`.
+            Some(next) => return Err(redirect_loop(&next.url())),
             // An unusable Location is a broken origin, not a hop worth
             // spending: report it as the protocol error it is.
             None => {
@@ -1803,7 +1808,6 @@ pub(crate) async fn fetch_range_following<C: Connector>(
                 ))
             }
         }
-        let _ = hop;
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -2448,6 +2452,7 @@ pub async fn fetch_range_retry<C: Connector>(
     let t0 = Instant::now();
     let mut off = lo;
     let mut t = t;
+    let mut chain = crate::polite::RedirectChain::new(&t.url());
     let mut redirects: u32 = 0;
     for attempt in 0..max_tries {
         if off >= hi {
@@ -2527,6 +2532,9 @@ pub async fn fetch_range_retry<C: Connector>(
                             ));
                         }
                         match retarget(&t, &loc) {
+                            Some(next) if !chain.advance(&next.url()) => {
+                                return Err(redirect_loop(&next.url()))
+                            }
                             Some(next) => {
                                 t = next;
                                 redirects += 1;
@@ -2607,6 +2615,30 @@ fn split_authority(auth: &str, default_port: u16) -> Option<(String, u16)> {
     }
 }
 
+/// The error a chain reports when a `Location` names an address it has already
+/// asked for.
+///
+/// Distinct from the budget being spent, and deliberately worded so: a loop is
+/// the origin declining the request, and "too many redirects" sends the reader
+/// looking for a chain that is too long instead of one that never moves.
+fn redirect_loop(location: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("redirect loop: {location} was already requested"),
+    )
+}
+
+/// The location stays on the origin that issued it: same scheme, host and port.
+///
+/// Judged on the ORIGIN endpoint, never the socket peer, so a proxied chain is
+/// measured by where the bytes come from rather than by which proxy carries
+/// them. Scheme counts (RFC 6454 §4): an `http` hop is not the `https` origin
+/// that set the cookie, however alike the two addresses read.
+fn same_origin(prev: &Target, tls: bool, host: &str, port: u16) -> bool {
+    let (prev_host, prev_port) = prev.origin_endpoint();
+    tls == prev.tls && port == prev_port && host.eq_ignore_ascii_case(&prev_host)
+}
+
 /// The target a `Location` names, relative to the one that produced it.
 ///
 /// `https` is followed, not refused. It used to be: an absolute TLS `Location`
@@ -2617,10 +2649,15 @@ fn split_authority(auth: &str, default_port: u16) -> Option<(String, u16)> {
 /// object store — reported `unusable redirect target` and stopped, naming a URL
 /// that was perfectly good.
 ///
-/// Headers and the agent deliberately do NOT travel to an absolute location:
-/// the hop is usually cross-origin, and replaying a `Cookie:` at whatever host
-/// a redirect names is how a session token leaks to a third party. A relative
-/// hop stays on the same origin and keeps them.
+/// Headers and the agent travel only to the SAME origin. Replaying a
+/// `Cookie:` at whatever host a redirect names is how a session token leaks to
+/// a third party, so a hop that changes scheme, host or port drops both. The
+/// test used to be absolute-versus-relative, which is not the same question: a
+/// mirror that answers with its own address in full form is still the origin
+/// that was asked, and dropping the headers there discarded the one thing the
+/// user had supplied to get in — the documented workaround for a site that
+/// needs a cookie is `-H 'Cookie: ...'`, and an absolute same-origin hop threw
+/// it away.
 fn retarget(prev: &Target, location: &str) -> Option<Target> {
     let loc = location.trim();
     let absolute = |tls: bool, rest: &str| {
@@ -2628,19 +2665,24 @@ fn retarget(prev: &Target, location: &str) -> Option<Target> {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, "/"),
         };
-        match &prev.origin {
+        let (host, port) = split_authority(auth, if tls { 443 } else { 80 })?;
+        let mut next = match &prev.origin {
             // Through a forward proxy the request stays in absolute form and the
-            // proxy does the reaching, so the authority travels as text.
-            Some(_) => Some(Target::via_proxy(&prev.host, prev.port, auth, path)),
-            None => {
-                let (h, p) = split_authority(auth, if tls { 443 } else { 80 })?;
-                Some(if tls {
-                    Target::direct_tls(&h, p, path)
-                } else {
-                    Target::direct(&h, p, path)
-                })
-            }
+            // proxy does the reaching, so the authority travels as text — and so
+            // does the scheme, which `via_proxy` alone would drop, turning a
+            // proxied `https` chain into cleartext at its first hop.
+            Some(_) => Target {
+                tls,
+                ..Target::via_proxy(&prev.host, prev.port, auth, path)
+            },
+            None if tls => Target::direct_tls(&host, port, path),
+            None => Target::direct(&host, port, path),
+        };
+        if same_origin(prev, tls, &host, port) {
+            next.headers = prev.headers.clone();
+            next.agent = prev.agent.clone();
         }
+        Some(next)
     };
     if let Some(rest) = loc.strip_prefix("https://") {
         return absolute(true, rest);
@@ -3616,6 +3658,60 @@ mod retarget_tests {
         for bad in ["", "   ", "ftp://h/o", "javascript:alert(1)", "https://"] {
             assert!(retarget(&prev, bad).is_none(), "{bad:?} must be refused");
         }
+        let proxied = Target::via_proxy("proxy.local", 3128, "h:80", "/a");
+        assert!(
+            retarget(&proxied, "https://").is_none(),
+            "an empty authority is no more usable through a proxy"
+        );
+    }
+
+    /// The z-lib shape: an absolute `Location` naming the host that sent it.
+    /// Judged on form rather than origin, this dropped the `Cookie:` the user
+    /// had supplied — the one documented way to get into such a site.
+    #[test]
+    fn an_absolute_same_origin_location_keeps_the_headers() {
+        let mut prev = Target::direct_tls("zh.z-lib.sk", 443, "/dl/omZxxOYdnp");
+        prev.headers = vec!["Cookie: __diamwall=0x472138112".into()];
+        prev.agent = Some("hydra-test/1".into());
+        let n = retarget(&prev, "https://zh.z-lib.sk/dl/omZxxOYdnp").expect("usable");
+        assert_eq!(n.headers, prev.headers, "same origin keeps its headers");
+        assert_eq!(n.agent, prev.agent, "and its agent");
+    }
+
+    /// Host comparison is case-insensitive, port and scheme are part of the
+    /// origin. The last two are what stop a cookie set over TLS, or for one
+    /// service, from being replayed somewhere it was never issued for.
+    #[test]
+    fn only_a_genuinely_same_origin_hop_keeps_them() {
+        let mut prev = Target::direct_tls("h.example", 443, "/a");
+        prev.headers = vec!["Cookie: s=1".into()];
+        let kept = retarget(&prev, "https://H.EXAMPLE/b").expect("usable");
+        assert_eq!(kept.headers, prev.headers, "the host case is not the host");
+        for elsewhere in [
+            "http://h.example/b",
+            "https://h.example:9000/b",
+            "https://other.example/b",
+        ] {
+            let n = retarget(&prev, elsewhere).expect("usable");
+            assert!(n.headers.is_empty(), "{elsewhere} must not carry them");
+        }
+    }
+
+    /// Through a forward proxy the hop kept the authority but lost the scheme,
+    /// so a proxied `https` chain continued in the clear from its first
+    /// redirect.
+    #[test]
+    fn a_proxied_hop_keeps_its_scheme_and_same_origin_headers() {
+        let mut prev = Target::via_proxy("proxy.local", 3128, "h.example:443", "/a");
+        prev.tls = true;
+        prev.headers = vec!["Cookie: s=1".into()];
+        let n = retarget(&prev, "https://h.example:443/b").expect("usable");
+        assert!(n.tls, "an https hop must not continue in the clear");
+        assert_eq!(n.host, "proxy.local", "the socket still goes to the proxy");
+        assert_eq!(n.origin.as_deref(), Some("h.example:443"));
+        assert_eq!(n.headers, prev.headers);
+        let away = retarget(&prev, "https://other.example/b").expect("usable");
+        assert!(away.headers.is_empty(), "a proxy is not a same-origin pass");
     }
 }
 

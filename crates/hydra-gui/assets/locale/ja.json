@@ -299,6 +299,8 @@
   "Record": "録画",
   "Recorded": "録画済み",
   "Recording, segments:": "録画中、セグメント数:",
+  "Redirect loop": "リダイレクトのループ",
+  "Redirect loop (the server expects a cookie)": "リダイレクトのループ（サーバーが Cookie を要求しています）",
   "Redownload": "再ダウンロード",
   "Refresh": "更新",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "再起動後もダウンロードとキューを継続できるよう、Hydraをログイン項目に登録します。",

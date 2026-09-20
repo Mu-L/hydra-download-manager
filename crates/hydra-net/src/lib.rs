@@ -169,6 +169,18 @@ impl Target {
         self.origin.as_deref().unwrap_or(&self.host)
     }
 
+    /// The absolute URL this target addresses.
+    ///
+    /// Built from the ORIGIN endpoint, never the socket peer: through a
+    /// forward proxy `host`/`port` name the proxy, and an address keyed on
+    /// those would read every hop of a redirect chain as the same place. See
+    /// [`crate::polite::RedirectChain`], which is what asks.
+    pub fn url(&self) -> String {
+        let (host, port) = self.origin_endpoint();
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://{host}:{port}{}", self.path)
+    }
+
     /// Attach extra request headers and a `User-Agent`, as the CLI flags request.
     pub fn with_headers(mut self, headers: Vec<String>, agent: Option<String>) -> Self {
         self.headers = headers;

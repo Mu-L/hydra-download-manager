@@ -299,6 +299,8 @@
   "Record": "הקלט",
   "Recorded": "הוקלט",
   "Recording, segments:": "מקליט, מקטעים:",
+  "Redirect loop": "לולאת הפניה",
+  "Redirect loop (the server expects a cookie)": "לולאת הפניה (השרת מצפה לעוגייה)",
   "Redownload": "הורד מחדש",
   "Refresh": "רענן",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "רושם את Hydra כפריט התחברות כדי שהורדות ותורים ימשיכו גם לאחר הפעלה מחדש.",

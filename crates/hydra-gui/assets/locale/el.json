@@ -299,6 +299,8 @@
   "Record": "Εγγραφή",
   "Recorded": "Έγινε εγγραφή",
   "Recording, segments:": "Εγγραφή, τμήματα:",
+  "Redirect loop": "Βρόχος ανακατεύθυνσης",
+  "Redirect loop (the server expects a cookie)": "Βρόχος ανακατεύθυνσης (ο διακομιστής αναμένει cookie)",
   "Redownload": "Νέα λήψη",
   "Refresh": "Ανανέωση",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Καταχωρίζει το Hydra ως στοιχείο σύνδεσης, ώστε οι λήψεις και οι ουρές να συνεχίζονται μετά από επανεκκίνηση.",

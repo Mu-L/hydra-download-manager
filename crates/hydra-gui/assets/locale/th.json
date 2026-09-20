@@ -299,6 +299,8 @@
   "Record": "บันทึก",
   "Recorded": "บันทึกแล้ว",
   "Recording, segments:": "กำลังบันทึก จำนวนส่วน:",
+  "Redirect loop": "การเปลี่ยนเส้นทางวนซ้ำ",
+  "Redirect loop (the server expects a cookie)": "การเปลี่ยนเส้นทางวนซ้ำ (เซิร์ฟเวอร์ต้องการคุกกี้)",
   "Redownload": "ดาวน์โหลดใหม่",
   "Refresh": "รีเฟรช",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "ลงทะเบียน Hydra เป็นรายการเข้าสู่ระบบ เพื่อให้การดาวน์โหลดและคิวดำเนินต่อได้หลังรีบูตเครื่อง",

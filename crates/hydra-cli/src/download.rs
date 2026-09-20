@@ -997,6 +997,7 @@ pub async fn probe_public<C: hya_net::Connector>(
     args: &crate::cli::Cli,
 ) -> Result<(hya_net::Probe, Url), String> {
     let mut cur = u.clone();
+    let mut chain = hya_net::polite::RedirectChain::new(&cur.to_string());
     let mut hops = 0u32;
     loop {
         let px = proxy_for_public(&cur, args.proxy.as_deref(), args.no_proxy);
@@ -1014,7 +1015,10 @@ pub async fn probe_public<C: hya_net::Connector>(
                 .location
                 .as_deref()
                 .and_then(|loc| crate::url::Url::parse(loc).or_else(|| cur.join(loc)));
-            if let Some(next) = next {
+            // A hop to an address already asked for is a loop, and a loop has
+            // no final response to reach: stop and describe the one in hand,
+            // which is what this function does with a budget it cannot spend.
+            if let Some(next) = next.filter(|n| chain.advance(&n.to_string())) {
                 cur = next;
                 hops += 1;
                 continue;
@@ -1027,6 +1031,7 @@ pub async fn probe_public<C: hya_net::Connector>(
             if let Some(next) = hya_net::html_redirect(c, &target)
                 .await
                 .and_then(|loc| cur.join(&loc))
+                .filter(|n| chain.advance(&n.to_string()))
             {
                 cur = next;
                 hops += 1;
@@ -1082,6 +1087,7 @@ where
     let max_hops = max_redirs as usize;
     let mut target = t.clone();
     let mut current = u.clone();
+    let mut chain = hya_net::polite::RedirectChain::new(&current.to_string());
     let mut via_html = false;
     // `0..=max_hops`: the extra pass is what answers the request that the last
     // permitted hop arrived at. Without it a budget of N would resolve only N-1.
@@ -1105,6 +1111,12 @@ where
             let next = current
                 .join(&loc)
                 .ok_or_else(|| format!("unparsable redirect target {loc:?}"))?;
+            // A hop back to an address already asked for is a loop. The
+            // remaining budget cannot break it, and spending it reports
+            // "too many redirects" for a chain that never moved.
+            if !chain.advance(&next.to_string()) {
+                return Err(format!("redirect loop: {next} was already requested"));
+            }
             log.push((1, format!("redirect {} -> {}", current.host, next.host)));
             let px = proxy_for(&next);
             target = next
@@ -1124,6 +1136,9 @@ where
                 .await
                 .and_then(|loc| current.join(&loc))
             {
+                if !chain.advance(&next.to_string()) {
+                    return Err(format!("redirect loop: {next} was already requested"));
+                }
                 log.push((
                     1,
                     format!("html redirect {} -> {}", current.host, next.host),
@@ -4183,6 +4198,82 @@ mod tests {
             final_url.port, real_port,
             "must land on the redirect target"
         );
+    }
+
+    /// A `Location` naming the request just made is a loop, and the transfer
+    /// path must say so. It used to spend `--max-redirs` round trips and then
+    /// report "too many redirects", which describes a chain that is too long
+    /// rather than one that never moves.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_transfer_path_names_a_self_redirect_a_loop() {
+        let net = hya_net::origin::OriginSet::new();
+        let (port, ctl) = net.spawn_redirecting(0, 1_000_000, "/obj");
+        *ctl.redirect_to.lock().unwrap() = Some(format!("http://127.0.0.1:{port}/obj"));
+        let u = Url::parse(&format!("http://127.0.0.1:{port}/obj")).expect("url");
+        let t = u.to_target(None).expect("target");
+        let mut log = Vec::new();
+        let err = match probe_resolving(&net, &u, &t, &mut log, 8).await {
+            Ok(r) => panic!("a loop resolved to a {}-byte object", r.probe.size),
+            Err(e) => e,
+        };
+        assert!(err.contains("redirect loop"), "{err:?}");
+        assert!(
+            !err.contains("max-redirs"),
+            "the budget was not the cause: {err:?}"
+        );
+        assert_eq!(
+            ctl.requests.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the first answer already said everything the chain needed"
+        );
+    }
+
+    /// A forwarding page that forwards to itself is the same loop written in
+    /// HTML, and it is charged to the same chain: two such pages pointing at
+    /// each other would otherwise spend the budget too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_html_redirector_pointing_at_itself_is_a_loop() {
+        let net = hya_net::origin::OriginSet::new();
+        let (port, ctl) = net.spawn_html_redirecting(0, 1_000_000, "/obj");
+        *ctl.html_redirect_to.lock().unwrap() = Some(format!("http://127.0.0.1:{port}/obj"));
+        let u = Url::parse(&format!("http://127.0.0.1:{port}/obj")).expect("url");
+        let t = u.to_target(None).expect("target");
+        let mut log = Vec::new();
+        let err = match probe_resolving(&net, &u, &t, &mut log, 8).await {
+            Ok(r) => panic!("a loop resolved to a {}-byte object", r.probe.size),
+            Err(e) => e,
+        };
+        assert!(err.contains("redirect loop"), "{err:?}");
+
+        // The reporting path takes the same chain and stops on it too.
+        let args = crate::cli::Cli::parse_with_queries([
+            "hydra",
+            "--no-proxy",
+            &format!("http://127.0.0.1:{port}/obj"),
+        ])
+        .unwrap();
+        let (pr, _) = probe_public(&net, &u, &args).await.expect("a probe");
+        assert!(pr.maybe_redirector(), "the page itself is what is left");
+    }
+
+    /// The reporting path prefers to describe what it reached over refusing,
+    /// so a loop stops the chain and hands back the response in hand — after
+    /// one request, not after the whole budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reporting_path_stops_at_a_self_redirect() {
+        let net = hya_net::origin::OriginSet::new();
+        let (port, ctl) = net.spawn_redirecting(0, 1_000_000, "/obj");
+        *ctl.redirect_to.lock().unwrap() = Some(format!("http://127.0.0.1:{port}/obj"));
+        let args = crate::cli::Cli::parse_with_queries([
+            "hydra",
+            "--no-proxy",
+            &format!("http://127.0.0.1:{port}/obj"),
+        ])
+        .unwrap();
+        let u = Url::parse(&args.urls[0]).unwrap();
+        let (pr, _) = probe_public(&net, &u, &args).await.expect("a probe");
+        assert!(pr.is_redirect(), "the loop's own response is what is left");
+        assert_eq!(ctl.requests.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

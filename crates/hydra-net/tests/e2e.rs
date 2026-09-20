@@ -232,19 +232,75 @@ async fn overloaded_origin_backs_off_then_gives_up_cleanly() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// A redirect loop must terminate within the hop budget.
+/// A redirect loop must be recognised as one, on the hop that closes it.
+///
+/// It used to be merely bounded: the client spent the whole hop budget on an
+/// origin that had answered the same way every time, then reported "too many
+/// redirects" — the budget, not the loop. One request is enough to know.
 #[tokio::test]
-async fn redirect_loop_terminates_within_the_hop_budget() {
+async fn a_self_redirect_is_named_a_loop_and_costs_one_request() {
     use hya_net::{fetch_range_retry, SparseSink};
     const SIZE: u64 = 1024 * 1024;
     let net = Arc::new(OriginSet::new());
-    // Redirects to itself: a loop, which must be bounded rather than infinite.
-    let (port, _ctl) = net.spawn_redirecting(SIZE, 8_000_000, "/obj");
+    let (port, ctl) = net.spawn_redirecting(SIZE, 8_000_000, "/obj");
     let out = std::env::temp_dir().join("hydra_redir.bin");
     let outs = out.to_string_lossy().to_string();
     let sink = Arc::new(SparseSink::create(&outs, SIZE).unwrap());
-    let r = fetch_range_retry(net.clone(), tgt(port), 0, SIZE, sink, 3, 4.0).await;
-    assert!(r.is_err(), "a redirect loop must not be followed forever");
+    let e = fetch_range_retry(net.clone(), tgt(port), 0, SIZE, sink, 3, 4.0)
+        .await
+        .expect_err("a redirect loop must not be followed");
+    let msg = e.to_string();
+    assert!(msg.contains("redirect loop"), "{msg}");
+    assert!(
+        !msg.contains("budget"),
+        "the budget was never the problem: {msg}"
+    );
+    assert_eq!(
+        ctl.requests.load(Ordering::Relaxed),
+        1,
+        "the first answer already said everything the chain needed"
+    );
+    let _ = std::fs::remove_file(&out);
+}
+
+/// The shape from the field (issue #235): the `Location` is the request's own
+/// URL written out in full. Judged on absolute-versus-relative form this reads
+/// as a hop somewhere else, and the chain walks it until the budget runs out.
+#[tokio::test]
+async fn an_absolute_self_redirect_is_the_same_loop() {
+    use hya_net::{fetch_range_retry, SparseSink};
+    const SIZE: u64 = 1024 * 1024;
+    let net = Arc::new(OriginSet::new());
+    let (port, ctl) = net.spawn_redirecting(SIZE, 8_000_000, "/obj");
+    // Spelled with the port the user never types, so the comparison has to
+    // canonicalise rather than match bytes.
+    *ctl.redirect_to.lock().unwrap() = Some(format!("http://127.0.0.1:{port}/obj"));
+    let out = std::env::temp_dir().join("hydra_redir_abs.bin");
+    let outs = out.to_string_lossy().to_string();
+    let sink = Arc::new(SparseSink::create(&outs, SIZE).unwrap());
+    let e = fetch_range_retry(net.clone(), tgt(port), 0, SIZE, sink, 3, 4.0)
+        .await
+        .expect_err("an absolute self-redirect is still a loop");
+    assert!(e.to_string().contains("redirect loop"), "{e}");
+    assert_eq!(ctl.requests.load(Ordering::Relaxed), 1);
+    let _ = std::fs::remove_file(&out);
+}
+
+/// The scheduler-driven path follows redirects itself, so it owns the same
+/// question and must answer it the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scheduler_path_reports_a_redirect_loop_too() {
+    const SIZE: u64 = 1024 * 1024;
+    let net = Arc::new(OriginSet::new());
+    let (port, ctl) = net.spawn_redirecting(SIZE, 8_000_000, "/obj");
+    *ctl.redirect_to.lock().unwrap() = Some(format!("http://127.0.0.1:{port}/obj"));
+    let out = std::env::temp_dir().join("hydra_redir_sched.bin");
+    let outs = out.to_string_lossy().to_string();
+    let sched = Scheduler::new(SIZE, vec![src(4e6)], &[2]).with_stall_timeout(3.0);
+    let e = run_transfer(net.clone(), vec![tgt(port)], &[2], SIZE, &outs, sched)
+        .await
+        .expect_err("a redirect loop cannot deliver an object");
+    assert!(e.to_string().contains("redirect loop"), "{e}");
     let _ = std::fs::remove_file(&out);
 }
 

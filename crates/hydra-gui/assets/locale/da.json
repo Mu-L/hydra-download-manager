@@ -299,6 +299,8 @@
   "Record": "Optag",
   "Recorded": "Optaget",
   "Recording, segments:": "Optager, segmenter:",
+  "Redirect loop": "Omdirigeringsløkke",
+  "Redirect loop (the server expects a cookie)": "Omdirigeringsløkke (serveren forventer en cookie)",
   "Redownload": "Download igen",
   "Refresh": "Opdater",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Registrerer Hydra som et logon-emne, så downloads og køer fortsætter efter en genstart.",

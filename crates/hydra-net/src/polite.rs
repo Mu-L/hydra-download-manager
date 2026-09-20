@@ -29,6 +29,79 @@ pub const DEFAULT_TOTAL: usize = 16;
 /// is typically misconfigured, and each hop costs a full `delta` round-trip.
 pub const MAX_REDIRECTS: u32 = 8;
 
+/// The addresses a redirect chain has already asked for.
+///
+/// [`MAX_REDIRECTS`] bounds a chain but cannot tell a long one from a loop,
+/// and the two need different answers. An origin that replies to a request
+/// with a `Location` naming that same request is not forwarding it anywhere —
+/// it is refusing, typically a bot wall issuing a cookie it expects a browser
+/// to echo back — so following it spends the whole budget on round trips and
+/// then blames the budget, which was never the problem. Remembering where the
+/// chain has been names the loop on the hop that closes it, for no extra
+/// request.
+///
+/// Addresses compare with the host lowercased and the scheme's default port
+/// elided, because `https://h/p` and `https://H:443/p` are one address and a
+/// chain that read them as two would walk the loop anyway.
+#[derive(Clone, Debug)]
+pub struct RedirectChain {
+    seen: Vec<String>,
+}
+
+impl RedirectChain {
+    /// A chain whose first request goes to `url`.
+    ///
+    /// Seeded rather than empty: a `Location` echoing the URL just requested
+    /// is the common shape of this failure, and an empty chain would have to
+    /// take that hop once before it could recognise it.
+    pub fn new(url: &str) -> Self {
+        Self {
+            seen: vec![canonical_url(url)],
+        }
+    }
+
+    /// Take the chain to `url`. `false` when it has been there already, which
+    /// is a loop rather than a hop worth spending.
+    #[must_use]
+    pub fn advance(&mut self, url: &str) -> bool {
+        let next = canonical_url(url);
+        if self.seen.contains(&next) {
+            return false;
+        }
+        self.seen.push(next);
+        true
+    }
+}
+
+/// One spelling for an address, so that two spellings of the same one compare
+/// equal.
+///
+/// Scheme and host are case-insensitive and the default port is redundant
+/// (RFC 3986 §3.1, §6.2.3); the path is neither, and is left alone. Anything
+/// this cannot read is returned unchanged — an address that cannot be
+/// canonicalised still compares against itself, which is the case that
+/// matters.
+fn canonical_url(url: &str) -> String {
+    let url = url.trim();
+    let (scheme, default_port) = if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
+        ("https://", ":443")
+    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
+        ("http://", ":80")
+    } else {
+        return url.to_string();
+    };
+    let rest = &url[scheme.len()..];
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let authority = authority
+        .strip_suffix(default_port)
+        .unwrap_or(authority)
+        .to_ascii_lowercase();
+    format!("{scheme}{authority}{path}")
+}
+
 /// How far the rate limiter's cursor may lag the clock: the burst a transfer
 /// may send without waiting, as time at the current rate.
 ///
@@ -852,5 +925,80 @@ mod tests {
             "a 1 KiB/s cap must not take a {n}-byte read: the pause it owes would \
              outlast the stall watchdog"
         );
+    }
+}
+
+#[cfg(test)]
+mod redirect_chain_tests {
+    use super::*;
+
+    /// The reported failure: a `307` whose `Location` is the URL just asked
+    /// for. It cost eight round trips and reported "too many redirects", which
+    /// named the budget instead of the loop.
+    #[test]
+    fn a_location_naming_the_request_is_a_loop_on_the_first_hop() {
+        const URL: &str = "https://zh.z-lib.sk/dl/omZxxOYdnp";
+        let mut chain = RedirectChain::new(URL);
+        assert!(!chain.advance(URL), "a self-redirect must not be followed");
+    }
+
+    #[test]
+    fn a_chain_that_goes_somewhere_is_followed() {
+        let mut chain = RedirectChain::new("https://a.example/f");
+        assert!(chain.advance("https://b.example/f"));
+        assert!(chain.advance("https://c.example/f"));
+    }
+
+    /// A cycle longer than one hop is the same defect with more steps: the
+    /// budget would absorb it silently until it ran out.
+    #[test]
+    fn a_cycle_is_caught_where_it_closes() {
+        let mut chain = RedirectChain::new("https://a.example/f");
+        assert!(chain.advance("https://b.example/f"));
+        assert!(chain.advance("https://c.example/f"));
+        assert!(!chain.advance("https://b.example/f"), "b was already asked");
+    }
+
+    /// The hop that matters most is the one a relative `Location` produces:
+    /// `join_url` spells the port, the URL the user pasted does not, and a
+    /// byte comparison would call those two different places.
+    #[test]
+    fn one_address_spelled_two_ways_is_one_address() {
+        let mut chain = RedirectChain::new("https://Zh.Z-Lib.SK/dl/x");
+        assert!(!chain.advance("https://zh.z-lib.sk:443/dl/x"));
+        let mut plain = RedirectChain::new("http://h.example:80/f");
+        assert!(!plain.advance("HTTP://H.EXAMPLE/f"));
+    }
+
+    /// Case folding stops at the authority: a server that distinguishes `/A`
+    /// from `/a` is serving two objects, and calling them one would report a
+    /// loop on a chain that has none.
+    #[test]
+    fn the_path_is_case_sensitive() {
+        let mut chain = RedirectChain::new("https://h.example/A");
+        assert!(chain.advance("https://h.example/a"));
+    }
+
+    /// A non-default port is part of the address, not noise to elide.
+    #[test]
+    fn a_non_default_port_distinguishes_two_addresses() {
+        let mut chain = RedirectChain::new("https://h.example/f");
+        assert!(chain.advance("https://h.example:9000/f"));
+    }
+
+    /// `https://h` and `https://h/` name the root either way.
+    #[test]
+    fn an_empty_path_is_the_root() {
+        let mut chain = RedirectChain::new("https://h.example");
+        assert!(!chain.advance("https://h.example/"));
+    }
+
+    /// An address this cannot parse must still compare against itself, or a
+    /// loop through one would be invisible.
+    #[test]
+    fn an_unparsable_address_still_compares_against_itself() {
+        let mut chain = RedirectChain::new("ftp://h.example/f");
+        assert!(!chain.advance("ftp://h.example/f"));
+        assert!(chain.advance("ftp://other.example/f"));
     }
 }

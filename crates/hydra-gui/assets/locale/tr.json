@@ -299,6 +299,8 @@
   "Record": "Kaydet",
   "Recorded": "Kaydedildi",
   "Recording, segments:": "Kaydediliyor, segmentler:",
+  "Redirect loop": "Yönlendirme döngüsü",
+  "Redirect loop (the server expects a cookie)": "Yönlendirme döngüsü (sunucu bir çerez bekliyor)",
   "Redownload": "Yeniden İndir",
   "Refresh": "Yenile",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Hydra'yı oturum açma öğesi olarak kaydeder, böylece yeniden başlatmanın ardından indirmeler ve kuyruklar devam eder.",

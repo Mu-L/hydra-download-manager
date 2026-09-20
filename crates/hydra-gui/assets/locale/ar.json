@@ -299,6 +299,8 @@
   "Record": "تسجيل",
   "Recorded": "تم التسجيل",
   "Recording, segments:": "جارٍ التسجيل، المقاطع:",
+  "Redirect loop": "حلقة إعادة توجيه",
+  "Redirect loop (the server expects a cookie)": "حلقة إعادة توجيه (الخادم يتوقع ملف تعريف ارتباط)",
   "Redownload": "إعادة التنزيل",
   "Refresh": "تحديث",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "يسجل Hydra كعنصر بدء تشغيل حتى تستمر التنزيلات وقوائم الانتظار بعد إعادة التشغيل.",

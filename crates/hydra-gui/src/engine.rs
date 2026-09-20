@@ -1760,6 +1760,23 @@ async fn cancellable<F: std::future::Future>(fut: F, cancel: &AtomicBool) -> Opt
     }
 }
 
+/// What to call a redirect that leads back where it came from.
+///
+/// A self-redirect that also SETS a cookie is a bot wall rather than a broken
+/// forwarding rule: the hop exists to hand out state the origin expects the
+/// next request to echo, and a client with no cookie jar walks it forever.
+/// Naming that is the difference between a user reporting a redirect bug and
+/// knowing the link wants a browser session — the mirror in issue #235
+/// answers `307` to its own URL with `Set-Cookie: __diamwall=…`. Holding that
+/// cookie is issue #227's work; saying why the download stopped is not.
+fn loop_reason(p: &Probe) -> String {
+    if hya_net::header_lookup(&p.raw_head, "set-cookie").is_some() {
+        crate::i18n::tr("Redirect loop (the server expects a cookie)")
+    } else {
+        crate::i18n::tr("Redirect loop")
+    }
+}
+
 async fn run_download(
     mut spec: StartSpec,
     cancel: Arc<AtomicBool>,
@@ -1839,6 +1856,11 @@ async fn run_download(
     // `spec.mirrors` is A — and removing by the post-redirect `url` removes
     // nothing, so `plan_sources` would probe the dead chain a second time.
     let mut attempt = url.clone();
+    // Where this chain has already been. A budget alone cannot tell a long
+    // chain from one that never moves: a mirror that answers with a `Location`
+    // naming the request just made spent the whole budget and then reported
+    // "Too many redirects", which names the budget rather than the loop.
+    let mut chain = hya_net::polite::RedirectChain::new(&url);
     let mut probed: Option<(ParsedUrl, Probe)> = None;
     // Mirrors to fall forward to when the one being probed cannot be reached at
     // all, best-ranked first and excluding the one already being tried.
@@ -1906,7 +1928,17 @@ async fn run_download(
                     crate::log::redact(&loc)
                 ));
                 match join_url(&u, &loc) {
-                    Some(next) => url = next,
+                    Some(next) if chain.advance(&next) => url = next,
+                    Some(next) => {
+                        ev(Event::Failed {
+                            id,
+                            error: format!("{}: {next}", loop_reason(&p)),
+                            done: 0,
+                            held: spec.held.clone(),
+                            permission_denied: false,
+                        });
+                        return;
+                    }
                     None => {
                         ev(Event::Failed {
                             id,
@@ -1944,6 +1976,16 @@ async fn run_download(
                     None
                 };
                 if let Some(next) = hop_to {
+                    if !chain.advance(&next) {
+                        ev(Event::Failed {
+                            id,
+                            error: format!("{}: {next}", loop_reason(&p)),
+                            done: 0,
+                            held: spec.held.clone(),
+                            permission_denied: false,
+                        });
+                        return;
+                    }
                     crate::log::debug(&format!(
                         "#{id} html redirect -> {}",
                         crate::log::redact(&next)
@@ -1974,6 +2016,11 @@ async fn run_download(
                     // never listed.
                     spec.mirrors.retain(|m| m.url != attempt);
                     url = next;
+                    // A different mirror is a different chain: the addresses
+                    // the dead one walked say nothing about this one, and a
+                    // mirror list that names the same URL twice would
+                    // otherwise read as a loop.
+                    chain = hya_net::polite::RedirectChain::new(&url);
                     attempt.clone_from(&url);
                     spec.url.clone_from(&url);
                 }
@@ -3354,6 +3401,43 @@ mod tests {
         };
         assert_eq!(remote_stamp(&p), None);
         assert_eq!(remote_stamp(&Probe::default()), None);
+    }
+
+    /// A loop whose hop hands out a cookie is a bot wall, and saying so is
+    /// what stops the next reader hunting for a redirect bug. The header block
+    /// is the whole evidence — see issue #235's `Set-Cookie: __diamwall=…` on
+    /// a `307` to the request's own URL.
+    #[test]
+    fn a_cookie_setting_loop_says_the_server_wants_a_cookie() {
+        let walled = Probe {
+            status: 307,
+            raw_head: "HTTP/1.1 307 Temporary Redirect\r\n\
+                       Location: https://zh.z-lib.sk/dl/omZxxOYdnp\r\n\
+                       Set-Cookie: __diamwall=0x472138112; Path=/\r\n\r\n"
+                .into(),
+            ..Default::default()
+        };
+        assert!(
+            loop_reason(&walled).contains("cookie"),
+            "{}",
+            loop_reason(&walled)
+        );
+    }
+
+    /// A misconfigured forwarding rule asks for nothing, so promising the user
+    /// a cookie would send them after a session they do not need.
+    #[test]
+    fn a_plain_loop_claims_no_cause_it_cannot_see() {
+        let plain = Probe {
+            status: 301,
+            raw_head: "HTTP/1.1 301 Moved Permanently\r\nLocation: /a\r\n\r\n".into(),
+            ..Default::default()
+        };
+        assert!(
+            !loop_reason(&plain).contains("cookie"),
+            "{}",
+            loop_reason(&plain)
+        );
     }
 
     #[test]
@@ -7400,6 +7484,194 @@ x-amzn-waf-action: challenge\r\nConnection: close\r\n\r\n",
             }
         });
         port
+    }
+
+    /// A bot wall that answers every request with a `307` to the request's own
+    /// URL and a cookie it expects the next one to carry. Z-Library's mirrors
+    /// (issue #235) front their `/dl/` links this way.
+    fn self_redirecting_origin(counted: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let counted = counted.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf);
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let _ = sock.write_all(
+                        format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\n\
+                             Location: http://127.0.0.1:{port}/dl/omZxxOYdnp\r\n\
+                             Set-Cookie: __diamwall=0x472138112; Path=/\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    );
+                });
+            }
+        });
+        port
+    }
+
+    /// The reported defect (issue #235), in the GUI's own transfer path.
+    ///
+    /// The mirror answers its own URL with a `307` to that same URL, so the
+    /// chain never moved — but the loop was bounded only by the hop budget, so
+    /// the row spent every hop and then said **Too many redirects**, which
+    /// names the budget and not the cause. The cookie on the hop is the cause,
+    /// and the message has to reach the user: holding it is issue #227's work,
+    /// saying why the download stopped is not.
+    #[test]
+    fn a_self_redirect_is_reported_as_a_loop_not_as_a_spent_budget() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = self_redirecting_origin(requests.clone());
+        let dir = std::env::temp_dir().join(format!("hydra-loop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("omZxxOYdnp");
+
+        let spec = StartSpec {
+            id: 235,
+            url: format!("http://127.0.0.1:{port}/dl/omZxxOYdnp"),
+            user_agent: "hydra-test".into(),
+            temp_path: out.with_extension("part").to_string_lossy().into_owned(),
+            final_path: out.to_string_lossy().into_owned(),
+            ..StartSpec::plain()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let final_path = out.to_string_lossy().into_owned();
+        let outcome = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                run_download(
+                    spec,
+                    Arc::new(AtomicBool::new(false)),
+                    Pace::unlimited(),
+                    Arc::new(Mutex::new(final_path)),
+                    tx,
+                )
+                .await;
+                let mut outcome = None;
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        Event::Finished { .. } => outcome = Some(Err(())),
+                        Event::Failed { error, .. } => outcome = Some(Ok(error)),
+                        _ => {}
+                    }
+                }
+                outcome
+            });
+
+        match outcome {
+            Some(Ok(error)) => {
+                assert!(error.contains("Redirect loop"), "{error}");
+                assert!(error.contains("cookie"), "the cause is readable: {error}");
+                assert!(!error.contains("Too many"), "{error}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            1,
+            "the first answer already said everything the chain needed"
+        );
+        assert!(!out.exists(), "no file may be left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A referrer stripper whose forwarding page forwards to itself: the same
+    /// loop written in HTML instead of in a `Location`, and charged to the
+    /// same chain.
+    fn self_redirecting_page_origin(counted: Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let counted = counted.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    let head_only = buf[..n].starts_with(b"HEAD");
+                    let body = format!(
+                        "<!DOCTYPE html><html><head>\
+                         <meta http-equiv=\"refresh\" content=\"0; \
+                         url=http://127.0.0.1:{port}/go\" />\
+                         </head><body>Redirecting..</body></html>"
+                    );
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes());
+                    if !head_only {
+                        let _ = sock.write_all(body.as_bytes());
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// The HTML half of the same defect. A forwarding page naming its own URL
+    /// used to spend the whole hop budget; and with nothing asking for a
+    /// cookie, the message must not invent one.
+    #[test]
+    fn a_page_that_forwards_to_itself_is_a_loop_with_no_cause_invented() {
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = self_redirecting_page_origin(requests.clone());
+        let dir = std::env::temp_dir().join(format!("hydra-htmlloop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("go");
+
+        let spec = StartSpec {
+            id: 236,
+            url: format!("http://127.0.0.1:{port}/go"),
+            user_agent: "hydra-test".into(),
+            temp_path: out.with_extension("part").to_string_lossy().into_owned(),
+            final_path: out.to_string_lossy().into_owned(),
+            ..StartSpec::plain()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let final_path = out.to_string_lossy().into_owned();
+        let outcome = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                run_download(
+                    spec,
+                    Arc::new(AtomicBool::new(false)),
+                    Pace::unlimited(),
+                    Arc::new(Mutex::new(final_path)),
+                    tx,
+                )
+                .await;
+                let mut outcome = None;
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        Event::Finished { .. } => outcome = Some(Err(())),
+                        Event::Failed { error, .. } => outcome = Some(Ok(error)),
+                        _ => {}
+                    }
+                }
+                outcome
+            });
+
+        match outcome {
+            Some(Ok(error)) => {
+                assert!(error.contains("Redirect loop"), "{error}");
+                assert!(!error.contains("cookie"), "nothing asked for one: {error}");
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert!(!out.exists(), "no forwarding page may be saved as the file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An origin that accepts the connection and then says nothing at all —

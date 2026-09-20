@@ -299,6 +299,8 @@
   "Record": "Spela in",
   "Recorded": "Inspelad",
   "Recording, segments:": "Spelar in, segment:",
+  "Redirect loop": "Omdirigeringsloop",
+  "Redirect loop (the server expects a cookie)": "Omdirigeringsloop (servern förväntar sig en kaka)",
   "Redownload": "Ladda ned igen",
   "Refresh": "Uppdatera",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Registrerar Hydra som ett inloggningsobjekt så att nedladdningar och köer fortsätter efter en omstart.",
