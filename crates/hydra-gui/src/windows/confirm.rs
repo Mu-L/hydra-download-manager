@@ -4,9 +4,9 @@
 //! Small confirmation / warning dialogs.
 
 use crate::app::{App, ConfirmKind, El, Message, WinKind};
-use crate::windows::{dlg_btn, dlg_btn_auto, dlg_btn_auto_primary, dlg_btn_primary};
+use crate::windows::{check, dlg_btn, dlg_btn_auto, dlg_btn_auto_primary, dlg_btn_primary};
 use crate::{i18n::tr, icons, theme};
-use iced::widget::{checkbox, column, container, row, svg, text};
+use iced::widget::{column, container, row, svg, text};
 use iced::Length;
 
 pub fn view(app: &App) -> El<'_> {
@@ -113,12 +113,8 @@ pub fn view(app: &App) -> El<'_> {
         Some(ConfirmKind::DeleteItems(_)) | Some(ConfirmKind::DeleteCompleted)
     );
     let remove_file: El<'_> = if offer_remove_file {
-        checkbox(app.confirm_remove_file)
-            .label(tr("Also remove file from disk"))
+        check(app.confirm_remove_file, tr("Also remove file from disk"))
             .on_toggle(Message::ConfirmRemoveFile)
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check)
             .into()
     } else {
         iced::widget::space::horizontal().height(0.0).into()

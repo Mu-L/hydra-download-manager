@@ -6,11 +6,9 @@
 
 use crate::app::{App, El, Message, SchField, SchTab, WinKind};
 use crate::model::{DlState, PowerAction, QueueDef};
-use crate::windows::{dlg_btn, dlg_btn_primary};
+use crate::windows::{cell, check, dlg_btn, dlg_btn_primary};
 use crate::{fmt, i18n::tr, icons, theme};
-use iced::widget::{
-    button, checkbox, column, container, mouse_area, radio, row, scrollable, svg, text, text_input,
-};
+use iced::widget::{button, column, container, mouse_area, radio, row, svg, text, text_input};
 
 use iced::Length;
 
@@ -20,6 +18,10 @@ fn s(f: SchField) -> Message {
 
 /// Width of the queue list box; the New queue / Delete pair shares it.
 const LIST_W: f32 = 240.0;
+
+/// Size, Status and Time left in the files list; the header and the rows
+/// share the number.
+const FILE_COL_W: f32 = 100.0;
 
 /// Vertical gap between the schedule tab's rows: a checkbox row is only
 /// 18 px, and at the ordinary dialog gap the ticks read as one dense block.
@@ -146,7 +148,7 @@ fn queue_list(app: &App) -> El<'_> {
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
-        container(scrollable(list).height(Length::Fill))
+        container(crate::ui::scroll(list).height(Length::Fill))
             .padding(4)
             .width(LIST_W)
             .height(Length::Fill)
@@ -179,14 +181,7 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
         let mut c = column![].spacing(8);
         for (name, i) in chunk {
             let i = *i;
-            c = c.push(
-                checkbox(sc.days[i])
-                    .label(tr(name))
-                    .on_toggle(move |b| s(SchField::Day(i, b)))
-                    .size(15.0)
-                    .text_size(theme::FONT_SIZE)
-                    .style(theme::check),
-            );
+            c = c.push(check(sc.days[i], tr(name)).on_toggle(move |b| s(SchField::Day(i, b))));
         }
         day_cols = day_cols.push(c);
     }
@@ -208,19 +203,11 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
             .text_size(theme::FONT_SIZE),
         ]
         .spacing(30),
-        checkbox(sc.start_on_startup)
-            .label(tr("Start download on Hydra startup"))
-            .on_toggle(|b| s(SchField::OnStartup(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(sc.start_on_startup, tr("Start download on Hydra startup"))
+            .on_toggle(|b| s(SchField::OnStartup(b))),
         row![
-            checkbox(sc.start_enabled)
-                .label(tr("Start download at"))
-                .on_toggle(|b| s(SchField::StartEnabled(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(sc.start_enabled, tr("Start download at"))
+                .on_toggle(|b| s(SchField::StartEnabled(b))),
             text_input("23:00", &sc.start_at)
                 .on_input(|v| s(SchField::StartAt(v)))
                 .size(theme::FONT_SIZE)
@@ -241,12 +228,8 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
         .spacing(30),
         day_cols,
         row![
-            checkbox(sc.stop_enabled)
-                .label(tr("Stop download at"))
-                .on_toggle(|b| s(SchField::StopEnabled(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(sc.stop_enabled, tr("Stop download at"))
+                .on_toggle(|b| s(SchField::StopEnabled(b))),
             text_input("07:30", &sc.stop_at)
                 .on_input(|v| s(SchField::StopAt(v)))
                 .size(theme::FONT_SIZE)
@@ -256,14 +239,11 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
         .spacing(10)
         .align_y(iced::Alignment::Center),
         row![
-            checkbox(sc.retries_enabled)
-                .label(tr(
-                    "Number of retries for each file if downloading failed :"
-                ))
-                .on_toggle(|b| s(SchField::RetriesEnabled(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(
+                sc.retries_enabled,
+                tr("Number of retries for each file if downloading failed :")
+            )
+            .on_toggle(|b| s(SchField::RetriesEnabled(b))),
             spin(
                 sc.retries,
                 crate::model::QUEUE_RETRIES,
@@ -274,12 +254,11 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
         .spacing(10)
         .align_y(iced::Alignment::Center),
         row![
-            checkbox(sc.open_file_enabled)
-                .label(tr("Open the following file when done:"))
-                .on_toggle(|b| s(SchField::OpenFileEnabled(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(
+                sc.open_file_enabled,
+                tr("Open the following file when done:")
+            )
+            .on_toggle(|b| s(SchField::OpenFileEnabled(b))),
             text_input("", &sc.open_file)
                 .on_input(|v| s(SchField::OpenFile(v)))
                 .size(theme::FONT_SIZE)
@@ -288,18 +267,13 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center),
-        checkbox(sc.exit_when_done)
-            .label(tr("Exit Hydra when done"))
-            .on_toggle(|b| s(SchField::ExitDone(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
-        checkbox(sc.shutdown_when_done)
-            .label(tr("Shut down / log off / sleep computer when done"))
-            .on_toggle(|b| s(SchField::ShutdownDone(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(sc.exit_when_done, tr("Exit Hydra when done"))
+            .on_toggle(|b| s(SchField::ExitDone(b))),
+        check(
+            sc.shutdown_when_done,
+            tr("Shut down / log off / sleep computer when done")
+        )
+        .on_toggle(|b| s(SchField::ShutdownDone(b))),
     ]
     .spacing(ROW_GAP);
 
@@ -354,10 +328,10 @@ fn files_tab(app: &App) -> El<'_> {
     let mut list = column![].spacing(1);
     list = list.push(
         row![
-            container(text(tr("File Name")).size(theme::FONT_SIZE)).width(Length::Fill),
-            container(text(tr("Size")).size(theme::FONT_SIZE)).width(100.0),
-            container(text(tr("Status")).size(theme::FONT_SIZE)).width(100.0),
-            container(text(tr("Time left")).size(theme::FONT_SIZE)).width(100.0),
+            cell(tr("File Name"), Length::Fill),
+            cell(tr("Size"), FILE_COL_W),
+            cell(tr("Status"), FILE_COL_W),
+            cell(tr("Time left"), FILE_COL_W),
         ]
         .spacing(4)
         .padding([2, 4]),
@@ -371,21 +345,16 @@ fn files_tab(app: &App) -> El<'_> {
             mouse_area(
                 container(
                     row![
-                        container(text(d.file_name.clone()).size(theme::FONT_SIZE))
-                            .width(Length::Fill),
-                        container(
-                            text(d.size.map(fmt::size2).unwrap_or_default()).size(theme::FONT_SIZE)
-                        )
-                        .width(100.0),
-                        container(text(d.status_text()).size(theme::FONT_SIZE)).width(100.0),
-                        container(
-                            text(match d.state {
+                        cell(d.file_name.clone(), Length::Fill),
+                        cell(d.size.map(fmt::size2).unwrap_or_default(), FILE_COL_W),
+                        cell(d.status_text(), FILE_COL_W),
+                        cell(
+                            match d.state {
                                 DlState::Receiving => d.eta_secs.map(fmt::eta).unwrap_or_default(),
                                 _ => String::new(),
-                            })
-                            .size(theme::FONT_SIZE)
-                        )
-                        .width(100.0),
+                            },
+                            FILE_COL_W,
+                        ),
                     ]
                     .spacing(4),
                 )
@@ -424,7 +393,7 @@ fn files_tab(app: &App) -> El<'_> {
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
-        container(scrollable(list).height(Length::Fill))
+        container(crate::ui::scroll(list).height(Length::Fill))
             .padding(4)
             .width(Length::Fill)
             .height(Length::Fill)

@@ -7,11 +7,10 @@
 
 use crate::app::{App, El, Message, ProgTab, ScanState};
 use crate::model::{DlState, DownloadItem, PowerAction, ProxyPick};
-use crate::windows::{dlg_btn, dlg_btn_primary};
+use crate::windows::{cell, check, dlg_btn, dlg_btn_primary};
 use crate::{fmt, i18n::tr, theme};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, progress_bar, radio, row, scrollable, text,
-    text_input,
+    button, column, container, pick_list, progress_bar, radio, row, text, text_input,
 };
 use iced::Length;
 
@@ -23,13 +22,22 @@ fn tab_btn<'a>(label: String, selected: bool, msg: Message) -> El<'a> {
         .into()
 }
 
-fn kv<'a>(k: String, v: String) -> El<'a> {
-    row![
-        text(k).size(theme::FONT_SIZE).width(130.0),
-        text(v).size(theme::FONT_SIZE),
-    ]
-    .spacing(8)
-    .into()
+/// The narrowest the status rows' key column is drawn; it grows to the
+/// widest key the locale produced (see `crate::windows::label_column`).
+const KEY_W: f32 = 130.0;
+/// Floors for the two label columns that stand outside the status rows.
+const PROXY_LABEL_W: f32 = 170.0;
+const SAVE_TO_W: f32 = 70.0;
+const ROW_GAP: f32 = 8.0;
+
+/// One reported value, as a row for [`rows`].
+fn kv<'a>(k: String, v: String) -> (Option<String>, El<'a>) {
+    (Some(k), text(v).size(theme::FONT_SIZE).into())
+}
+
+/// The reported values of a tab, over one key column.
+fn rows<'a>(rows: Vec<(Option<String>, El<'a>)>) -> El<'a> {
+    crate::windows::label_column(rows, KEY_W, ROW_GAP)
 }
 
 fn status_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
@@ -38,6 +46,46 @@ fn status_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
         .size
         .map(|s| fmt::pct(d.downloaded, s))
         .unwrap_or_default();
+    let status = (
+        Some(tr("Status")),
+        text(if d.status_line.is_empty() {
+            d.status_text()
+        } else {
+            d.status_line.clone()
+        })
+        .size(theme::FONT_SIZE)
+        // A virus verdict is the one status worth shouting: red for
+        // "infected" or a scanner that could not run, the usual blue for
+        // everything else, scanning included.
+        .color(match app.scans.get(&d.id) {
+            Some(st) if !st.running() => iced::Color::from_rgb8(0xC4, 0x1F, 0x1F),
+            _ => iced::Color::from_rgb8(0x1F, 0x3F, 0xC4),
+        })
+        .into(),
+    );
+    // A live recording has no size and never will: it ends when someone
+    // stops it. Reporting "?" against a label that expects a number says
+    // nothing, so the row becomes the one measure that IS knowable —
+    // how much media is on disk.
+    let size_row = if recording {
+        let done = d
+            .recorded_secs
+            .map(|s| fmt::eta(s as u64))
+            .unwrap_or_else(|| "0:00".into());
+        kv(
+            tr("Recorded"),
+            match d.stream.as_ref().and_then(|s| s.max_seconds) {
+                // Asked for a fixed length: say how much of it is done.
+                Some(limit) => format!("{done} / {}", fmt::eta(limit)),
+                None => done,
+            },
+        )
+    } else {
+        kv(
+            tr("File size"),
+            d.size.map(fmt::size3).unwrap_or_else(|| "?".into()),
+        )
+    };
     column![
         crate::windows::ext_hint(
             text(d.url.clone())
@@ -45,74 +93,38 @@ fn status_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
                 .wrapping(iced::widget::text::Wrapping::None),
             &d.url,
         ),
-        row![
-            text(tr("Status")).size(theme::FONT_SIZE).width(130.0),
-            text(if d.status_line.is_empty() {
-                d.status_text()
-            } else {
-                d.status_line.clone()
-            })
-            .size(theme::FONT_SIZE)
-            // A virus verdict is the one status worth shouting: red for
-            // "infected" or a scanner that could not run, the usual blue for
-            // everything else, scanning included.
-            .color(match app.scans.get(&d.id) {
-                Some(st) if !st.running() => iced::Color::from_rgb8(0xC4, 0x1F, 0x1F),
-                _ => iced::Color::from_rgb8(0x1F, 0x3F, 0xC4),
-            }),
-        ]
-        .spacing(8),
-        // A live recording has no size and never will: it ends when someone
-        // stops it. Reporting "?" against a label that expects a number says
-        // nothing, so the row becomes the one measure that IS knowable —
-        // how much media is on disk.
-        if recording {
-            let done = d
-                .recorded_secs
-                .map(|s| fmt::eta(s as u64))
-                .unwrap_or_else(|| "0:00".into());
+        rows(vec![
+            status,
+            size_row,
             kv(
-                tr("Recorded"),
-                match d.stream.as_ref().and_then(|s| s.max_seconds) {
-                    // Asked for a fixed length: say how much of it is done.
-                    Some(limit) => format!("{done} / {}", fmt::eta(limit)),
-                    None => done,
-                },
-            )
-        } else {
-            kv(
-                tr("File size"),
-                d.size.map(fmt::size3).unwrap_or_else(|| "?".into()),
-            )
-        },
-        kv(
-            tr("Downloaded"),
-            format!(
-                "{}{}",
-                fmt::size3(d.downloaded),
-                if pct.is_empty() {
-                    String::new()
-                } else {
-                    format!("  ( {pct} )")
-                }
+                tr("Downloaded"),
+                format!(
+                    "{}{}",
+                    fmt::size3(d.downloaded),
+                    if pct.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ( {pct} )")
+                    }
+                ),
             ),
-        ),
-        kv(
-            tr("Transfer rate"),
-            fmt::rate_capped(d.rate, app.effective_limit(d))
-        ),
-        kv(
-            tr("Time left"),
-            d.eta_secs.map(fmt::eta).unwrap_or_default()
-        ),
-        kv(
-            tr("Resume capability"),
-            match d.resume {
-                Some(true) => tr("Yes"),
-                Some(false) => tr("No"),
-                None => "?".into(),
-            },
-        ),
+            kv(
+                tr("Transfer rate"),
+                fmt::rate_capped(d.rate, app.effective_limit(d)),
+            ),
+            kv(
+                tr("Time left"),
+                d.eta_secs.map(fmt::eta).unwrap_or_default(),
+            ),
+            kv(
+                tr("Resume capability"),
+                match d.resume {
+                    Some(true) => tr("Yes"),
+                    Some(false) => tr("No"),
+                    None => "?".into(),
+                },
+            ),
+        ]),
     ]
     .spacing(7)
     .into()
@@ -129,9 +141,11 @@ fn proxy_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
     let p = app.prog.get(&d.id).cloned().unwrap_or_default();
     let running = d.state.is_active();
     let id = d.id;
-    let label = text(tr("Proxy for this download"))
+    let title = tr("Proxy for this download");
+    let label = text(title.clone())
         .size(theme::FONT_SIZE)
-        .width(170.0);
+        .wrapping(iced::widget::text::Wrapping::None)
+        .width(crate::windows::label_width(&title, PROXY_LABEL_W));
     // While it runs the row REPORTS instead of offering: a picker that
     // accepts a click it cannot act on is the same broken promise as a
     // setting that never reaches the transport.
@@ -215,16 +229,12 @@ fn proxy_problem(p: &crate::app::ProgState) -> Option<String> {
 fn speed_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
     let p = app.prog.get(&d.id).cloned().unwrap_or_default();
     column![
-        kv(
+        rows(vec![kv(
             tr("Transfer rate"),
-            fmt::rate_capped(d.rate, app.effective_limit(d))
-        ),
-        checkbox(p.limit_on)
-            .label(tr("Use Speed Limiter"))
-            .on_toggle(move |b| Message::ProgLimitOn(d.id, b))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+            fmt::rate_capped(d.rate, app.effective_limit(d)),
+        )]),
+        check(p.limit_on, tr("Use Speed Limiter"))
+            .on_toggle(move |b| Message::ProgLimitOn(d.id, b)),
         text(tr("Maximum download speed:"))
             .size(theme::FONT_SIZE)
             .color(theme::dim_text(&iced::Theme::Light)),
@@ -238,14 +248,11 @@ fn speed_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
-        checkbox(p.remember_limit)
-            .label(tr(
-                "Remember Speed Limiter settings for this file on download stop/resume"
-            ))
-            .on_toggle(move |b| Message::ProgLimitRemember(d.id, b))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(
+            p.remember_limit,
+            tr("Remember Speed Limiter settings for this file on download stop/resume")
+        )
+        .on_toggle(move |b| Message::ProgLimitRemember(d.id, b)),
         if app.cfg.settings.show_hide_buttons {
             crate::windows::dlg_btn(tr("Hide tab"), Some(Message::ProgHideTab(d.id, 1)))
         } else {
@@ -259,32 +266,32 @@ fn speed_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
 fn completion_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
     let mut col = column![
         row![
-            text(tr("Save To:")).size(theme::FONT_SIZE).width(70.0),
+            text(tr("Save To:"))
+                .size(theme::FONT_SIZE)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(crate::windows::label_width(&tr("Save To:"), SAVE_TO_W)),
             text(d.full_path().to_string_lossy().into_owned()).size(theme::FONT_SIZE),
         ]
         .spacing(8),
-        checkbox(app.cfg.settings.show_complete_dialog)
-            .label(tr("Show download complete dialog"))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
-        checkbox(app.cfg.settings.remove_completed)
-            .label(tr("Remove completed downloads from the list"))
-            .on_toggle(Message::ProgRemoveCompleted)
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(
+            app.cfg.settings.show_complete_dialog,
+            tr("Show download complete dialog")
+        ),
+        check(
+            app.cfg.settings.remove_completed,
+            tr("Remove completed downloads from the list")
+        )
+        .on_toggle(Message::ProgRemoveCompleted),
         text(tr(
             "These settings are unavailable when \"Show download complete dialog\" is turned on"
         ))
         .size(theme::FONT_SIZE)
         .color(theme::dim_text(&iced::Theme::Light)),
-        checkbox(d.shutdown_after)
-            .label(tr("Shut down / log off / sleep computer when done"))
-            .on_toggle(move |b| Message::ProgShutdownAfter(d.id, b))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(
+            d.shutdown_after,
+            tr("Shut down / log off / sleep computer when done")
+        )
+        .on_toggle(move |b| Message::ProgShutdownAfter(d.id, b)),
     ]
     .spacing(10);
 
@@ -393,7 +400,7 @@ fn scan_log(st: &ScanState) -> El<'_> {
         );
     }
     container(
-        scrollable(rows)
+        crate::ui::scroll(rows)
             .height(ROW_H * VISIBLE as f32)
             .width(Length::Fill)
             .anchor_bottom(),
@@ -436,18 +443,17 @@ fn chunk_strip<'a>(d: &DownloadItem) -> El<'a> {
         .into()
 }
 
+/// The two fixed columns of the connections table; the header and the rows
+/// share the numbers.
+const CONN_N_W: f32 = 50.0;
+const CONN_SIZE_W: f32 = 150.0;
+
 fn conn_table<'a>(d: &'a DownloadItem) -> El<'a> {
     // Header stays put; only the rows scroll.
     let header = row![
-        container(text(tr("N.")).size(theme::FONT_SIZE))
-            .width(50.0)
-            .padding([2, 6]),
-        container(text(tr("Downloaded")).size(theme::FONT_SIZE))
-            .width(150.0)
-            .padding([2, 6]),
-        container(text(tr("Info")).size(theme::FONT_SIZE))
-            .width(Length::Fill)
-            .padding([2, 6]),
+        cell(tr("N."), CONN_N_W).padding([2, 6]),
+        cell(tr("Downloaded"), CONN_SIZE_W).padding([2, 6]),
+        cell(tr("Info"), Length::Fill).padding([2, 6]),
     ]
     .spacing(0);
     // Exactly 8 rows are visible (blank band rows pad shorter transfers so
@@ -463,22 +469,17 @@ fn conn_table<'a>(d: &'a DownloadItem) -> El<'a> {
         rows = rows.push(
             container(
                 row![
-                    container(text(format!("{}", i + 1)).size(theme::FONT_SIZE))
-                        .width(50.0)
-                        .padding([1, 6]),
-                    container(
-                        text(if c.downloaded > 0 {
+                    cell(format!("{}", i + 1), CONN_N_W).padding([1, 6]),
+                    cell(
+                        if c.downloaded > 0 {
                             fmt::size3(c.downloaded)
                         } else {
                             String::new()
-                        })
-                        .size(theme::FONT_SIZE)
+                        },
+                        CONN_SIZE_W,
                     )
-                    .width(150.0)
                     .padding([1, 6]),
-                    container(text(c.info.clone()).size(theme::FONT_SIZE))
-                        .width(Length::Fill)
-                        .padding([1, 6]),
+                    cell(c.info.clone(), Length::Fill).padding([1, 6]),
                 ]
                 .spacing(0)
                 .height(ROW_H),
@@ -498,7 +499,7 @@ fn conn_table<'a>(d: &'a DownloadItem) -> El<'a> {
     // the table instead of stretching an empty band below the connections.
     container(column![
         header,
-        scrollable(rows)
+        crate::ui::scroll(rows)
             .height(ROW_H * VISIBLE as f32)
             .width(Length::Fill),
     ])
@@ -576,7 +577,7 @@ pub fn view(app: &App, id: crate::model::DlId) -> El<'_> {
     // bar, buttons and connections panel below never jump when switching.
     let mut col = column![
         tabs,
-        container(scrollable(tab_body))
+        container(crate::ui::scroll(tab_body))
             .width(Length::Fill)
             .height(210.0)
             .padding(12)

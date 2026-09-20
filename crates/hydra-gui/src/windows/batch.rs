@@ -6,7 +6,7 @@
 //! to add, choose where they are saved ("Download All Links" flow).
 
 use crate::app::{App, BatchRow, BatchSortKey, BatchState, El, Message, WinKind};
-use crate::windows::{dlg_btn, dlg_btn_primary};
+use crate::windows::{check, dlg_btn, dlg_btn_primary};
 use crate::{fmt, i18n::tr, theme};
 use iced::widget::{
     checkbox, column, container, mouse_area, pick_list, radio, row, scrollable, text, text_editor,
@@ -79,7 +79,7 @@ pub fn view(app: &App) -> El<'_> {
     let table = column![
         header(st, &rows),
         hairline(),
-        scrollable(list).height(Length::Fill),
+        crate::ui::scroll(list).height(Length::Fill),
     ];
 
     let cats: Vec<String> = app.cfg.categories.iter().map(|c| c.name.clone()).collect();
@@ -176,18 +176,8 @@ pub fn view(app: &App) -> El<'_> {
             tr("Uncheck Selected"),
             has_sel.then_some(Message::BatchCheckSel(false))
         ),
-        checkbox(st.hide_html)
-            .label(tr("Hide HTML files"))
-            .on_toggle(Message::BatchHideHtml)
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
-        checkbox(st.hide_dups)
-            .label(tr("Hide duplicate links"))
-            .on_toggle(Message::BatchHideDups)
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(st.hide_html, tr("Hide HTML files")).on_toggle(Message::BatchHideHtml),
+        check(st.hide_dups, tr("Hide duplicate links")).on_toggle(Message::BatchHideDups),
     ]
     .spacing(8);
 

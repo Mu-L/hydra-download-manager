@@ -17,12 +17,13 @@
 
 use crate::app::{App, El, FileInfoState, Message};
 use crate::model::{DlState, ProxyPick};
-use crate::windows::{dlg_btn, dlg_btn_auto, dlg_btn_primary};
+use crate::windows::{check, dlg_btn, dlg_btn_auto, dlg_btn_primary};
 use crate::{fmt, i18n::tr, theme};
-use iced::widget::{button, checkbox, column, container, pick_list, row, svg, text, text_input};
+use iced::widget::{button, column, container, pick_list, row, svg, text, text_input};
 use iced::Length;
 
-/// The label column: is about this wide at the same font size.
+/// The label column's floor, matching IDM's at this font size; a locale
+/// whose labels are longer widens it (see [`form`]).
 const LABEL_W: f32 = 84.0;
 const GAP: f32 = 8.0;
 
@@ -33,25 +34,14 @@ fn punctuated(label: &str) -> String {
     format!("{}:", label.trim_end().trim_end_matches(':').trim_end())
 }
 
-fn labeled<'a>(label: String, content: El<'a>) -> El<'a> {
-    row![
-        text(punctuated(&label))
-            .size(theme::FONT_SIZE)
-            .wrapping(iced::widget::text::Wrapping::None)
-            .width(LABEL_W),
-        content,
-    ]
-    .spacing(GAP)
-    .align_y(iced::Alignment::Center)
-    .into()
-}
-
-/// A row that starts at the field column (no label).
-fn indented(content: El) -> El {
-    row![iced::widget::space::horizontal().width(LABEL_W), content]
-        .spacing(GAP)
-        .align_y(iced::Alignment::Center)
-        .into()
+/// The form, over one label column wide enough for the labels this locale
+/// produced. A row with no label starts at the field column.
+fn form<'a>(rows: Vec<(Option<String>, El<'a>)>) -> El<'a> {
+    let rows = rows
+        .into_iter()
+        .map(|(label, content)| (label.as_deref().map(punctuated), content))
+        .collect();
+    crate::windows::label_column(rows, LABEL_W, GAP)
 }
 
 fn field<'a>(value: &str, on_input: fn(String) -> Message) -> text_input::TextInput<'a, Message> {
@@ -138,20 +128,20 @@ pub fn view(app: &App) -> El<'_> {
     let cats: Vec<String> = app.cfg.categories.iter().map(|c| c.name.clone()).collect();
     let complete = item.map(|d| d.state == DlState::Complete).unwrap_or(false);
 
-    let mut form = column![].spacing(GAP).width(Length::Fill);
+    let mut rows: Vec<(Option<String>, El<'_>)> = vec![];
 
     // What the entry already is, in one block: nothing here is editable,
     // and reading the outcome of the last attempt next to the status beats
     // hunting for it under the fields that change it.
     if !st.is_new {
-        form = form.push(labeled(
-            tr("Status:"),
+        rows.push((
+            Some(tr("Status:")),
             text(item.map(|d| d.status_text()).unwrap_or_default())
                 .size(theme::FONT_SIZE)
                 .into(),
         ));
-        form = form.push(labeled(
-            tr("Size:"),
+        rows.push((
+            Some(tr("Size:")),
             text(
                 size.map(|s| format!("{} ({s} Bytes)", fmt::size2(s)))
                     .unwrap_or_else(|| "?".into()),
@@ -159,8 +149,8 @@ pub fn view(app: &App) -> El<'_> {
             .size(theme::FONT_SIZE)
             .into(),
         ));
-        form = form.push(labeled(
-            tr("Last try date:"),
+        rows.push((
+            Some(tr("Last try date:")),
             text(
                 item.and_then(|d| d.last_try)
                     .map(fmt::date)
@@ -170,8 +160,8 @@ pub fn view(app: &App) -> El<'_> {
             .into(),
         ));
         if let Some(err) = item.and_then(|d| d.error.clone()) {
-            form = form.push(labeled(
-                tr("Result:"),
+            rows.push((
+                Some(tr("Result:")),
                 text(err)
                     .size(theme::FONT_SIZE)
                     .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B))
@@ -191,21 +181,21 @@ pub fn view(app: &App) -> El<'_> {
     } else {
         field(&st.url, Message::FiUrl).into()
     };
-    form = form.push(labeled(
-        tr("Address:"),
+    rows.push((
+        Some(tr("Address:")),
         crate::windows::ext_hint(addr, &st.url),
     ));
 
-    form = form.push(labeled(
-        tr("Category"),
+    rows.push((
+        Some(tr("Category")),
         pick_list(cats, Some(st.category.clone()), Message::FiCategory)
             .text_size(theme::FONT_SIZE)
             .style(theme::picker)
             .width(200.0)
             .into(),
     ));
-    form = form.push(labeled(
-        tr("Save As"),
+    rows.push((
+        Some(tr("Save As")),
         row![
             field(&st.save_as(), Message::FiSaveAs),
             small_btn("...", Message::FiBrowse),
@@ -226,22 +216,23 @@ pub fn view(app: &App) -> El<'_> {
         } else {
             st.category.as_str()
         };
-        form = form.push(indented(
-            checkbox(st.remember)
-                .label(format!(
+        rows.push((
+            None,
+            check(
+                st.remember,
+                format!(
                     "{} \"{}\" {}",
                     tr("Remember this path for"),
                     remember_cat,
                     tr("category")
-                ))
-                .on_toggle(Message::FiRemember)
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check)
-                .into(),
+                ),
+            )
+            .on_toggle(Message::FiRemember)
+            .into(),
         ));
         // The folder that tick would store, greyed out.
-        form = form.push(indented(
+        rows.push((
+            None,
             text_input("", &st.save_dir)
                 .size(theme::FONT_SIZE)
                 .style(|t, s| {
@@ -252,26 +243,25 @@ pub fn view(app: &App) -> El<'_> {
                 .width(Length::Fill)
                 .into(),
         ));
-        form = form.push(indented(
-            // Off — and honestly so — for a file type that is not in
+        rows.push((
+            None, // Off — and honestly so — for a file type that is not in
             // Options > File types: nothing is running behind this dialog.
-            checkbox(app.cfg.settings.bg_download && !st.bg_blocked)
-                .label(tr("Download in background while choosing options"))
-                .on_toggle(Message::FiBgToggle)
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check)
-                .into(),
+            check(
+                app.cfg.settings.bg_download && !st.bg_blocked,
+                tr("Download in background while choosing options"),
+            )
+            .on_toggle(Message::FiBgToggle)
+            .into(),
         ));
     }
-    form = form.push(labeled(
-        tr("Description"),
+    rows.push((
+        Some(tr("Description")),
         field(&st.description, Message::FiDescription).into(),
     ));
 
     if !st.is_new {
-        form = form.push(labeled(
-            tr("Login"),
+        rows.push((
+            Some(tr("Login")),
             row![
                 text_input("", &st.login)
                     .on_input(Message::FiLogin)
@@ -290,8 +280,8 @@ pub fn view(app: &App) -> El<'_> {
             .align_y(iced::Alignment::Center)
             .into(),
         ));
-        form = form.push(labeled(
-            tr("Cookies"),
+        rows.push((
+            Some(tr("Cookies")),
             text_input("name=value; name2=value2", &st.cookies)
                 .on_input(Message::FiCookies)
                 .size(theme::FONT_SIZE)
@@ -300,9 +290,10 @@ pub fn view(app: &App) -> El<'_> {
                 .into(),
         ));
     }
-    form = form.push(labeled(tr("Proxy"), proxy_row(st)));
+    rows.push((Some(tr("Proxy")), proxy_row(st)));
     if let Some(why) = proxy_problem(st) {
-        form = form.push(indented(
+        rows.push((
+            None,
             text(why)
                 .size(theme::FONT_SIZE - 1.0)
                 .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B))
@@ -367,7 +358,7 @@ pub fn view(app: &App) -> El<'_> {
     // opens above them — never as a dead strip under the last button.
     container(
         column![
-            row![form, side].spacing(GAP).height(Length::Fill),
+            row![form(rows), side].spacing(GAP).height(Length::Fill),
             row![
                 iced::widget::space::horizontal(),
                 buttons,

@@ -9,7 +9,7 @@ use crate::app::{App, El, Message, WinKind};
 use crate::model::SHORTCUT_ACTIONS;
 use crate::windows::dlg_btn_primary;
 use crate::{i18n::tr, theme};
-use iced::widget::{column, container, row, scrollable, text, text_input};
+use iced::widget::{column, container, row, text, text_input};
 use iced::Length;
 
 pub fn view(app: &App) -> El<'_> {
@@ -39,7 +39,7 @@ pub fn view(app: &App) -> El<'_> {
         column![
             // The table grows with every new action, and View > Scale scales
             // every row: scroll rather than push OK off the bottom.
-            scrollable(list).height(Length::Fill),
+            crate::ui::scroll(list).height(Length::Fill),
             row![
                 iced::widget::space::horizontal(),
                 dlg_btn_primary(

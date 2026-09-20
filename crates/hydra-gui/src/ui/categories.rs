@@ -6,7 +6,7 @@
 
 use crate::app::{App, El, Message, TreeSel};
 use crate::{i18n::tr, icons, theme};
-use iced::widget::{button, column, container, row, scrollable, svg, text, text_input};
+use iced::widget::{button, column, container, row, svg, text, text_input};
 use iced::Length;
 
 pub fn cat_icon(name: &str) -> svg::Handle {
@@ -46,12 +46,19 @@ fn node<'a>(
         ),
         None => r.push(iced::widget::space::horizontal().width(14.0)),
     };
-    r = r
-        .push(svg(icon).width(17.0).height(17.0))
-        .push(text(label).size(theme::FONT_SIZE));
+    r = r.push(svg(icon).width(17.0).height(17.0)).push(
+        text(label)
+            .size(theme::FONT_SIZE)
+            .wrapping(iced::widget::text::Wrapping::None),
+    );
+    // One line, cut at the sidebar edge: a category or queue name is long
+    // enough in some locales to be drawn across the list beside it, and a
+    // tree row that grows to two lines breaks the rhythm of the whole
+    // column.
     button(r)
         .padding([2, 2])
         .width(Length::Fill)
+        .clip(true)
         .style(theme::btn_row(selected))
         .on_press(Message::TreeSelect(sel))
         .into()
@@ -97,7 +104,9 @@ fn queue_node<'a>(app: &App, name: &str) -> El<'a> {
         svg(icons::queue_folder(app.queue_color(name)))
             .width(17.0)
             .height(17.0),
-        text(tr(name)).size(theme::FONT_SIZE),
+        text(tr(name))
+            .size(theme::FONT_SIZE)
+            .wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(4)
     .align_y(iced::Alignment::Center)
@@ -108,6 +117,7 @@ fn queue_node<'a>(app: &App, name: &str) -> El<'a> {
     button(r)
         .padding([2, 2])
         .width(Length::Fill)
+        .clip(true)
         .style(theme::btn_row(selected))
         .on_press(Message::TreeSelect(sel))
         .into()
@@ -222,7 +232,7 @@ pub fn view(app: &App) -> El<'_> {
         }
     }
 
-    container(scrollable(col).height(Length::Fill))
+    container(crate::ui::scroll(col).height(Length::Fill))
         .width(230.0)
         .height(Length::Fill)
         .padding(2)

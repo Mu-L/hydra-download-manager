@@ -142,7 +142,7 @@ fn main() -> iced::Result {
         .scale_factor(scale_of)
         .subscription(subscription)
         .font(include_bytes!("../assets/fonts/Vazirmatn-Regular.ttf").as_slice())
-        .default_font(font::default_font(pre.language.as_deref()))
+        .default_font(font::adopt(pre.language.as_deref()))
         .run()
 }
 

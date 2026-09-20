@@ -7,11 +7,11 @@
 
 use crate::app::{App, El, Message, OptField, OptTab, WinKind};
 use crate::model::{ProxyMode, ProxyType};
-use crate::windows::{dlg_btn, dlg_btn_auto, dlg_btn_auto_primary, dlg_btn_primary};
+use crate::windows::{cell, check, dlg_btn, dlg_btn_auto, dlg_btn_auto_primary, dlg_btn_primary};
 use crate::{i18n::tr, theme};
 use iced::widget::{
-    button, checkbox, column, container, pick_list, radio, row, scrollable, text, text_editor,
-    text_input, tooltip,
+    button, column, container, pick_list, radio, row, scrollable, text, text_editor, text_input,
+    tooltip,
 };
 use iced::Length;
 
@@ -64,15 +64,8 @@ fn general(app: &App) -> El<'_> {
         let connected = live.iter().any(|b| b.eq_ignore_ascii_case(name));
         browsers = browsers.push(
             row![
-                container(
-                    checkbox(*on)
-                        .label(name.clone())
-                        .on_toggle(move |b| o(OptField::Browser(i, b)))
-                        .size(15.0)
-                        .text_size(theme::FONT_SIZE)
-                        .style(theme::check),
-                )
-                .width(Length::Fill),
+                container(check(*on, name.clone()).on_toggle(move |b| o(OptField::Browser(i, b))),)
+                    .width(Length::Fill),
                 text(if connected {
                     tr("extension connected")
                 } else {
@@ -88,22 +81,12 @@ fn general(app: &App) -> El<'_> {
     // app while no window is open.
     #[cfg(target_os = "macos")]
     let hide_taskbar: Option<El<'_>> = Some(hinted(
-        checkbox(s.hide_from_taskbar)
-            .label(tr("Hide Dock icon"))
-            .on_toggle(|b| o(OptField::HideTaskbar(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(s.hide_from_taskbar, tr("Hide Dock icon")).on_toggle(|b| o(OptField::HideTaskbar(b))),
         tr("Removes Hydra from the Dock and Cmd-Tab while it runs in the tray; the Dock icon and menu bar return while a window is open."),
     ));
     #[cfg(target_os = "windows")]
     let hide_taskbar: Option<El<'_>> = Some(hinted(
-        checkbox(s.hide_from_taskbar)
-            .label(tr("Hide from taskbar"))
-            .on_toggle(|b| o(OptField::HideTaskbar(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(s.hide_from_taskbar, tr("Hide from taskbar")).on_toggle(|b| o(OptField::HideTaskbar(b))),
         tr("Hydra windows get no taskbar button; reach the app from the tray icon. Applies to windows opened after the change."),
     ));
     // Linux: an X11 window-manager hint per window. Wayland has no
@@ -115,12 +98,7 @@ fn general(app: &App) -> El<'_> {
         .is_none()
         .then(|| {
             hinted(
-                checkbox(s.hide_from_taskbar)
-                    .label(tr("Hide from taskbar"))
-                    .on_toggle(|b| o(OptField::HideTaskbar(b)))
-                    .size(15.0)
-                    .text_size(theme::FONT_SIZE)
-                    .style(theme::check),
+                check(s.hide_from_taskbar, tr("Hide from taskbar")).on_toggle(|b| o(OptField::HideTaskbar(b))),
                 tr("Keeps Hydra windows out of the taskbar and the workspace switcher; reach the app from the tray icon. Wayland has no way to hide an open window, so there it applies while Hydra runs in the tray."),
             )
         });
@@ -130,27 +108,15 @@ fn general(app: &App) -> El<'_> {
         column![
         section(tr("Browser/System Integration")),
         hinted(
-            checkbox(s.launch_on_startup).label(tr("Launch Hydra on startup"))
-                .on_toggle(|b| o(OptField::LaunchStartup(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.launch_on_startup, tr("Launch Hydra on startup")).on_toggle(|b| o(OptField::LaunchStartup(b))),
             tr("Registers Hydra as a login item so downloads and queues continue after a reboot."),
         ),
         hinted(
-            checkbox(s.start_in_tray).label(tr("Launch minimized to system tray"))
-                .on_toggle(|b| o(OptField::StartInTray(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.start_in_tray, tr("Launch minimized to system tray")).on_toggle(|b| o(OptField::StartInTray(b))),
             tr("Autostart launches stay in the tray; open the window from the tray icon."),
         ),
         hinted(
-            checkbox(s.close_to_tray).label(tr("Close to system tray"))
-                .on_toggle(|b| o(OptField::CloseToTray(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.close_to_tray, tr("Close to system tray")).on_toggle(|b| o(OptField::CloseToTray(b))),
             tr("Closing the main window leaves Hydra running in the tray, where queues and transfers carry on; open it again from the tray icon. Off: closing the window exits Hydra."),
         ),
     ];
@@ -161,43 +127,23 @@ fn general(app: &App) -> El<'_> {
     }
     col.extend([
         hinted(
-            checkbox(s.check_updates_on_startup).label(tr("Check for updates on startup"))
-                .on_toggle(|b| o(OptField::CheckUpdates(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.check_updates_on_startup, tr("Check for updates on startup")).on_toggle(|b| o(OptField::CheckUpdates(b))),
             tr("Asks the release server for a newer Hydra when the app starts. Only the check is automatic; installing always waits for your confirmation."),
         ),
         hinted(
-            checkbox(s.beta_channel).label(tr("Download Beta channel"))
-                .on_toggle(|b| o(OptField::BetaChannel(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.beta_channel, tr("Download Beta channel")).on_toggle(|b| o(OptField::BetaChannel(b))),
             tr("Update checks also offer release candidates (-rc tags) when one is ahead of the stable release; otherwise the stable release is used. Beta builds may be less stable."),
         ),
         hinted(
-            checkbox(s.power_save).label(tr("Power save mode"))
-                .on_toggle(|b| o(OptField::PowerSave(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.power_save, tr("Power save mode")).on_toggle(|b| o(OptField::PowerSave(b))),
             tr("Fewer wakeups: slower interface refresh, no progress animation, coarser transfer ticks. Download speed is unchanged."),
         ),
         hinted(
-            checkbox(s.gpu_render).label(tr("Use GPU render for smoother interface"))
-                .on_toggle(|b| o(OptField::GpuRender(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.gpu_render, tr("Use GPU render for smoother interface")).on_toggle(|b| o(OptField::GpuRender(b))),
             tr("GPU rendering is smoother on very large windows but uses considerably more memory and the graphics processor. Takes effect after restart."),
         ),
         hinted(
-            checkbox(s.monitor_clipboard).label(tr("Automatically start downloading of URLs placed to clipboard"))
-                .on_toggle(|b| o(OptField::Clipboard(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.monitor_clipboard, tr("Automatically start downloading of URLs placed to clipboard")).on_toggle(|b| o(OptField::Clipboard(b))),
             tr("Watches the clipboard for download links by file type and known download sites; one link opens the file dialog, many open the batch list."),
         ),
         text(tr("Capture downloads from the following browsers:"))
@@ -237,11 +183,7 @@ fn file_types(app: &App) -> El<'_> {
             .height(70.0),
         text(tr("(separate with commas or spaces)")).size(theme::FONT_SIZE - 1.0)
             .color(theme::dim_text(&iced::Theme::Light)),
-        checkbox(s.show_exception_dialog).label(tr("Show the dialog to add an address to the list of exceptions for a twice-cancelled download"))
-        .on_toggle(|b| o(OptField::ExcDialog(b)))
-        .size(15.0)
-        .text_size(theme::FONT_SIZE)
-        .style(theme::check),
+        check(s.show_exception_dialog, tr("Show the dialog to add an address to the list of exceptions for a twice-cancelled download")).on_toggle(|b| o(OptField::ExcDialog(b))),
     ]
     .spacing(10)
     .into()
@@ -336,34 +278,20 @@ fn save_to(app: &App) -> El<'_> {
         ]
         .spacing(8),
         hinted(
-            checkbox(app.options.draft.no_category_dirs)
-                .label(tr("Do not create category folders — save everything in the default folder"))
-                .on_toggle(|b| o(OptField::NoCatDirs(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(app.options.draft.no_category_dirs, tr("Do not create category folders — save everything in the default folder")).on_toggle(|b| o(OptField::NoCatDirs(b))),
             format!(
                 "{}\n{}",
                 tr("Off (default): a download is filed in its category folder, e.g. Downloads/Video."),
                 tr("On: the folders above are ignored and new downloads are saved directly in the General category folder. Downloads already on the list keep their folder."),
             ),
         ),
-        checkbox(app.options.draft.remember_last_dir)
-            .label(format!(
+        check(app.options.draft.remember_last_dir, format!(
                 "{} \"{}\" {}",
                 tr("Change folder for"),
                 app.options.sel_category,
                 tr("category on last selected")
-            ))
-            .on_toggle(|b| o(OptField::RememberLast(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
-        checkbox(app.options.draft.server_file_date).label(tr("Set file creation date as provided by the server"))
-            .on_toggle(|b| o(OptField::ServerDate(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+            )).on_toggle(|b| o(OptField::RememberLast(b))),
+        check(app.options.draft.server_file_date, tr("Set file creation date as provided by the server")).on_toggle(|b| o(OptField::ServerDate(b))),
         text(tr("File parts are stored next to the destination as \"<name>.part\" and renamed in place on completion — no temporary directory is needed."))
             .size(theme::FONT_SIZE - 1.0)
             .color(theme::dim_text(&iced::Theme::Light)),
@@ -377,75 +305,39 @@ fn downloads(app: &App) -> El<'_> {
     column![
         section(tr("Customize \"Download progress\" dialog")),
         hinted(
-            checkbox(s.start_minimized).label(tr("Start download progress dialog minimized"))
-                .on_toggle(|b| o(OptField::StartMinimized(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.start_minimized, tr("Start download progress dialog minimized")).on_toggle(|b| o(OptField::StartMinimized(b))),
             tr("New progress windows open minimized to the Dock/taskbar instead of in front."),
         ),
         hinted(
-            checkbox(s.show_file_info_dialog).label(tr("Show \"Download File Info\" dialog before starting"))
-                .on_toggle(|b| o(OptField::ShowFileInfo(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.show_file_info_dialog, tr("Show \"Download File Info\" dialog before starting")).on_toggle(|b| o(OptField::ShowFileInfo(b))),
             tr("Adding a link first shows name/category/folder while the transfer already runs in the background; off = downloads start immediately."),
         ),
         hinted(
-            checkbox(s.bg_download).label(tr("Download in background while choosing options"))
-                .on_toggle(|b| o(OptField::BgDownload(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.bg_download, tr("Download in background while choosing options")).on_toggle(|b| o(OptField::BgDownload(b))),
             tr("Off = nothing is fetched until \"Start Download\" is pressed, so a rename or a change of folder happens before the transfer, not during it."),
         ),
         hinted(
-            checkbox(s.show_speed_tab).label(tr("Show \"Speed Limiter\" tab"))
-                .on_toggle(|b| o(OptField::SpeedTab(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.show_speed_tab, tr("Show \"Speed Limiter\" tab")).on_toggle(|b| o(OptField::SpeedTab(b))),
             tr("Shows or hides the Speed Limiter tab of the progress window."),
         ),
         hinted(
-            checkbox(s.show_completion_tab).label(tr("Show \"Options on completion\" tab"))
-                .on_toggle(|b| o(OptField::CompletionTab(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.show_completion_tab, tr("Show \"Options on completion\" tab")).on_toggle(|b| o(OptField::CompletionTab(b))),
             tr("Shows or hides the Options-on-completion tab of the progress window."),
         ),
         hinted(
-            checkbox(s.show_hide_buttons).label(tr("Show \"Hide tab\" buttons"))
-                .on_toggle(|b| o(OptField::HideButtons(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.show_hide_buttons, tr("Show \"Hide tab\" buttons")).on_toggle(|b| o(OptField::HideButtons(b))),
             tr("Shows a Hide-tab button inside the Speed Limiter and Options-on-completion tabs."),
         ),
         hinted(
-            checkbox(s.show_conn_details).label(tr("Show connection details"))
-                .on_toggle(|b| o(OptField::ConnDetails(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.show_conn_details, tr("Show connection details")).on_toggle(|b| o(OptField::ConnDetails(b))),
             tr("Off = the progress window opens collapsed; its \"Show details\" button still opens the per-connection panel."),
         ),
         hinted(
-            checkbox(s.show_complete_dialog).label(tr("Show download complete dialog"))
-                .on_toggle(|b| o(OptField::CompleteDialog(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.show_complete_dialog, tr("Show download complete dialog")).on_toggle(|b| o(OptField::CompleteDialog(b))),
             tr("Pops the completion dialog with Open / Open folder when a download finishes."),
         ),
         hinted(
-            checkbox(s.remove_completed).label(tr("Remove completed downloads from the list"))
-                .on_toggle(|b| o(OptField::RemoveCompleted(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.remove_completed, tr("Remove completed downloads from the list")).on_toggle(|b| o(OptField::RemoveCompleted(b))),
             tr("A finished download drops off the list on its own — once the complete dialog is closed, when that dialog is shown. The downloaded file is kept."),
         ),
         section(tr("Virus checking")),
@@ -510,6 +402,12 @@ fn quota_line(app: &App) -> String {
 /// the stock speed profiles in full and still hints at a fourth row when a
 /// list has one.
 const LIST_H: f32 = 70.0;
+/// Floor for the PAC address label.
+const PAC_LABEL_W: f32 = 80.0;
+/// The two fixed columns of the saved-logins list, header and rows off the
+/// same numbers.
+const LOGIN_USER_W: f32 = 140.0;
+const LOGIN_PASS_W: f32 = 120.0;
 
 fn connection(app: &App) -> El<'_> {
     let s = &app.options.draft;
@@ -520,8 +418,8 @@ fn connection(app: &App) -> El<'_> {
         exc = exc.push(
             button(
                 row![
-                    container(text(server.clone()).size(theme::FONT_SIZE)).width(Length::Fill),
-                    container(text(n.to_string()).size(theme::FONT_SIZE)).width(70.0),
+                    cell(server.clone(), Length::Fill),
+                    cell(n.to_string(), 70.0),
                 ]
                 .spacing(6),
             )
@@ -536,8 +434,8 @@ fn connection(app: &App) -> El<'_> {
         profiles = profiles.push(
             button(
                 row![
-                    container(text(tr(&p.name)).size(theme::FONT_SIZE)).width(Length::Fill),
-                    container(text(crate::fmt::limit(p.limit)).size(theme::FONT_SIZE)).width(90.0),
+                    cell(tr(&p.name), Length::Fill),
+                    cell(crate::fmt::limit(p.limit), 90.0),
                 ]
                 .spacing(6),
             )
@@ -561,16 +459,11 @@ fn connection(app: &App) -> El<'_> {
         .spacing(10)
         .align_y(iced::Alignment::Center),
         hinted(
-            checkbox(s.adaptive_conns)
-                .label(tr("Measure and adapt connection count"))
-                .on_toggle(|b| o(OptField::AdaptiveConns(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.adaptive_conns, tr("Measure and adapt connection count")).on_toggle(|b| o(OptField::AdaptiveConns(b))),
             tr("Starts each transfer with one connection and adds more only while they measurably improve speed; the default max. number acts as a ceiling."),
         ),
         text(tr("Exceptions:")).size(theme::FONT_SIZE),
-        container(scrollable(exc).height(Length::Fill))
+        container(crate::ui::scroll(exc).height(Length::Fill))
             .padding(3)
             .width(Length::Fill)
             .height(LIST_H)
@@ -598,12 +491,7 @@ fn connection(app: &App) -> El<'_> {
         // has to fit its window without scrolling.
         row![
             hinted(
-                checkbox(s.speed_limiter_on)
-                    .label(tr("Limit download speed"))
-                    .on_toggle(|b| o(OptField::SpeedLimiter(b)))
-                    .size(15.0)
-                    .text_size(theme::FONT_SIZE)
-                    .style(theme::check),
+                check(s.speed_limiter_on, tr("Limit download speed")).on_toggle(|b| o(OptField::SpeedLimiter(b))),
                 tr("Caps the combined speed of every download that has no limit of its own. The toolbar's Speed Limit button switches the same cap on and off while downloads run."),
             ),
             text_input("500", &st.speed_limit_kb_txt)
@@ -621,7 +509,7 @@ fn connection(app: &App) -> El<'_> {
             text(tr("Profiles:")).size(theme::FONT_SIZE),
             tr("Named caps the toolbar's Speed Limit arrow switches between in one click. Leave the speed empty for a profile that turns the limiter off; saving a name that is already in the list retunes it."),
         ),
-        container(scrollable(profiles).height(Length::Fill))
+        container(crate::ui::scroll(profiles).height(Length::Fill))
             .padding(3)
             .width(Length::Fill)
             .height(LIST_H)
@@ -646,12 +534,7 @@ fn connection(app: &App) -> El<'_> {
         .spacing(8),
         section(tr("Download limits")),
         hinted(
-            checkbox(s.dl_limit_enabled)
-                .label(tr("Download limits"))
-                .on_toggle(|b| o(OptField::DlLimit(b)))
-                .size(15.0)
-                .text_size(theme::FONT_SIZE)
-                .style(theme::check),
+            check(s.dl_limit_enabled, tr("Download limits")).on_toggle(|b| o(OptField::DlLimit(b))),
             tr("Caps how much Hydra may transfer per period — for metered or capped connections. Transfers pause when the cap is reached and resume by themselves when the next period starts."),
         ),
         row![
@@ -674,12 +557,7 @@ fn connection(app: &App) -> El<'_> {
         text(quota_line(app))
             .size(theme::FONT_SIZE - 1.0)
             .color(theme::dim_text(&iced::Theme::Light)),
-        checkbox(s.warn_before_stop)
-            .label(tr("Show warning before stopping downloads"))
-            .on_toggle(|b| o(OptField::WarnStop(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(s.warn_before_stop, tr("Show warning before stopping downloads")).on_toggle(|b| o(OptField::WarnStop(b))),
     ]
     .spacing(8)
     .into()
@@ -719,7 +597,10 @@ fn proxy(app: &App) -> El<'_> {
         .size(15.0)
         .text_size(theme::FONT_SIZE),
         row![
-            text(tr("Address")).size(theme::FONT_SIZE).width(80.0),
+            text(tr("Address"))
+                .size(theme::FONT_SIZE)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(crate::windows::label_width(&tr("Address"), PAC_LABEL_W)),
             text_input("", &s.proxy_script)
                 .on_input(|v| o(OptField::ProxyScript(v)))
                 .size(theme::FONT_SIZE)
@@ -746,7 +627,9 @@ fn proxy(app: &App) -> El<'_> {
         .text_size(theme::FONT_SIZE),
         row![
             column![
-                text(tr("Type")).size(theme::FONT_SIZE),
+                text(tr("Type"))
+                    .size(theme::FONT_SIZE)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                 pick_list(&ProxyType::ALL[..], Some(s.proxy_type), |t| o(
                     OptField::ProxyType(t)
                 ))
@@ -757,7 +640,9 @@ fn proxy(app: &App) -> El<'_> {
             .spacing(4)
             .width(110.0),
             column![
-                text(tr("Proxy server address")).size(theme::FONT_SIZE),
+                text(tr("Proxy server address"))
+                    .size(theme::FONT_SIZE)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                 hinted(
                     text_input("", &s.proxy_host)
                         .on_input(|v| o(OptField::ProxyHost(v)))
@@ -770,7 +655,9 @@ fn proxy(app: &App) -> El<'_> {
             .spacing(4)
             .width(Length::Fill),
             column![
-                text(tr("Port")).size(theme::FONT_SIZE),
+                text(tr("Port"))
+                    .size(theme::FONT_SIZE)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                 text_input("", &s.proxy_port)
                     .on_input(|v| o(OptField::ProxyPort(v)))
                     .size(theme::FONT_SIZE)
@@ -779,7 +666,9 @@ fn proxy(app: &App) -> El<'_> {
             .spacing(4)
             .width(90.0),
             column![
-                text(tr("UserName")).size(theme::FONT_SIZE),
+                text(tr("UserName"))
+                    .size(theme::FONT_SIZE)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                 text_input("", &s.proxy_user)
                     .on_input(|v| o(OptField::ProxyUser(v)))
                     .size(theme::FONT_SIZE)
@@ -788,7 +677,9 @@ fn proxy(app: &App) -> El<'_> {
             .spacing(4)
             .width(140.0),
             column![
-                text(tr("Password")).size(theme::FONT_SIZE),
+                text(tr("Password"))
+                    .size(theme::FONT_SIZE)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                 text_input("", &s.proxy_pass)
                     .on_input(|v| o(OptField::ProxyPass(v)))
                     .secure(true)
@@ -804,12 +695,7 @@ fn proxy(app: &App) -> El<'_> {
         ))
         .size(theme::FONT_SIZE - 1.0)
         .color(theme::dim_text(&iced::Theme::Light)),
-        checkbox(s.ftp_pasv)
-            .label(tr("Use FTP in PASV mode"))
-            .on_toggle(|b| o(OptField::FtpPasv(b)))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check),
+        check(s.ftp_pasv, tr("Use FTP in PASV mode")).on_toggle(|b| o(OptField::FtpPasv(b))),
     ]
     .spacing(8)
     .into()
@@ -820,9 +706,9 @@ fn sites(app: &App) -> El<'_> {
     let mut list = column![].spacing(2);
     list = list.push(
         row![
-            container(text(tr("Site/path")).size(theme::FONT_SIZE)).width(Length::Fill),
-            container(text(tr("User")).size(theme::FONT_SIZE)).width(140.0),
-            container(text(tr("Password")).size(theme::FONT_SIZE)).width(120.0),
+            cell(tr("Site/path"), Length::Fill),
+            cell(tr("User"), LOGIN_USER_W),
+            cell(tr("Password"), LOGIN_PASS_W),
         ]
         .spacing(6),
     );
@@ -831,9 +717,9 @@ fn sites(app: &App) -> El<'_> {
         list = list.push(
             button(
                 row![
-                    container(text(l.site.clone()).size(theme::FONT_SIZE)).width(Length::Fill),
-                    container(text(l.user.clone()).size(theme::FONT_SIZE)).width(140.0),
-                    container(text("•••".to_string()).size(theme::FONT_SIZE)).width(120.0),
+                    cell(l.site.clone(), Length::Fill),
+                    cell(l.user.clone(), LOGIN_USER_W),
+                    cell("•••".to_string(), LOGIN_PASS_W),
                 ]
                 .spacing(6),
             )
@@ -845,7 +731,7 @@ fn sites(app: &App) -> El<'_> {
     }
     column![
         section(tr("User names and passwords for servers/sites")),
-        container(scrollable(list).height(220.0))
+        container(crate::ui::scroll(list).height(220.0))
             .padding(6)
             .width(Length::Fill)
             .style(theme::panel),
@@ -1113,12 +999,7 @@ fn extensions(app: &App) -> El<'_> {
         column![
             section(tr("Portable copy")),
             hinted(
-                checkbox(app.options.draft.portable_capture)
-                    .label(tr("Let this copy handle browser capture"))
-                    .on_toggle(|b| o(OptField::PortableCapture(b)))
-                    .size(15.0)
-                    .text_size(theme::FONT_SIZE)
-                    .style(theme::check),
+                check(app.options.draft.portable_capture, tr("Let this copy handle browser capture")).on_toggle(|b| o(OptField::PortableCapture(b))),
                 tr("Registers this copy's helper with your browsers so capture reaches this profile, and lets a browser start Hydra on it when nothing is running. Browser registration is per user, so this takes capture away from any ordinary Hydra install on this account."),
             ),
             text(format!("{} {}", tr("Profile:"), dir.display()))
@@ -1179,13 +1060,16 @@ fn extensions(app: &App) -> El<'_> {
     col.into()
 }
 
+/// The file column, header and rows off the same number.
+const SOUND_FILE_W: f32 = 230.0;
+
 fn sounds(app: &App) -> El<'_> {
     let s = &app.options.draft;
     let mut list = column![].spacing(4);
     list = list.push(
         row![
-            container(text(tr("Event")).size(theme::FONT_SIZE)).width(Length::Fill),
-            container(text(tr("Sound file")).size(theme::FONT_SIZE)).width(200.0),
+            cell(tr("Event"), Length::Fill),
+            cell(tr("Sound file"), SOUND_FILE_W),
         ]
         .spacing(6),
     );
@@ -1197,22 +1081,15 @@ fn sounds(app: &App) -> El<'_> {
         };
         list = list.push(
             row![
-                checkbox(snd.enabled)
-                    .label(tr(&snd.event))
+                check(snd.enabled, tr(&snd.event))
                     .on_toggle(move |b| o(OptField::Sound(i, b)))
-                    .size(15.0)
-                    .text_size(theme::FONT_SIZE)
-                    .style(theme::check)
                     .width(Length::Fill),
-                container(
-                    text(file_label)
-                        .size(theme::FONT_SIZE - 1.0)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                )
-                .width(230.0)
-                .clip(true),
-                dlg_btn(tr("Browse"), Some(o(OptField::SoundBrowse(i)))),
-                dlg_btn(tr("Play"), Some(o(OptField::SoundPlay(i)))),
+                cell(file_label, SOUND_FILE_W),
+                // Sized to their labels: every row carries the same two, so
+                // the grid still lines up, and the event column keeps the
+                // ~130px a uniform button would have taken from it.
+                dlg_btn_auto(tr("Browse"), Some(o(OptField::SoundBrowse(i)))),
+                dlg_btn_auto(tr("Play"), Some(o(OptField::SoundPlay(i)))),
             ]
             .spacing(6)
             .align_y(iced::Alignment::Center),

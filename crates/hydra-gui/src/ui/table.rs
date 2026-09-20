@@ -251,7 +251,15 @@ fn queue_glyph<'a>(app: &App, d: &DownloadItem) -> El<'a> {
 
 /// What one column shows for one download.
 fn cell_content<'a>(app: &App, d: &'a DownloadItem, col: Column) -> El<'a> {
-    let txt = |s: String| -> El<'a> { text(s).size(theme::FONT_SIZE).into() };
+    // One line, cut at the column edge by `cell`: a value that wrapped
+    // would put its tail on a second line the row is not tall enough to
+    // show.
+    let txt = |s: String| -> El<'a> {
+        text(s)
+            .size(theme::FONT_SIZE)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into()
+    };
     match col {
         Column::Name => row![
             svg(file_icon(app, d)).width(15.0).height(15.0),

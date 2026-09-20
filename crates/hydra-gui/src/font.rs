@@ -44,6 +44,50 @@ pub fn default_font(locale: Option<&str>) -> iced::Font {
     iced::Font::with_name(default_face(locale))
 }
 
+/// Adopt `locale`'s face for this session and hand it to the renderer.
+///
+/// Remembered so text can be measured with the face it will be drawn in:
+/// the renderer is built with this one font and keeps it until the next
+/// launch, whatever the language is switched to afterwards.
+pub fn adopt(locale: Option<&str>) -> iced::Font {
+    let face = default_font(locale);
+    let _ = SESSION_FACE.set(face);
+    face
+}
+
+/// The face this session draws with, or iced's own before `adopt` has run
+/// (tests, and the frames before the window system comes up).
+fn session_face() -> iced::Font {
+    SESSION_FACE.get().copied().unwrap_or_default()
+}
+
+static SESSION_FACE: std::sync::OnceLock<iced::Font> = std::sync::OnceLock::new();
+
+/// The width one line of `s` takes in the interface, in logical pixels.
+///
+/// Laid out by the same text system the renderer draws with, so a panel
+/// sized from this holds the label in any locale: a width guessed from a
+/// character count is out by a third between a Latin and a CJK translation,
+/// and iced paints a label that does not fit straight over its neighbour
+/// instead of clipping it.
+pub fn line_width(s: &str, size: f32) -> f32 {
+    use iced::advanced::text::Paragraph as _;
+
+    iced::advanced::graphics::text::Paragraph::with_text(iced::advanced::text::Text {
+        content: s,
+        bounds: iced::Size::INFINITE,
+        size: size.into(),
+        line_height: iced::advanced::text::LineHeight::default(),
+        font: session_face(),
+        align_x: iced::advanced::text::Alignment::Default,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: iced::advanced::text::Shaping::default(),
+        wrapping: iced::advanced::text::Wrapping::None,
+    })
+    .min_bounds()
+    .width
+}
+
 /// Whether moving from one locale to another lands the interface on a
 /// different face — the question View > Language asks, because the renderer
 /// was built with the face the session started on and cannot be given
@@ -126,6 +170,26 @@ mod tests {
         assert!(!changes_face(Some("fa"), Some("ar")));
         assert!(!changes_face(Some("en"), Some("de")));
         assert!(!changes_face(Some("zh"), None));
+    }
+
+    #[test]
+    fn a_line_is_measured_by_what_is_in_it() {
+        let size = 13.0;
+        assert_eq!(line_width("", size), 0.0);
+
+        // The property every measured layout rests on: more text, or the
+        // same text bigger, is more pixels.
+        let short = line_width("Add URL", size);
+        let long = line_width("Add batch download from text file", size);
+        assert!(short > 0.0, "a label measured as nothing: {short}");
+        assert!(long > short, "{long} is not wider than {short}");
+        assert!(line_width("Add URL", size * 2.0) > short);
+
+        // And the reason any of this exists: the translation of a label is
+        // not the width of the label.
+        let en = line_width("Add batch download from clipboard", size);
+        let de = line_width("Batch-Download aus der Zwischenablage hinzufügen", size);
+        assert!(de > en, "German {de} measured no wider than English {en}");
     }
 
     #[test]
