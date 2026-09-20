@@ -345,6 +345,15 @@ jobs:
           cp "target/hydra-${VERSION}-windows-${ARCH}-setup.exe" dist/
           ls -lh dist/
 
+      - name: Build portable bundle (Windows)
+        if: matrix.os == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/package-windows-portable.sh "${{ matrix.arch }}" --no-build
+          cp "target/dist/hydra-${VERSION}-windows-portable-${{ matrix.arch }}.zip" dist/
+          ls -lh dist/
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:

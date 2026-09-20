@@ -141,7 +141,7 @@ Debian 12, RHEL 9 and newer.
 
 A GUI install is a real desktop app, not a loose binary:
 
-- **Windows** — a start-menu shortcut (`-Desktop` adds a desktop one) and an **Apps & features** entry, so Hydra is listed and uninstallable from Settings like any other app.
+- **Windows** — a start-menu shortcut (`-Desktop` adds a desktop one) and an **Apps & features** entry, so Hydra is listed and uninstallable from Settings like any other app. A `hydra-<version>-windows-portable-<amd64|arm64>.zip` on the [releases page](https://github.com/ja7ad/hydra/releases) is the alternative for a machine you cannot install on: unpack it anywhere, run `HydraPortable.exe`, and the app keeps its configuration inside the bundle instead of `%APPDATA%\hydra`.
 - **macOS** — `Hydra Download Manager.app` is installed into `/Applications` (override with `--app-dir DIR`, e.g. `~/Applications`), with its icon and name in Launchpad, Spotlight, the Dock and the app switcher. `hydra`, `hya`, `hydra-gui` and `hydra-host` in `<prefix>/bin` are symlinks into the app, so the CLI stays on `PATH` and one update refreshes both.
 - **Linux** — the logo lands in the hicolor icon theme and a `hydra.desktop` entry in your applications directory (plus the prefix's, for a system-wide install), so the app shows up in the launcher, the dock and the switcher with its own icon.
 
@@ -326,6 +326,7 @@ Every installer also ships pre-built extension packages with the app in both pac
 | Install | Extensions directory |
 | --- | --- |
 | Windows (setup.exe) | `%LOCALAPPDATA%\Programs\Hydra\extensions` |
+| Windows (portable .zip) | `HydraPortable\App\Hydra\extensions` |
 | macOS (.app / DMG) | `Hydra Download Manager.app/Contents/Resources/extensions` |
 | macOS (.pkg) | `/Library/Application Support/Hydra/extensions` |
 | Linux (.deb / .rpm) | `/usr/share/hydra-download-manager/extensions` |

@@ -8,6 +8,8 @@
 #   make linux      both deb and rpm
 #   make appimage   portable, self-updating AppImage    -> target/dist/*.AppImage
 #   make flatpak    Flatpak package and metadata        -> target/dist/*.flatpak
+#   make windows    Windows NSIS installer              -> target/*-setup.exe
+#   make windows-portable   portable Windows bundle     -> target/dist/*-portable-*.zip
 #   make package    the right artifact(s) for the OS make runs on
 #
 #   make extensions  browser extensions: packed .xpi + .zip (+ .crx with a
@@ -33,7 +35,8 @@ VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 PROFILE ?= release
 CARGO   ?= cargo
 
-.PHONY: all build cli gui host app dmg deb rpm linux appimage flatpak windows package clean \
+.PHONY: all build cli gui host app dmg deb rpm linux appimage flatpak windows \
+        windows-portable package clean \
         extensions \
         require-macos require-linux ffi header header-check ffi-compat \
         ffi-test ffi-dist ffi-android ffi-apple
@@ -158,6 +161,11 @@ flatpak:
 
 windows:
 	scripts/build-windows-installer.sh x64
+
+#   make windows-portable ARGS=arm64          the aarch64 bundle
+#   make windows-portable ARGS=--no-build     pack binaries already built
+windows-portable:
+	scripts/package-windows-portable.sh $(ARGS)
 
 package:
 ifeq ($(UNAME),Darwin)
