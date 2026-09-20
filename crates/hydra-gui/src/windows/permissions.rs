@@ -10,7 +10,7 @@
 use crate::app::{App, El, Message, WinKind};
 use crate::windows::{dlg_btn, dlg_btn_auto, dlg_btn_primary};
 use crate::{i18n::tr, theme};
-use iced::widget::{column, container, row, scrollable, text};
+use iced::widget::{column, container, row, text};
 use iced::Length;
 
 /// Live probe results shown as status dots.
@@ -177,7 +177,7 @@ pub fn view(app: &App) -> El<'_> {
             text(tr("Green means Hydra verified the access just now; red means the OS is currently refusing it."))
                 .size(theme::FONT_SIZE - 1.0)
                 .color(theme::dim_text(&iced::Theme::Light)),
-            scrollable(items).height(Length::Fill),
+            crate::ui::scroll(items).height(Length::Fill),
             row![
                 iced::widget::space::horizontal(),
                 dlg_btn(tr("Refresh"), Some(Message::PermRefresh)),

@@ -13,7 +13,7 @@ use crate::app::{App, El, Message, WinKind, ZipPeek};
 use crate::windows::dlg_btn_primary;
 use crate::{fmt, i18n::tr, icons, model, theme};
 use hya_net::zipdir::{DosTime, Entry};
-use iced::widget::{column, container, row, scrollable, svg, text};
+use iced::widget::{column, container, row, svg, text};
 use iced::{Background, Length};
 
 const CELL_H: f32 = 22.0;
@@ -52,9 +52,13 @@ pub fn view(app: &App) -> El<'_> {
             for e in entries.iter().filter(|e| !e.is_dir()) {
                 rows = rows.push(row_el(app, e));
             }
-            column![header(), hairline(), scrollable(rows).height(Length::Fill)]
-                .spacing(0)
-                .into()
+            column![
+                header(),
+                hairline(),
+                crate::ui::scroll(rows).height(Length::Fill)
+            ]
+            .spacing(0)
+            .into()
         }
     };
 

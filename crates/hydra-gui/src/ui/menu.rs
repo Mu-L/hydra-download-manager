@@ -7,7 +7,7 @@
 use crate::app::{App, El, MenuAction, MenuBarKind, Message};
 use crate::model::{Column, DlState};
 use crate::{i18n::tr, theme};
-use iced::widget::{button, column, container, mouse_area, row, scrollable, space, text};
+use iced::widget::{button, column, container, mouse_area, row, space, text};
 use iced::Length;
 
 /// Flyouts longer than this many rows scroll instead of growing past the
@@ -18,9 +18,17 @@ const FLYOUT_MAX_ROWS: usize = 10;
 const ROW_H: f32 = theme::FONT_SIZE * 1.3 + 10.0;
 /// Height of a separator: the hairline plus `sep_row`'s vertical padding.
 const SEP_H: f32 = 1.0 + 6.0;
-/// The dropdown panel's fixed width and the padding around its rows.
+/// The narrowest a panel and a flyout are drawn, and the widest either may
+/// grow to before a label is left to the panel's own clip. Between the two
+/// the box is sized to what it holds; see `panel_width`.
 const PANEL_W: f32 = 260.0;
+const FLYOUT_W: f32 = 230.0;
+const MAX_PANEL_W: f32 = 560.0;
 const PANEL_PAD: f32 = 4.0;
+/// A row's horizontal button padding, and the room the submenu arrow needs
+/// beside the longest label.
+const ROW_PAD: f32 = 28.0;
+const SUB_ARROW_W: f32 = 20.0;
 
 pub struct Entry {
     pub action: Option<MenuAction>,
@@ -453,13 +461,44 @@ fn sep_row<'a>(visible: bool) -> El<'a> {
     container(line).width(Length::Fill).padding([3, 6]).into()
 }
 
+/// What a row draws: the tick column, then the label. The column is
+/// spaces rather than an offset so an unticked row lines up with a ticked
+/// one, and so one measurement covers both.
+fn row_label(e: &Entry) -> String {
+    let check = if e.checked { "✓  " } else { "    " };
+    format!("{check}{}", e.label)
+}
+
+/// The width a panel needs to hold `items`, never below `min`.
+///
+/// Measured rather than fixed: the same menu is 33 characters in English
+/// and 64 in Portuguese, and iced paints a label that does not fit over
+/// whatever sits beside it instead of clipping it. Rows stay one line tall
+/// at this width, which is what `panel_height` and the flyout's ghost
+/// alignment are built on.
+fn panel_width(items: &[Entry], min: f32) -> f32 {
+    items
+        .iter()
+        .map(|e| {
+            let arrow = if e.submenu.is_empty() {
+                0.0
+            } else {
+                SUB_ARROW_W
+            };
+            crate::font::line_width(&row_label(e), theme::FONT_SIZE) + arrow + ROW_PAD
+        })
+        .fold(min, f32::max)
+        .min(MAX_PANEL_W)
+}
+
 /// One dropdown entry row (label + optional check mark / submenu arrow).
 fn entry_row<'a>(e: &Entry, i: usize, open_submenu: Option<usize>) -> El<'a> {
-    let check = if e.checked { "✓  " } else { "    " };
     let has_sub = !e.submenu.is_empty();
     let is_open = has_sub && open_submenu == Some(i);
     let label_row = row![
-        text(format!("{check}{}", e.label)).size(theme::FONT_SIZE),
+        text(row_label(e))
+            .size(theme::FONT_SIZE)
+            .wrapping(text::Wrapping::None),
         space::horizontal(),
         text(if has_sub { "›" } else { "" }).size(theme::FONT_SIZE),
     ]
@@ -498,8 +537,9 @@ fn entry_row<'a>(e: &Entry, i: usize, open_submenu: Option<usize>) -> El<'a> {
 /// exact height of the real row, used to align the flyout with its parent.
 fn ghost_entry<'a>(e: &Entry) -> El<'a> {
     button(
-        text(format!("    {}", e.label))
+        text(row_label(e))
             .size(theme::FONT_SIZE)
+            .wrapping(text::Wrapping::None)
             .color(iced::Color::TRANSPARENT),
     )
     .padding([5, 14])
@@ -521,7 +561,8 @@ pub fn dropdown<'a>(items: &[Entry], open_submenu: Option<usize>) -> El<'a> {
     }
     let panel = container(col)
         .padding(PANEL_PAD)
-        .width(PANEL_W)
+        .width(panel_width(items, PANEL_W))
+        .clip(true)
         .style(theme::menu_panel);
 
     let open = open_submenu
@@ -547,18 +588,21 @@ pub fn dropdown<'a>(items: &[Entry], open_submenu: Option<usize>) -> El<'a> {
 
     let mut sub = column![].spacing(0).width(Length::Shrink);
     for c in &parent.submenu {
-        let check = if c.checked { "✓  " } else { "    " };
-        let mut cb = button(text(format!("{check}{}", c.label)).size(theme::FONT_SIZE))
-            .padding([5, 14])
-            .width(Length::Fill)
-            .style(theme::btn_menu);
+        let mut cb = button(
+            text(row_label(c))
+                .size(theme::FONT_SIZE)
+                .wrapping(text::Wrapping::None),
+        )
+        .padding([5, 14])
+        .width(Length::Fill)
+        .style(theme::btn_menu);
         if let Some(a) = c.action.clone().filter(|_| c.enabled) {
             cb = cb.on_press(Message::Menu(a));
         }
         sub = sub.push(cb);
     }
     let sub: El<'a> = if parent.submenu.len() > FLYOUT_MAX_ROWS {
-        scrollable(sub)
+        crate::ui::scroll(sub)
             .width(Length::Fill)
             .height(ROW_H * FLYOUT_MAX_ROWS as f32)
             .into()
@@ -567,7 +611,8 @@ pub fn dropdown<'a>(items: &[Entry], open_submenu: Option<usize>) -> El<'a> {
     };
     let flyout = container(sub)
         .padding(4)
-        .width(230.0)
+        .width(panel_width(&parent.submenu, FLYOUT_W))
+        .clip(true)
         .style(theme::menu_panel);
 
     row![panel, column![spacer, flyout]].into()
@@ -605,7 +650,7 @@ fn anchor(at: iced::Point, panel: iced::Size, view: iced::Size) -> iced::Point {
 
 /// Full-window overlay: click-away layer + positioned dropdown.
 pub fn overlay<'a>(app: &'a App, items: Vec<Entry>, at: iced::Point) -> El<'a> {
-    let size = iced::Size::new(PANEL_W, panel_height(&items));
+    let size = iced::Size::new(panel_width(&items, PANEL_W), panel_height(&items));
     let at = anchor(at, size, app.main_viewport());
     let panel = dropdown(&items, app.open_submenu);
     iced::widget::stack![
@@ -635,6 +680,61 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn a_short_menu_keeps_the_classic_panel_width() {
+        assert_eq!(panel_width(&entries(4, 0), PANEL_W), PANEL_W);
+    }
+
+    #[test]
+    fn a_panel_grows_to_hold_the_longest_label_it_has() {
+        // The label the German Tasks menu opens with, and the Portuguese
+        // one that is nearly twice the English string.
+        let long = [
+            "Batch-Download aus der Zwischenablage hinzufügen",
+            "Adicionar transferência em lote a partir de um ficheiro de texto",
+        ];
+        let mut items = entries(3, 0);
+        for (i, label) in long.iter().enumerate() {
+            items.push(Entry::plain((*label).into(), MenuAction::Options, true));
+            let w = panel_width(&items, PANEL_W);
+            assert!(w > PANEL_W, "{label} left the panel at {w}");
+            assert!(
+                w >= crate::font::line_width(&row_label(&items[3 + i]), theme::FONT_SIZE) + ROW_PAD,
+                "{label} does not fit the {w}px panel it produced"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_with_a_flyout_reserves_the_arrow_beside_its_label() {
+        let label = "Einstellungen zur Geschwindigkeitsbegrenzung";
+        let plain = vec![Entry::plain(label.into(), MenuAction::Options, true)];
+        let parent = vec![Entry::sub(label.into(), entries(2, 0))];
+        assert_eq!(
+            panel_width(&parent, PANEL_W) - panel_width(&plain, PANEL_W),
+            SUB_ARROW_W
+        );
+    }
+
+    #[test]
+    fn a_ticked_row_is_measured_with_its_tick_column() {
+        let item = Entry::plain("Unlimited".into(), MenuAction::Options, true);
+        let ticked = Entry::plain("Unlimited".into(), MenuAction::Options, true).check(true);
+        assert!(row_label(&ticked).starts_with('\u{2713}'));
+        // Both columns are four characters wide, so a tick never moves the
+        // label or the panel edge.
+        assert_eq!(
+            panel_width(&[item], PANEL_W),
+            panel_width(&[ticked], PANEL_W)
+        );
+    }
+
+    #[test]
+    fn a_label_past_all_reason_stops_at_the_panels_own_limit() {
+        let items = vec![Entry::plain("x".repeat(500), MenuAction::Options, true)];
+        assert_eq!(panel_width(&items, PANEL_W), MAX_PANEL_W);
     }
 
     #[test]

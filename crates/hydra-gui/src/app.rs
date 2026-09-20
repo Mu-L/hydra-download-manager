@@ -2488,7 +2488,7 @@ impl App {
             // a minimum straight to winit, so this one is in OS points and
             // does carry the scale.
             min_size: (kind == WinKind::Main)
-                .then(|| iced::Size::new(MAIN_MIN_W * scale, MAIN_MIN_H * scale)),
+                .then(|| iced::Size::new(main_min_w() * scale, MAIN_MIN_H * scale)),
             resizable,
             minimizable,
             position,
@@ -4073,7 +4073,7 @@ impl App {
                     // arrives in: below it the size is not one the user
                     // could have dragged to.
                     let resized = Some((self.main_size.width, self.main_size.height));
-                    if size.width >= MAIN_MIN_W
+                    if size.width >= main_min_w()
                         && size.height >= MAIN_MIN_H
                         && self.cfg.settings.window_size != resized
                     {
@@ -6963,7 +6963,7 @@ impl App {
                     let scale = self.ui_scale();
                     tasks.push(window::set_min_size(
                         id,
-                        Some(iced::Size::new(MAIN_MIN_W * scale, MAIN_MIN_H * scale)),
+                        Some(iced::Size::new(main_min_w() * scale, MAIN_MIN_H * scale)),
                     ));
                 }
                 Task::batch(tasks)
@@ -6986,11 +6986,26 @@ impl App {
                         self.cfg.queues.iter().map(|q| q.name.clone()).collect();
                     crate::tray::reinstall(&queues, self.cfg.settings.power_save);
                 }
+                // The new labels reach the toolbar on the next redraw, and
+                // the row is what the main window's floor is measured from:
+                // without this a window at the old floor cannot be widened
+                // to fit the tools the longer language needs.
+                let floor = self.main_id.map(|id| {
+                    let scale = self.ui_scale();
+                    window::set_min_size(
+                        id,
+                        Some(iced::Size::new(main_min_w() * scale, MAIN_MIN_H * scale)),
+                    )
+                });
                 if face_changes {
                     self.confirm = Some(ConfirmKind::FontNeedsRestart);
-                    return self.open_window(WinKind::Confirm);
+                    let confirm = self.open_window(WinKind::Confirm);
+                    return match floor {
+                        Some(floor) => Task::batch([floor, confirm]),
+                        None => confirm,
+                    };
                 }
-                Task::none()
+                floor.unwrap_or_else(Task::none)
             }
             MenuAction::HomePage => {
                 let _ = open::that_detached("https://hydra.javad.dev");
@@ -7431,7 +7446,7 @@ impl App {
 /// Default main-window size: scaled from the primary display's logical
 /// resolution at the reference ratio (1009x606 on a 1512x982 screen — i.e.
 /// two thirds of the width, ~62% of the height), clamped to the layout's
-/// [`MAIN_MIN_W`]x[`MAIN_MIN_H`] floor. Falls back to 1009x606 when the
+/// [`main_min_w`]x[`MAIN_MIN_H`] floor. Falls back to 1009x606 when the
 /// display cannot be queried.
 /// Stable sort on a precomputed key, applied in place.
 ///
@@ -7495,20 +7510,23 @@ fn display_normalized(w: f32, h: f32, scale: f32) -> iced::Size {
 /// whole toolbar row, which does not wrap — anything past the right edge is
 /// clipped, and a clipped tool is one the user cannot reach.
 ///
-/// Widened when the Speed Limit control joined the row, and sized for that
-/// tool's WIDEST label rather than its narrowest: a squeezed tool wraps its
-/// label onto a second line instead of clipping, which makes the whole
-/// toolbar taller — so a cap being switched on and off visibly moved the
-/// download list up and down.
-pub const MAIN_MIN_W: f32 = 1050.0;
+/// The floor is the row as this locale actually draws it. 1050 was measured
+/// against the English labels, and every language that writes "Delete
+/// Completed" as one long compound overran it — so the last tools were
+/// squeezed to nothing and their labels drawn over each other on a window
+/// nobody could narrow any further.
 pub const MAIN_MIN_H: f32 = 600.0;
+
+pub fn main_min_w() -> f32 {
+    crate::ui::toolbar::min_width().max(1050.0)
+}
 
 pub fn main_window_size() -> iced::Size {
     // Proportions of the 1512x982 desktop the layout was drawn on, so the
     // first run fills the same share of a bigger or smaller screen.
     let d = display_points().unwrap_or(iced::Size::new(1512.0, 982.0));
     iced::Size::new(
-        (d.width * (1009.0 / 1512.0)).max(MAIN_MIN_W),
+        (d.width * (1009.0 / 1512.0)).max(main_min_w()),
         (d.height * (606.0 / 982.0)).max(MAIN_MIN_H),
     )
 }
@@ -9038,7 +9056,7 @@ mod tests {
         // derives from the display instead, which is never this small.
         let (w, _) = main_open_size(Some((80.0, 40.0)), 1.0);
         assert!(
-            w >= super::MAIN_MIN_W,
+            w >= super::main_min_w(),
             "nonsense is replaced, not restored: {w}"
         );
     }

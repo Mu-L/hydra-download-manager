@@ -4,24 +4,36 @@
 //! "Enter new address to download" — Add URL dialog.
 
 use crate::app::{App, El, Message, WinKind};
-use crate::windows::{dlg_btn, dlg_btn_primary};
+use crate::windows::{check, dlg_btn, dlg_btn_primary};
 use crate::{i18n::tr, theme};
-use iced::widget::{checkbox, column, container, pick_list, row, text, text_input};
+use iced::widget::{column, container, pick_list, row, text, text_input};
 use iced::Length;
 
 /// Widget id of the Address box, so the dialog can open with the caret in
 /// it (`App::update`, `Message::WindowOpened`).
 pub const ADDRESS_ID: &str = "add-url-address";
 
-/// The label column, matching the Download File Info dialog's.
+/// The label column, matching the Download File Info dialog's. A floor:
+/// the column is drawn as wide as the widest label this locale produced,
+/// since a label that outgrows it would be painted over its field.
 const LABEL_W: f32 = 70.0;
 const GAP: f32 = 8.0;
+
+/// Every label in the column, so one width fits all of them and the rows
+/// stay aligned.
+const LABELS: [&str; 5] = ["Address", "Stream", "Quality", "Record", "Metalink"];
+
+fn label_w() -> f32 {
+    LABELS
+        .iter()
+        .fold(LABEL_W, |w, l| crate::windows::label_width(&tr(l), w))
+}
 
 fn label<'a>(s: String) -> El<'a> {
     text(s)
         .size(theme::FONT_SIZE)
         .wrapping(iced::widget::text::Wrapping::None)
-        .width(LABEL_W)
+        .width(label_w())
         .into()
 }
 
@@ -46,12 +58,7 @@ pub fn view(app: &App) -> El<'_> {
     .spacing(GAP)
     .align_y(iced::Alignment::Center);
 
-    let auth = checkbox(st.use_auth)
-        .label(tr("Use authorization"))
-        .on_toggle(Message::AddrAuthToggled)
-        .size(15.0)
-        .text_size(theme::FONT_SIZE)
-        .style(theme::check);
+    let auth = check(st.use_auth, tr("Use authorization")).on_toggle(Message::AddrAuthToggled);
 
     // Login and Password stay on screen and grey out until the box is
     // ticked, the way draws them: the dialog keeps one shape instead of
@@ -70,7 +77,7 @@ pub fn view(app: &App) -> El<'_> {
             })
     };
     let creds = row![
-        iced::widget::space::horizontal().width(LABEL_W),
+        iced::widget::space::horizontal().width(label_w()),
         cred_label(tr("Login")),
         text_input("", &st.login)
             .on_input_maybe(st.use_auth.then_some(Message::AddrLogin))

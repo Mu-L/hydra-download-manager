@@ -10,8 +10,52 @@ use crate::{i18n::tr, icons, theme};
 use iced::widget::{button, column, container, row, svg, text, tooltip};
 use iced::{Alignment, Length};
 
+/// Geometry of the row, shared by `view` and [`min_width`]: the icon
+/// square, the padding either side of it, the gap between tools, a split
+/// button's arrow, and the padding at each end of the row.
+const ICON_W: f32 = 34.0;
+const TOOL_PAD_X: f32 = 10.0;
+const GAP: f32 = 4.0;
+const ARROW_W: f32 = 14.0;
+const ROW_PAD_X: f32 = 8.0;
+/// The three split buttons: Start Queue, Stop Queue, Speed Limit.
+const ARROWS: usize = 3;
+
+/// Every label the row draws, widest form (a Speed Limiter with a cap set
+/// shows the cap, which is shorter than its name). `min_width` measures
+/// these and a test holds the list to what `view` actually draws.
+const TOOL_LABELS: [&str; 12] = [
+    "Add URL",
+    "Resume",
+    "Stop",
+    "Stop All",
+    "Delete",
+    "Delete Completed",
+    "Options",
+    "Extensions",
+    "Scheduler",
+    "Start Queue",
+    "Stop Queue",
+    "Speed Limit",
+];
+
+/// The width the toolbar needs in this locale, labels and all.
+///
+/// The row does not wrap or scroll: past the right edge iced squeezes the
+/// last tools to nothing and draws their labels over each other. The
+/// window's floor comes from here rather than from a number measured once
+/// against English, which every longer translation then overran.
+pub fn min_width() -> f32 {
+    let tools: f32 = TOOL_LABELS
+        .iter()
+        .map(|l| crate::font::line_width(&tr(l), theme::FONT_SIZE).max(ICON_W) + 2.0 * TOOL_PAD_X)
+        .sum();
+    let n = TOOL_LABELS.len() + ARROWS;
+    tools + ARROWS as f32 * ARROW_W + (n - 1) as f32 * GAP + 2.0 * ROW_PAD_X
+}
+
 fn tool<'a>(icon: svg::Handle, label: String, msg: Option<Message>, labels: bool) -> El<'a> {
-    let icon = svg(icon).width(34.0).height(34.0);
+    let icon = svg(icon).width(ICON_W).height(ICON_W);
     let content: El<'a> = if labels {
         column![icon, text(label.clone()).size(theme::FONT_SIZE)]
             .spacing(3)
@@ -20,7 +64,9 @@ fn tool<'a>(icon: svg::Handle, label: String, msg: Option<Message>, labels: bool
     } else {
         icon.into()
     };
-    let mut b = button(content).padding([6, 10]).style(theme::btn_toolbar);
+    let mut b = button(content)
+        .padding([6.0, TOOL_PAD_X])
+        .style(theme::btn_toolbar);
     if let Some(m) = msg {
         b = b.on_press(m);
     }
@@ -173,8 +219,8 @@ pub fn view(app: &App) -> El<'_> {
             .style(theme::btn_toolbar)
             .on_press(Message::SpeedMenuOpen),
     ]
-    .spacing(4)
-    .padding([4, 8])
+    .spacing(GAP)
+    .padding([4.0, ROW_PAD_X])
     .width(Length::Fill)
     .into()
 }
@@ -182,6 +228,41 @@ pub fn view(app: &App) -> El<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every label `view` draws, read off this file: a tool added without
+    /// its label in [`TOOL_LABELS`] would leave the window's floor too
+    /// narrow for the row, which is the bug this list exists to prevent.
+    fn labels_drawn() -> std::collections::BTreeSet<String> {
+        let src = include_str!("toolbar.rs");
+        let call = ["tr", "(", "\""].concat();
+        src.match_indices(&call)
+            .filter_map(|(i, _)| {
+                let rest = &src[i + call.len()..];
+                rest.find('"').map(|end| rest[..end].to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_window_floor_measures_every_label_the_row_draws() {
+        let measured: std::collections::BTreeSet<String> =
+            TOOL_LABELS.iter().map(|l| l.to_string()).collect();
+        assert_eq!(labels_drawn(), measured);
+    }
+
+    #[test]
+    fn the_row_asks_for_at_least_what_its_tools_take() {
+        // The floor has to cover the labels and the chrome around them, or
+        // the last tools are squeezed to nothing and drawn over each other.
+        let tools: f32 = TOOL_LABELS
+            .iter()
+            .map(|l| crate::font::line_width(&tr(l), theme::FONT_SIZE).max(ICON_W))
+            .sum();
+        assert!(min_width() > tools, "no room for the chrome around them");
+        // And the window keeps the floor it has always had, so a locale
+        // that never overran it sees no change.
+        assert!(crate::app::main_min_w() >= 1050.0);
+    }
 
     #[test]
     fn a_hidden_label_leaves_the_speed_cap_named_in_its_hover_hint() {

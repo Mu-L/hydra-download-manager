@@ -11,9 +11,9 @@
 
 use crate::app::{App, El, Message, WinKind};
 use crate::model::Column;
-use crate::windows::{dlg_btn_auto, dlg_btn_primary};
+use crate::windows::{check, dlg_btn_auto, dlg_btn_primary};
 use crate::{i18n::tr, theme};
-use iced::widget::{button, checkbox, column, container, row, scrollable, text};
+use iced::widget::{button, column, container, row, text};
 use iced::Length;
 
 /// One of the two move arrows. Disabled at the end it cannot move past.
@@ -34,11 +34,7 @@ pub fn view(app: &App) -> El<'_> {
         // File Name identifies the row, so it is the one column that cannot
         // be hidden; its checkbox is shown ticked and inert rather than
         // hidden, so the list still reads as the whole table.
-        let toggle = checkbox(pref.visible)
-            .label(tr(pref.id.label()))
-            .size(15.0)
-            .text_size(theme::FONT_SIZE)
-            .style(theme::check);
+        let toggle = check(pref.visible, tr(pref.id.label()));
         let toggle = if pref.id == Column::Name {
             toggle
         } else {
@@ -60,7 +56,7 @@ pub fn view(app: &App) -> El<'_> {
             text(tr("The first column is the leftmost one in the list."))
                 .size(theme::FONT_SIZE - 1.0)
                 .color(theme::dim_text(&iced::Theme::Light)),
-            scrollable(list).height(Length::Fill),
+            crate::ui::scroll(list).height(Length::Fill),
             row![
                 dlg_btn_auto(tr("Reset"), Some(Message::ColReset)),
                 iced::widget::space::horizontal(),

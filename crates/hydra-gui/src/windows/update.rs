@@ -8,7 +8,7 @@
 use crate::app::{App, El, Message, UpdatePhase};
 use crate::windows::{dlg_btn, dlg_btn_primary};
 use crate::{fmt, i18n::tr, theme};
-use iced::widget::{button, column, container, image, progress_bar, row, scrollable, text};
+use iced::widget::{button, column, container, image, progress_bar, row, text};
 use iced::Length;
 
 pub fn view(app: &App) -> El<'_> {
@@ -45,7 +45,7 @@ pub fn view(app: &App) -> El<'_> {
     .align_y(iced::Alignment::Center);
 
     // Release notes, rendered from the API's markdown.
-    let notes = container(scrollable(notes_body(&info.notes)).width(Length::Fill))
+    let notes = container(crate::ui::scroll(notes_body(&info.notes)).width(Length::Fill))
         .padding(12)
         .width(Length::Fill)
         .height(Length::Fill)
