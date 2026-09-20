@@ -299,6 +299,8 @@
   "Record": "Nagrywaj",
   "Recorded": "Nagrano",
   "Recording, segments:": "Nagrywanie, segmenty:",
+  "Redirect loop": "Pętla przekierowań",
+  "Redirect loop (the server expects a cookie)": "Pętla przekierowań (serwer oczekuje ciasteczka)",
   "Redownload": "Pobierz ponownie",
   "Refresh": "Odśwież",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Rejestruje Hydrę jako pozycję logowania, aby pobierania i kolejki kontynuowały działanie po ponownym uruchomieniu.",

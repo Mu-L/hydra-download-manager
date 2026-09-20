@@ -299,6 +299,8 @@
   "Record": "Записать",
   "Recorded": "Записано",
   "Recording, segments:": "Запись, сегменты:",
+  "Redirect loop": "Циклическое перенаправление",
+  "Redirect loop (the server expects a cookie)": "Циклическое перенаправление (сервер ожидает cookie)",
   "Redownload": "Скачать заново",
   "Refresh": "Обновить",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Регистрирует Hydra в автозагрузке, чтобы загрузки и очереди продолжали работу после перезагрузки.",

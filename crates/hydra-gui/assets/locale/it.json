@@ -299,6 +299,8 @@
   "Record": "Registra",
   "Recorded": "Registrato",
   "Recording, segments:": "Registrazione, segmenti:",
+  "Redirect loop": "Ciclo di reindirizzamento",
+  "Redirect loop (the server expects a cookie)": "Ciclo di reindirizzamento (il server si aspetta un cookie)",
   "Redownload": "Scarica di nuovo",
   "Refresh": "Aggiorna",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Registra Hydra come elemento di login in modo che download e code continuino dopo un riavvio.",

@@ -299,6 +299,8 @@
   "Record": "Aufnehmen",
   "Recorded": "Aufgenommen",
   "Recording, segments:": "Aufnahme, Segmente:",
+  "Redirect loop": "Weiterleitungsschleife",
+  "Redirect loop (the server expects a cookie)": "Weiterleitungsschleife (der Server erwartet ein Cookie)",
   "Redownload": "Erneut herunterladen",
   "Refresh": "Aktualisieren",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Hydra wird als Anmeldeelement registriert, damit Downloads und Warteschlangen nach einem Neustart fortgesetzt werden.",

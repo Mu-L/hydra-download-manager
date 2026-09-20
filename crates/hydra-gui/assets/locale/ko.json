@@ -299,6 +299,8 @@
   "Record": "녹화",
   "Recorded": "녹화됨",
   "Recording, segments:": "녹화, 세그먼트:",
+  "Redirect loop": "리디렉션 루프",
+  "Redirect loop (the server expects a cookie)": "리디렉션 루프(서버가 쿠키를 요구함)",
   "Redownload": "다시 다운로드",
   "Refresh": "새로 고침",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "재부팅 후에도 다운로드와 대기열이 이어지도록 Hydra를 로그인 항목으로 등록합니다.",

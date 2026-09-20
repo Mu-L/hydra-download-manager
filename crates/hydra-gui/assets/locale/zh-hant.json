@@ -299,6 +299,8 @@
   "Record": "錄製",
   "Recorded": "已錄製",
   "Recording, segments:": "錄製中，片段：",
+  "Redirect loop": "重定向迴圈",
+  "Redirect loop (the server expects a cookie)": "重定向迴圈（伺服器需要 Cookie）",
   "Redownload": "重新下載",
   "Refresh": "重新整理",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "將 Hydra 加入為登入項目，以便重新開機後繼續下載和佇列。",

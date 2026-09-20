@@ -299,6 +299,8 @@
   "Record": "रिकॉर्ड करें",
   "Recorded": "रिकॉर्ड किया गया",
   "Recording, segments:": "रिकॉर्डिंग, खंड:",
+  "Redirect loop": "रीडायरेक्ट लूप",
+  "Redirect loop (the server expects a cookie)": "रीडायरेक्ट लूप (सर्वर को कुकी चाहिए)",
   "Redownload": "फिर से डाउनलोड करें",
   "Refresh": "रीफ्रेश करें",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Hydra को लॉगिन आइटम के रूप में पंजीकृत करता है ताकि रीबूट के बाद डाउनलोड और कतारें जारी रहें।",

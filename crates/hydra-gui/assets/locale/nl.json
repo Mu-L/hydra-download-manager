@@ -299,6 +299,8 @@
   "Record": "Opnemen",
   "Recorded": "Opgenomen",
   "Recording, segments:": "Opnemen, segmenten:",
+  "Redirect loop": "Omleidingslus",
+  "Redirect loop (the server expects a cookie)": "Omleidingslus (de server verwacht een cookie)",
   "Redownload": "Opnieuw downloaden",
   "Refresh": "Vernieuwen",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Registreert Hydra als een inlogonderdeel zodat downloads en wachtrijen na een herstart doorgaan.",

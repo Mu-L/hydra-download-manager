@@ -299,6 +299,8 @@
   "Record": "Rekam",
   "Recorded": "Direkam",
   "Recording, segments:": "Merekam, segmen:",
+  "Redirect loop": "Perulangan pengalihan",
+  "Redirect loop (the server expects a cookie)": "Perulangan pengalihan (server mengharapkan cookie)",
   "Redownload": "Unduh ulang",
   "Refresh": "Segarkan",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Mendaftarkan Hydra sebagai item login sehingga unduhan dan antrean tetap berjalan setelah dimulai ulang.",

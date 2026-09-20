@@ -299,6 +299,8 @@
   "Record": "Nauhoita",
   "Recorded": "Nauhoitettu",
   "Recording, segments:": "Nauhoitetaan, segmenttejä:",
+  "Redirect loop": "Uudelleenohjaussilmukka",
+  "Redirect loop (the server expects a cookie)": "Uudelleenohjaussilmukka (palvelin odottaa evästettä)",
   "Redownload": "Lataa uudelleen",
   "Refresh": "Päivitä",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Rekisteröi Hydran kirjautumiskohteeksi, jotta lataukset ja jonot jatkuvat uudelleenkäynnistyksen jälkeen.",

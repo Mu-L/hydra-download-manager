@@ -299,6 +299,8 @@
   "Record": "Înregistrează",
   "Recorded": "Înregistrat",
   "Recording, segments:": "Se înregistrează, segmente:",
+  "Redirect loop": "Buclă de redirecționare",
+  "Redirect loop (the server expects a cookie)": "Buclă de redirecționare (serverul așteaptă un cookie)",
   "Redownload": "Redescarcă",
   "Refresh": "Reîmprospătează",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "Înregistrează Hydra ca element de conectare astfel încât descărcările și cozile continuă după o repornire.",

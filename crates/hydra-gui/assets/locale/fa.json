@@ -299,6 +299,8 @@
   "Record": "ضبط",
   "Recorded": "ضبط شد",
   "Recording, segments:": "در حال ضبط، بخش‌ها:",
+  "Redirect loop": "حلقهٔ تغییر مسیر",
+  "Redirect loop (the server expects a cookie)": "حلقهٔ تغییر مسیر (سرور انتظار کوکی دارد)",
   "Redownload": "دانلود مجدد",
   "Refresh": "تازه‌سازی",
   "Registers Hydra as a login item so downloads and queues continue after a reboot.": "هیدرا را در آغاز به کار سیستم ثبت می‌کند تا دانلودها و صف‌ها پس از راه‌اندازی مجدد ادامه یابند.",
