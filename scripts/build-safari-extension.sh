@@ -78,10 +78,15 @@ find "$PROJ_DIR" -name "Info.plist" -print0 | while IFS= read -r -d '' plist; do
   echo "local networking allowed: $plist"
 done
 
+# Safari WebExtensions require Safari 14+ (macOS 11.0 Big Sur or later).
+# Ensure deployment target in generated project is at least 11.0.
+find "$PROJ_DIR" -name "project.pbxproj" -exec sed -i '' -e 's/MACOSX_DEPLOYMENT_TARGET = 10\.[0-9]*/MACOSX_DEPLOYMENT_TARGET = 11.0/g' {} + 2>/dev/null || true
+
 echo "building..."
 xcodebuild -project "$PROJ_DIR/$APP_NAME.xcodeproj" \
   -scheme "$APP_NAME" \
   -configuration Release \
+  MACOSX_DEPLOYMENT_TARGET=11.0 \
   CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO \
   build
 
