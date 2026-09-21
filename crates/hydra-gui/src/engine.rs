@@ -233,6 +233,10 @@ pub enum Event {
         id: DlId,
         size: Option<u64>,
         ranges: bool,
+        /// What the object turned out to be called, or `None` when neither
+        /// the server nor the resolved URL says — never `file_name_from_url`'s
+        /// `index.html`, which the app would adopt over the name a capture or
+        /// the File Info dialog already carries.
         file_name: Option<String>,
     },
     Status {
@@ -573,7 +577,12 @@ pub struct LinkMeta {
     pub size: Option<u64>,
     /// The name the object should be saved under: `Content-Disposition` if the
     /// server named one, else the last path segment of the FINAL URL.
-    pub file_name: String,
+    ///
+    /// `None` when neither states one. Not the `index.html` placeholder:
+    /// a caller that already has a name — the browser's capture, the name
+    /// typed into File Info — must be able to tell "the object is called
+    /// this" from "nobody said", or the placeholder overwrites a real name.
+    pub file_name: Option<String>,
     /// The URL serves a Metalink DOCUMENT rather than the object.
     ///
     /// Read from `Content-Type` on the probe that had to happen anyway, which
@@ -620,9 +629,7 @@ pub async fn probe_link(
     }
     Some(LinkMeta {
         size: (p.size > 0).then_some(p.size),
-        file_name: p
-            .suggested_filename()
-            .unwrap_or_else(|| file_name_from_url(&url)),
+        file_name: p.suggested_filename().or_else(|| url_file_name(&url)),
         is_metalink: p.serves_metalink(),
     })
 }
@@ -2174,10 +2181,7 @@ async fn run_download(
         return;
     }
 
-    let file_name = p.suggested_filename().or_else(|| {
-        let n = file_name_from_url(&url);
-        (!n.is_empty()).then_some(n)
-    });
+    let file_name = p.suggested_filename().or_else(|| url_file_name(&url));
     let known_size = (p.status < 300 && p.size > 0).then_some(p.size);
     ev(Event::Probed {
         id,
@@ -2689,10 +2693,7 @@ async fn run_ftp_download(
         });
         return;
     }
-    let file_name = {
-        let n = file_name_from_url(&spec.url);
-        (!n.is_empty()).then_some(n)
-    };
+    let file_name = url_file_name(&spec.url);
     ev(Event::Probed {
         id,
         size: Some(probe.size),
@@ -7891,5 +7892,76 @@ x-amzn-waf-action: challenge\r\nConnection: close\r\n\r\n",
             format!("127.0.0.1:{origin_port}"),
             "the handshake must name the origin, not the proxy"
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_link_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    /// An origin that serves one object under a path naming no file, with no
+    /// `Content-Disposition` — the shape a player's stream URL has.
+    fn serve(content_type: &str, size: u64) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nAccept-Ranges: bytes\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n"
+        );
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let Ok(peek) = sock.try_clone() else { continue };
+                let mut r = BufReader::new(peek);
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    fn probe(port: u16, path: &str) -> LinkMeta {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(probe_link(
+                format!("http://127.0.0.1:{port}{path}"),
+                "hydra-test".into(),
+                vec![],
+                crate::model::ProxyChoice::Default,
+            ))
+            .expect("the origin answered")
+    }
+
+    /// A probe reports a name only when one exists.
+    ///
+    /// The object here is a video whose URL carries it in the query
+    /// (`/video/tos/?a=1`), served as `text/html` with no
+    /// `Content-Disposition` — what a player overlay hands over. Answering
+    /// with `file_name_from_url`'s `index.html` placeholder made the probe
+    /// look like it had resolved a name, and the caller — which already held
+    /// the name the browser extension captured — adopted it over the real
+    /// one and renamed the finished MP4 to `index.html`.
+    #[test]
+    fn a_link_whose_url_names_nothing_is_probed_without_a_name() {
+        let port = serve("text/html", 5_000_000);
+        let meta = probe(port, "/token/video/tos/?a=1&br=2");
+        assert_eq!(meta.file_name, None);
+        assert_eq!(meta.size, Some(5_000_000));
+
+        let named = probe(port, "/token/video/clip.mp4");
+        assert_eq!(named.file_name.as_deref(), Some("clip.mp4"));
     }
 }
