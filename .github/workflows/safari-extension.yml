@@ -1,12 +1,21 @@
-﻿# Validate Safari extension packaging in CI.
+﻿# Validate Safari extension packaging in CI, and build the wrapper app the
+# release ships.
 #
 # Full Xcode `safari-web-extension-converter` builds only run on macOS.
 # Linux/Windows contributors still get a resource-sync + manifest check via
 # the shared sync script (no Xcode required).
+#
+# .github/workflows/release.yml calls this workflow so the .app attached to a
+# tag is produced by the same steps every pull request already runs, rather
+# than by a second copy of them that nothing exercises until release day.
 
 name: Safari Extension
 
+permissions:
+  contents: read
+
 on:
+  workflow_call:
   push:
     branches: [main]
     paths:
@@ -107,12 +116,12 @@ jobs:
       - name: Build Safari extension wrapper app
         run: bash scripts/build-safari-extension.sh
 
-      - name: Locate built app
+      - name: Package the wrapper app
         run: |
           set -euo pipefail
           # build-safari-extension.sh runs xcodebuild without -derivedDataPath, so
           # the Release .app lands under ~/Library/Developer/Xcode/DerivedData.
-          APP=$(find "$HOME/Library/Developer/Xcode/DerivedData" -maxdepth 6 \
+          APP=$(find "$HOME/Library/Developer/Xcode/DerivedData" -maxdepth 6 -type d \
             -name "Hydra Safari Extension.app" -path "*Release*" 2>/dev/null | head -1 || true)
           if [ -z "${APP:-}" ]; then
             APP=$(find "$HOME/Library/Developer/Xcode/DerivedData" extensions/safari \
@@ -123,20 +132,27 @@ jobs:
             echo "::error::No .app bundle found after Safari extension build"
             exit 1
           fi
-          # Stage a stable path for the artifact upload step
-          mkdir -p artifacts/safari
-          cp -R "$APP" "artifacts/safari/"
           # Confirm the native handler was installed into the generated project
           if ! find extensions/safari/generated -name "SafariWebExtensionHandler.swift" 2>/dev/null | grep -q .; then
             echo "::warning::Could not re-find installed SafariWebExtensionHandler.swift under generated/"
           else
             echo "OK: SafariWebExtensionHandler.swift present in generated project"
           fi
+          # ditto, not `zip` and not upload-artifact's own packing: an .app is
+          # a tree of symlinks carrying a code signature, and anything that
+          # resolves those symlinks yields a bundle macOS refuses to open. One
+          # archive is also what a release asset has to be — the release job
+          # checksums every downloaded file, and a directory is not one.
+          VERSION=$(python3 -c "import json;print(json.load(open('extensions/safari/Resources/manifest.json'))['version'])")
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent "$APP" \
+            "dist/hydra-safari-extension-${VERSION}.zip"
+          ls -lh dist/
 
       - name: Upload Safari extension app artifact
         uses: actions/upload-artifact@v4
         with:
           name: hydra-safari-extension
-          path: artifacts/safari/
-          if-no-files-found: warn
+          path: dist/*.zip
+          if-no-files-found: error
           retention-days: 14

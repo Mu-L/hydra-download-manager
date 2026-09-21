@@ -639,6 +639,38 @@ jobs:
           [ -z "$MISSING" ] || { echo "hydra-gui misses: $MISSING" >&2; exit 1; }
           flatpak uninstall --user -y io.github.ja7ad.hydra
 
+  build-extensions:
+    name: Browser extensions (Chromium, Firefox)
+    needs: [verify-version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build the packed extensions
+        run: scripts/build-extensions.sh --out target/extensions --quiet
+
+      - name: Stage the packed builds
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/extensions/*.zip target/extensions/*.xpi dist/
+          ls -lh dist/
+
+      - name: Upload browser extension artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hydra-browser-extensions
+          path: dist/*
+          if-no-files-found: error
+
+  build-safari-extension:
+    name: Safari extension
+    needs: [verify-version]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/safari-extension.yml
+
   # ---------------------------------------------------------------- libhydra
   #
   # The embeddable C ABI is a SEPARATE deliverable from the CLI/GUI bundle, and
@@ -943,6 +975,8 @@ jobs:
         build-ffi,
         build-ffi-android,
         build-ffi-apple,
+        build-extensions,
+        build-safari-extension,
       ]
     # The packaging jobs above are skipped for a pre-release, and the default
     # "every need succeeded" rule would take this job down with them. Require
