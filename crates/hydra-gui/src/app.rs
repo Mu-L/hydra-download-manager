@@ -6099,7 +6099,7 @@ impl App {
             }
             Message::BatchLoaded(None) => Task::none(),
             Message::InfoProbed(id, meta) => match meta {
-                Some(meta) => self.adopt_probed(id, Some(meta.file_name), meta.size),
+                Some(meta) => self.adopt_probed(id, meta.file_name, meta.size),
                 None => Task::none(),
             },
             Message::BatchProbed(url, meta) => {
@@ -6117,8 +6117,8 @@ impl App {
                     if let Some(size) = meta.size {
                         self.batch.sizes.insert(url.clone(), size);
                     }
-                    if !meta.file_name.is_empty() {
-                        self.batch.names.insert(url, meta.file_name);
+                    if let Some(name) = meta.file_name {
+                        self.batch.names.insert(url, name);
                     }
                 }
                 Task::none()
@@ -9617,6 +9617,52 @@ mod tests {
         let mut unlocked = item(2, "/dl", "setup.exe", None, DlState::Receiving);
         unlocked.held = vec![(0, 4096)];
         assert!(!may_adopt_name(&unlocked));
+    }
+
+    /// A probe that resolved no name must not hand back the placeholder.
+    ///
+    /// The stream URLs a player overlay captures carry the object in the
+    /// query rather than the path (`.../video/tos/?a=1&br=2`) and are served
+    /// with no `Content-Disposition`. `file_name_from_url` invents
+    /// `index.html` for a path like that so the bytes have somewhere to go,
+    /// and the probe used to report the invention as the object's name: it
+    /// replaced the title the browser extension had captured and, through
+    /// `SetFinalPath`, renamed the finished MP4 to `index.html` at the move
+    /// out of the `.part`.
+    #[test]
+    fn a_probe_that_resolved_no_name_leaves_the_captured_one() {
+        let mut app = App::default();
+        let url = "https://v3-web.example.com/tok/video/tos/?a=1&br=2";
+        let id = app.add_item(url.into(), None, None);
+        app.item_mut(id).unwrap().file_name = "video.mp4".into();
+
+        let meta = |name: Option<&str>| engine::LinkMeta {
+            size: Some(9),
+            file_name: name.map(str::to_string),
+            is_metalink: false,
+        };
+        let _ = app.update(Message::InfoProbed(id, Some(meta(None))));
+        assert_eq!(app.item(id).unwrap().file_name, "video.mp4");
+        assert_eq!(app.item(id).unwrap().size, Some(9));
+
+        // A name the probe really did resolve still wins: the server named
+        // the object, and that beats a guess made from the page title.
+        let _ = app.update(Message::InfoProbed(id, Some(meta(Some("clip.mp4")))));
+        assert_eq!(app.item(id).unwrap().file_name, "clip.mp4");
+
+        // The batch dialog reads its File Name column from the same probe,
+        // and a row the probe could not name keeps the placeholder rather
+        // than recording the invention as the resolved name.
+        let _ = app.update(Message::BatchProbed(url.into(), Some(meta(None))));
+        assert!(!app.batch.names.contains_key(url));
+        let _ = app.update(Message::BatchProbed(
+            url.into(),
+            Some(meta(Some("clip.mp4"))),
+        ));
+        assert_eq!(
+            app.batch.names.get(url).map(String::as_str),
+            Some("clip.mp4")
+        );
     }
 
     #[test]
