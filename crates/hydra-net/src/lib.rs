@@ -90,6 +90,70 @@ pub struct Arrival {
     pub dt: f64,
 }
 
+/// Bytes a request-target may carry verbatim: the unreserved and reserved sets
+/// of RFC 3986, plus `%` so an already-encoded path survives unchanged.
+fn target_byte_is_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'/'
+                | b'?'
+                | b'#'
+                | b'['
+                | b']'
+                | b'%'
+        )
+}
+
+/// Percent-encode everything in `path` that a request-target cannot carry.
+///
+/// A URL is pasted as the user reads it — `/d/guest/あけあけ/packs/x.rar` — but a
+/// request-target is ASCII, so the raw UTF-8 goes on the wire as bytes an origin
+/// is entitled to reject: nginx-fronted hosts answer `400 Bad Request` for an
+/// address every browser fetches. A space, or any other excluded ASCII
+/// character, fails the same way.
+///
+/// Encoding here rather than in each URL parser is what gives the CLI, the GUI,
+/// the FFI and the stream front ends one rule, and it leaves the URL as typed
+/// wherever it is displayed, written to a resume sidecar, or compared across a
+/// redirect chain.
+///
+/// `%` passes through, so a path that already carries escapes is not encoded a
+/// second time — the same address in either spelling reaches the same object.
+fn encode_request_target(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.bytes().all(target_byte_is_safe) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(path.len() + 16);
+    for &b in path.as_bytes() {
+        if target_byte_is_safe(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xF) as usize] as char);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[derive(Clone, Debug)]
 pub struct Target {
     /// Host to CONNECT the socket to. For a direct fetch this is the origin; for
@@ -211,12 +275,13 @@ impl Target {
 
     /// The request-target for the start line, and the `Host` header value.
     fn request_target(&self) -> (String, std::borrow::Cow<'_, str>) {
+        let target = encode_request_target(&self.path);
         match &self.origin {
             Some(o) => (
-                format!("http://{}{}", o, self.path),
+                format!("http://{o}{target}"),
                 std::borrow::Cow::Borrowed(o.as_str()),
             ),
-            None => (self.path.clone(), self.authority()),
+            None => (target.into_owned(), self.authority()),
         }
     }
 
