@@ -3775,6 +3775,84 @@ mod host_header_tests {
         );
         assert!(head.contains("\r\nHost: s3q.ait.dtu.dk:9000\r\n"), "{head}");
     }
+
+    /// The reported defect: an alist share whose directory is written in kana.
+    /// The address is legal and every browser fetches it, but the raw UTF-8 is
+    /// not a request-target, and the origin answered `400 Bad Request`.
+    #[test]
+    fn a_non_ascii_path_is_encoded_into_the_request_line() {
+        let t = Target::direct_tls(
+            "alist-tousaka.imoutoheaven.org",
+            443,
+            "/d/guest/Public8/あけあけ/packs/2025-10d.part1.rar",
+        );
+        assert!(
+            build_request_head("GET", &t, None).starts_with(
+                "GET /d/guest/Public8/%E3%81%82%E3%81%91%E3%81%82%E3%81%91/packs/2025-10d.part1.rar HTTP/1.1\r\n"
+            ),
+            "{}",
+            build_request_head("GET", &t, None)
+        );
+    }
+
+    /// The same address in its encoded spelling must reach the same object:
+    /// encoding `%` again would turn `%E3` into `%25E3` and 404 every URL
+    /// copied out of a browser's address bar.
+    #[test]
+    fn an_already_encoded_path_is_left_alone() {
+        let path = "/d/guest/%E3%81%82%E3%81%91/packs/2025-10d.part1.rar";
+        let t = Target::direct_tls("alist-tousaka.imoutoheaven.org", 443, path);
+        assert!(
+            build_request_head("GET", &t, None).starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+            "{}",
+            build_request_head("GET", &t, None)
+        );
+    }
+
+    /// A space is excluded from a request-target for a sharper reason than the
+    /// kana: it ends the target, so the start line parses as a request for the
+    /// first word with a garbage version. The query's own delimiters have to
+    /// survive the encoding that fixes it.
+    #[test]
+    fn a_space_is_encoded_and_the_query_delimiters_are_not() {
+        let t = Target::direct("example.com", 80, "/my files/a b.zip?x=1&y=2 3");
+        assert!(
+            build_request_head("GET", &t, None)
+                .starts_with("GET /my%20files/a%20b.zip?x=1&y=2%203 HTTP/1.1\r\n"),
+            "{}",
+            build_request_head("GET", &t, None)
+        );
+    }
+
+    /// Anything already legal reaches the origin byte-identical. A presigned
+    /// URL's signature covers the query as the signer spelled it, so encoding
+    /// `[`, `+` or an existing escape on the way out turns a valid signature
+    /// into `SignatureDoesNotMatch` on every object store.
+    #[test]
+    fn an_already_legal_query_is_passed_through_unchanged() {
+        let path = "/o?X-Amz-Credential=AKIA%2F20260921%2Fus-east-1&filter[a]=b&s=x+y~z";
+        let t = Target::direct_tls("s3.example.com", 443, path);
+        assert!(
+            build_request_head("GET", &t, None).starts_with(&format!("GET {path} HTTP/1.1\r\n")),
+            "{}",
+            build_request_head("GET", &t, None)
+        );
+    }
+
+    /// Through a forward proxy the target is absolute, and the path inside it
+    /// is the same string — a proxy rejects an invalid target as readily as an
+    /// origin does.
+    #[test]
+    fn a_proxied_non_ascii_path_is_encoded_too() {
+        let mut t = Target::direct_tls("example.com", 443, "/あ.rar");
+        t.origin = Some("example.com".into());
+        assert!(
+            build_request_head("GET", &t, None)
+                .starts_with("GET http://example.com/%E3%81%82.rar HTTP/1.1\r\n"),
+            "{}",
+            build_request_head("GET", &t, None)
+        );
+    }
 }
 
 #[cfg(test)]
