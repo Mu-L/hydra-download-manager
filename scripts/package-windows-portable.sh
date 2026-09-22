@@ -24,7 +24,10 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 if [ "$NO_BUILD" = 0 ]; then
   echo "building hydra-gui + hydra-host + hydra (cli) for $TARGET..."
+  # cargo-xwin puts its sysroot -L in CFLAGS, which clang flags as unused when
+  # embed-resource runs it as the .rc preprocessor.
   PATH="/opt/homebrew/opt/llvm/bin:$PATH" \
+    TARGET_CFLAGS="-Wno-unused-command-line-argument" \
     cargo xwin build --release --target "$TARGET" --cross-compiler clang \
       -p hya-gui -p hya-host -p hya-cli
 fi

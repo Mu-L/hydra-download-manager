@@ -738,6 +738,7 @@ impl TempCopy {
         // Owner-only, set at creation: the copy holds every site's cookies
         // until it is read and scoped, and on Linux the temp root is shared
         // with every other user of the machine.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
