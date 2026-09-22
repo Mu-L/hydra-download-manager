@@ -59,7 +59,6 @@ cbc = { version = "0.2", features = ["block-padding"] }
 # constructions layered over them, taken from the same audited family rather
 # than hand-rolled — a HMAC or a GHASH that is subtly wrong fails by decrypting
 # to plausible garbage, which is the hardest kind of bug to notice.
-hmac = "0.13"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 # SIMD byte search with runtime dispatch (AVX2/SSE2 on x86-64, NEON on aarch64)

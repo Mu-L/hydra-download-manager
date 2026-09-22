@@ -25,7 +25,6 @@ blake3 = { workspace = true }
 reed-solomon-simd = { workspace = true }
 # Browser cookie import: undoing Chromium's at-rest encryption. See the
 # workspace manifest for why these are dependencies rather than code here.
-hmac = { workspace = true }
 pbkdf2 = { workspace = true }
 aes-gcm = { workspace = true }
 aes = { workspace = true }

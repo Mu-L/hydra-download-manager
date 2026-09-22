@@ -2188,7 +2188,6 @@ dependencies = [
  "blake3",
  "cbc",
  "criterion",
- "hmac",
  "hya-core",
  "memchr",
  "pbkdf2",

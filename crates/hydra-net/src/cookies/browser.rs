@@ -909,7 +909,7 @@ mod tests {
         let (jar, store, undecryptable) = read_profile(Browser::Firefox, &profile).unwrap();
         assert_eq!(jar.len(), 404);
         assert_eq!(undecryptable, 0);
-        assert!(store.ends_with("cookies.sqlite"), "{store:?}");
+        assert!(store.ends_with("cookies.sqlite"));
     }
 
     #[test]
@@ -919,7 +919,7 @@ mod tests {
         s.store("Default/Network/Cookies", "ch.sqlite");
         let (jar, store, _) = read_profile(Browser::Chrome, &profile).unwrap();
         assert_eq!(jar.len(), 3);
-        assert!(store.ends_with("Network/Cookies"), "{store:?}");
+        assert!(store.ends_with("Network/Cookies"));
     }
 
     /// Chromium moved the store under `Network/` in version 96 and kept reading
@@ -1183,7 +1183,7 @@ mod tests {
         let store = profile_dir_in(&src, &s.0.join("Firefox"))
             .and_then(|p| open_store(Browser::Firefox, &p).map(|(_, store, _)| store))
             .unwrap();
-        assert!(store.ends_with("cookies.sqlite"), "{store:?}");
+        assert!(store.ends_with("cookies.sqlite"));
     }
 
     /// A store that is present but holds another browser's schema is a real

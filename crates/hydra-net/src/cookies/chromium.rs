@@ -164,11 +164,7 @@ fn sha256(b: &[u8]) -> [u8; 32] {
 /// cannot vary it cannot show that the count is actually applied.
 #[cfg(not(target_os = "windows"))]
 fn derive(password: &[u8], rounds: u32) -> [u8; 16] {
-    let mut key = [0u8; 16];
-    // Infallible for a 16-byte output: the error case is an output longer than
-    // the PRF can produce, which is 2^32-1 blocks of 20 bytes.
-    let _ = pbkdf2::pbkdf2::<hmac::Hmac<sha1::Sha1>>(password, SALT, rounds, &mut key);
-    key
+    pbkdf2::pbkdf2_hmac_array::<sha1::Sha1, 16>(password, SALT, rounds)
 }
 
 // ---------------------------------------------------------------- unix
