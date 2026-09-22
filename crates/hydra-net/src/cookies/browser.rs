@@ -496,27 +496,46 @@ fn profile_dir_in(src: &Source, root: &Path) -> Result<PathBuf, Error> {
 /// `default`, then whichever profile's store was written most recently, which
 /// is the one the user is actually browsing in.
 fn firefox_profile(root: &Path, want: Option<&str>) -> Option<PathBuf> {
-    let dirs: Vec<PathBuf> = ["Profiles", "."]
+    let all: Vec<PathBuf> = ["Profiles", "."]
         .iter()
         .flat_map(|sub| std::fs::read_dir(root.join(sub)).into_iter().flatten())
         .flatten()
         .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    let with_store: Vec<PathBuf> = all
+        .iter()
         .filter(|p| p.join("cookies.sqlite").is_file())
+        .cloned()
         .collect();
     let named = |suffix: &str| {
-        dirs.iter()
+        with_store
+            .iter()
             .find(|p| file_name(p).ends_with(suffix))
             .cloned()
     };
     match want {
-        Some(w) => dirs
-            .iter()
-            .find(|p| file_name(p).contains(w))
-            .cloned()
-            .or_else(|| root.join(w).is_dir().then(|| root.join(w))),
+        // The label after the salt, exactly, before a substring anywhere:
+        // `default` is inside `default-release`, and a user who typed the first
+        // must not be handed the second. The exact match is taken with or
+        // without a store, so a named profile that has none is reported as
+        // such rather than quietly swapped for a sibling.
+        Some(w) => {
+            let label = |p: &Path| {
+                file_name(p)
+                    .split_once('.')
+                    .map(|(_, l)| l.to_string())
+                    .unwrap_or_default()
+            };
+            all.iter()
+                .find(|p| label(p) == w)
+                .or_else(|| with_store.iter().find(|p| file_name(p).contains(w)))
+                .cloned()
+                .or_else(|| root.join(w).is_dir().then(|| root.join(w)))
+        }
         None => named(".default-release")
             .or_else(|| named(".default"))
-            .or_else(|| newest_by(&dirs, "cookies.sqlite")),
+            .or_else(|| newest_by(&with_store, "cookies.sqlite")),
     }
 }
 
@@ -974,7 +993,42 @@ mod tests {
         assert_eq!(name(firefox_profile(&root, None)), "bbb.default-release");
         assert_eq!(name(firefox_profile(&root, Some("work"))), "ccc.work");
         assert_eq!(name(firefox_profile(&root, Some("aaa"))), "aaa.default");
+        assert_eq!(
+            name(firefox_profile(&root, Some("default"))),
+            "aaa.default",
+            "`default` is a label of its own, not a prefix of default-release"
+        );
         assert!(firefox_profile(&root, Some("nosuch")).is_none());
+    }
+
+    /// Found on a real machine: `firefox:default` read `default-release`,
+    /// because the profile actually called `default` had no store and the
+    /// substring match fell through to the one that did. The profile the user
+    /// named is the answer, and its missing store is the error.
+    #[test]
+    fn a_named_profile_without_a_store_is_reported_not_swapped() {
+        let s = Scratch::new("ffnamedbare");
+        let root = s.dir("Firefox");
+        s.dir("Firefox/Profiles/aaa.default");
+        s.store(
+            "Firefox/Profiles/bbb.default-release/cookies.sqlite",
+            "ff.sqlite",
+        );
+        let src = Source {
+            browser: Browser::Firefox,
+            profile: Some("default".into()),
+        };
+        let chosen = profile_dir_in(&src, &root).expect("the named profile");
+        assert_eq!(file_name(&chosen), "aaa.default");
+        let e = cookie_store(Browser::Firefox, &chosen)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("aaa.default"), "{e}");
+        assert_eq!(
+            file_name(&firefox_profile(&root, None).expect("a profile")),
+            "bbb.default-release",
+            "with no name, only a profile with a store is a candidate"
+        );
     }
 
     #[test]
