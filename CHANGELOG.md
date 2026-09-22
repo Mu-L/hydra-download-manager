@@ -5,6 +5,53 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [0.6.1] - 2026-09-22
+
+### Added
+
+- **Cookie Jar & Browser Cookie Import for Authenticated Downloads (`hydra-net`, `hydra-cli`, `hydra-gui`)**:
+  - Added `--cookie "session=abc; csrf=def"` (curl's spelling) and `--cookie-jar <FILE>`, a Netscape `cookies.txt` read before the first request and written back after it, alongside wget's one-direction `--load-cookies`, `--save-cookies` and `--keep-session-cookies`.
+  - Added `--cookies-from-browser <BROWSER[:PROFILE]>`, reading the browser's own store: Firefox, LibreWolf and Zen from `cookies.sqlite`; Chrome, Chromium, Edge, Brave, Vivaldi and Opera from their encrypted `Cookies` database, unlocked through the platform the way the browser does it (macOS Keychain, Windows DPAPI-wrapped `Local State` key, Linux libsecret with the documented `peanuts` fallback); Safari from `Cookies.binarycookies`. A running browser does not have to be closed — the store and its WAL are copied into an owner-only (`0700`) directory and read from the copy.
+  - Implemented the SQLite page/overflow reader, the Chromium AES-CBC/AES-GCM unwrapping, the Safari binary format and the Netscape `cookies.txt` parser inside `hydra-net::cookies`, with fixtures and a generator script (`scripts/make-cookie-fixtures.py`) rather than a browser-database dependency.
+  - Scoped narrowly and deliberately: only cookies for the host being downloaded from survive the import, `Domain=` may widen a cookie only to a domain the setting host is under and never to a public suffix, a redirect to another site carries that site's cookies and nothing else, values are never logged at any `-v` level, and a jar written to disk is `0600`.
+  - Every run names the exact store it read and the host it read it for; nothing is written to disk unless `--cookie-jar` or `--save-cookies` asked for it.
+  - A `Set-Cookie` issued on a redirect is now held for the rest of that chain with no flag at all, which is what a login-gated CDN expects. The jar dies with the chain unless a flag asked for it to be kept.
+  - In the desktop app: **Add URL** gained a Cookies field that imports the session for the address being typed, **Options → Connection → Cookies** picks the browser and profile used for downloads added by hand and reports live whether that store can be read, and **Properties** shows where a download's cookies came from. Captures from the Hydra browser extension already carry the page's own cookies and are unaffected.
+  - On macOS a browser profile lives behind the system privacy control, so the first attempt names the path it could not read and points at **Full Disk Access** in System Settings ▸ Privacy & Security instead of failing as a download error.
+- **Options Dialog Grouped Into Four Sections (`hydra-gui`)**:
+  - Replaced nine tabs over two rows with four — *Application*, *Files*, *Connection*, *Extensions* — each opening a row of sub-tabs, leaving room for pages to be added without a tenth top-level tab.
+  - Split the former Connection tab into *Connections*, *Cookies*, *Speed limiter*, *Download limits*, *Proxy / Socks* and *Sites Logins*, and gave ffmpeg its own *Media tools* page under Extensions.
+  - Translated the new tab, section and cookie strings across all 30 supported languages.
+- **Portable Windows Bundle in the Release (`scripts/package-windows-portable.sh`, CI)**:
+  - Added a PortableApps-format bundle (`HydraPortable.exe` launcher, `App/AppInfo` metadata and icons, a `DefaultData` profile) built for `amd64` and `arm64` and attached to the release, so Hydra can run from an external drive with its configuration, state and logs beside it.
+- **Browser Extensions as Release Assets (CI)**:
+  - Added a release job that packs the Chromium `.zip` and Firefox `.xpi` from source and uploads them with the rest of the assets, and wired the Safari wrapper build into the release workflow.
+- **Safari Extension Sync, Validation & macOS Build Workflow (CI)** — *contributed by [@VedantMadane](https://github.com/VedantMadane) ([#1](https://github.com/ja7ad/hydra/issues/1))*:
+  - Added `.github/workflows/safari-extension.yml`, which regenerates the Safari `Resources` from the Chrome sources and fails if the result is dirty, validates the MV3 manifest and required assets, builds the wrapper app with full Xcode on macOS, and uploads the `.app` as a CI artifact.
+
+### Fixed
+
+- **Self-Redirect Reported as a Spent Hop Budget (`hydra-net`, `hydra-cli`, `hydra-gui`)**:
+  - Fixed a `Location` pointing back at an address already requested being followed until the redirect budget ran out and then reported as "too many redirects", which sent the reader looking for a chain that was too long instead of one that never moved. `polite::RedirectChain` now detects the repeat on the hop that makes it and fails with `redirect loop: <url> was already requested`; the GUI names it *Redirect loop*, or *Redirect loop (the server expects a cookie)* when that is what the chain is asking for.
+  - Fixed `-H` headers and the user agent being dropped on any absolute `Location`, on the theory that an absolute hop is cross-origin. A mirror that answers with its own address in full form is still the origin that was asked, and dropping the headers there discarded the one thing the user had supplied to get in. The test is now scheme, host and port, judged on the origin endpoint rather than the socket peer, so credentials still stop at the origin that issued them while the agent and ordinary headers travel the whole chain.
+  - Fixed a proxied `https` chain losing its scheme at the first absolute hop and continuing in cleartext.
+- **Non-ASCII and Unescaped Paths Rejected as `400 Bad Request` (`hydra-net`)**:
+  - Fixed a URL pasted as the user reads it — `/d/guest/あけあけ/packs/x.rar`, or any address with a space — going onto the wire as raw UTF-8, which nginx-fronted origins are entitled to reject even though every browser fetches the same link. The request-target is now percent-encoded per RFC 3986 at the transport, one rule for the CLI, the GUI, the FFI and the stream front ends, while the URL stays as typed wherever it is displayed, written to a resume sidecar or compared across a redirect chain. `%` passes through, so an already-escaped path is not encoded twice.
+- **Probe Renaming a File It Could Not Name (`hydra-gui`)**:
+  - Fixed a link probe that learned nothing about the filename falling back to a `file_name_from_url` placeholder — typically `index.html` — and the app adopting it over the name a browser capture or the File Info dialog already carried. `LinkMeta::file_name` is now `Option<String>`, so "the object is called this" is distinguishable from "nobody said".
+- **Named Firefox Profile Swapped for a Sibling (`hydra-net`)**:
+  - Fixed `--cookies-from-browser firefox:default` reading `default-release` on a machine where the profile actually called `default` has no store, because the substring match fell through to the first profile that did. The label after the salt is now matched exactly before any substring, and a named profile without a store is reported as such instead of quietly replaced.
+- **Cookie Import Hardening (`hydra-net`, `hydra-cli`, `hydra-gui`)**:
+  - Fixed an imported session surviving a change of host in **Add URL**: typing an address on another host now clears what an earlier import attached before any re-import answers, so pressing OK in between cannot send the previous site's cookies, and an import that finishes after the address has moved is discarded and re-asked.
+  - Fixed the Options readability check answering out of order — every keystroke in the profile box starts another, and they finish in whatever order the disk allows — by tagging each check and letting only the newest report.
+  - Fixed two ways a corrupt or hostile store could be walked further than it should: an overflow page naming itself as its own continuation is now cut off by the same cycle guard as the b-tree walk, and a WAL is subject to the same size cap as the database it belongs to.
+  - Corrected the warning printed when both a cookie flag and `-H 'Cookie: ...'` are given: the jar replaces the header per host rather than winning outright.
+  - Dropped the unused `hmac` dependency and kept browser store paths out of test failure messages, closing a CodeQL clear-text-logging report.
+- **Open Folder Forcing Explorer (`hydra-gui`)**:
+  - Fixed *Open folder* always going through the platform's file manager with the file selected, which on Windows means Explorer even when a replacement is installed. Added *Select the downloaded file in the file manager* under Options; with it off the folder opens through whatever the system opens folders with, and the replacement gets the window.
+
+---
+
 ## [0.6.0] - 2026-09-19
 
 ### Added
