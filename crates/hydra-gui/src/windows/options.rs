@@ -477,7 +477,7 @@ fn cookie_status(st: &crate::app::OptionsState) -> crate::app::El<'_> {
     }
     match &st.cookie_check {
         Some(Ok(path)) => indented(
-            text(format!("{} {path}", tr("Will read")))
+            text(format!("{} {path}", tr("Will read:")))
                 .size(theme::FONT_SIZE - 1.0)
                 .color(theme::dim_text(&iced::Theme::Light)),
         ),
