@@ -339,6 +339,9 @@ pub struct AddUrlState {
     /// rather than carrying the previous site's session to a new host.
     pub cookies_of: String,
     pub cookies_importing: bool,
+    /// `capture.cookies` holds what an import produced, not what the user
+    /// typed, so an address on another host clears it rather than carrying it.
+    pub cookies_imported: bool,
     /// One line naming the store the cookies were read from, or why they
     /// could not be. Shown under the field, which is what makes the import
     /// something the user is told about rather than something that happens.
@@ -626,6 +629,10 @@ pub struct OptionsState {
     /// be reporting a configuration problem as a download problem.
     pub cookie_check: Option<Result<String, String>>,
     pub cookie_checking: bool,
+    /// Which check is the current one. Every keystroke in the profile box
+    /// starts another, and they finish in whatever order the disk allows; only
+    /// the newest is allowed to answer.
+    pub cookie_check_gen: u64,
     /// Text buffers for the Download-limit numbers. The draft holds `u64`,
     /// and binding an input straight to `n.to_string()` makes the field
     /// un-clearable: an empty string fails to parse, the commit is skipped
@@ -666,6 +673,7 @@ impl Default for OptionsState {
             conn_exc_n: String::new(),
             cookie_check: None,
             cookie_checking: false,
+            cookie_check_gen: 0,
             dl_limit_mb_txt: String::new(),
             dl_limit_hours_txt: String::new(),
             speed_limit_kb_txt: String::new(),
@@ -1274,8 +1282,9 @@ pub enum Message {
     /// already carries the session.
     AddrImportCookies,
     AddrCookiesImported(Box<Result<(String, String), String>>),
-    /// Whether Options' chosen browser can be read, answered off the executor.
-    OptCookieChecked(Box<Result<String, String>>),
+    /// Whether Options' chosen browser can be read, answered off the executor,
+    /// tagged with the generation that asked.
+    OptCookieChecked(u64, Box<Result<String, String>>),
     AddUrlOk,
     /// Requests arriving from the browser extension over the extbus socket.
     Ext(crate::extbus::ExtEvent),
@@ -4789,14 +4798,22 @@ impl App {
                     self.add_url.metalink_error = None;
                 }
                 let mut tasks = vec![self.resize_open(WinKind::AddUrl)];
-                // A new address is a new host, and a session belongs to the
-                // host that issued it: re-import rather than carry the
-                // previous site's cookies across.
-                if !self.cfg.settings.cookies_from_browser.trim().is_empty()
-                    && self.add_url.cookies_of != addr
-                    && !addr.is_empty()
-                {
-                    tasks.push(self.update(Message::AddrImportCookies));
+                // A new host is a new session. Whatever an earlier import
+                // attached belonged to the previous one and goes NOW, before
+                // any re-import answers: pressing OK in between must not send
+                // it. Then re-import, if a browser is named. Typing out the
+                // path of the same host is not a new host and reads nothing.
+                if !same_host(&self.add_url.cookies_of, &addr) {
+                    if self.add_url.cookies_imported {
+                        self.add_url.capture.cookies = None;
+                        self.add_url.capture.cookie_source = None;
+                        self.add_url.cookie_note = None;
+                        self.add_url.cookies_imported = false;
+                    }
+                    if !self.cfg.settings.cookies_from_browser.trim().is_empty() && !addr.is_empty()
+                    {
+                        tasks.push(self.update(Message::AddrImportCookies));
+                    }
                 }
                 // A mirror list reads itself for the same reason a manifest
                 // does: it decides how many files are about to be added and
@@ -4827,6 +4844,7 @@ impl App {
                 self.add_url.capture.cookie_source =
                     (!v.is_empty()).then(|| crate::i18n::tr("typed in the Add URL dialog"));
                 self.add_url.cookie_note = None;
+                self.add_url.cookies_imported = false;
                 Task::none()
             }
             Message::AddrImportCookies => {
@@ -4844,6 +4862,14 @@ impl App {
             }
             Message::AddrCookiesImported(result) => {
                 self.add_url.cookies_importing = false;
+                // The address moved to another host while this was running:
+                // the answer is for a host no longer in the box, and applying
+                // it would attach that host's session to this one. Ask again
+                // for the address that is there now.
+                if !same_host(&self.add_url.cookies_of, self.add_url.address.trim()) {
+                    self.add_url.cookies_of.clear();
+                    return self.update(Message::AddrImportCookies);
+                }
                 match *result {
                     // An empty header means the browser simply holds nothing
                     // for this host. That is an answer, not a failure, and
@@ -4852,13 +4878,17 @@ impl App {
                         self.add_url.capture.cookies = Some(header);
                         self.add_url.capture.cookie_source = Some(why.clone());
                         self.add_url.cookie_note = Some(why);
+                        self.add_url.cookies_imported = true;
                     }
                     Ok((_, why)) => self.add_url.cookie_note = Some(why),
                     Err(e) => self.add_url.cookie_note = Some(e),
                 }
                 self.resize_open(WinKind::AddUrl)
             }
-            Message::OptCookieChecked(result) => {
+            Message::OptCookieChecked(generation, result) => {
+                if generation != self.options.cookie_check_gen {
+                    return Task::none();
+                }
                 self.options.cookie_checking = false;
                 self.options.cookie_check = Some(*result);
                 self.resize_open(WinKind::Options)
@@ -7280,13 +7310,15 @@ impl App {
     fn check_cookie_source(&mut self) -> Task<Message> {
         let spec = self.options.draft.cookies_from_browser.trim().to_string();
         self.options.cookie_check = None;
+        self.options.cookie_check_gen += 1;
         if spec.is_empty() {
             self.options.cookie_checking = false;
             return Task::none();
         }
         self.options.cookie_checking = true;
-        Task::perform(crate::engine::check_cookie_source(spec), |r| {
-            Message::OptCookieChecked(Box::new(r))
+        let generation = self.options.cookie_check_gen;
+        Task::perform(crate::engine::check_cookie_source(spec), move |r| {
+            Message::OptCookieChecked(generation, Box::new(r))
         })
     }
 
@@ -7849,6 +7881,16 @@ pub(crate) fn expiring_soon(url: &str) -> bool {
 /// matches and that category's folder — because only a rename may move the
 /// download, and resolving it is the half that needs the app's category
 /// table.
+/// Two addresses name the same origin — or are the same text, when either is
+/// not yet an address. A browser session belongs to a host and a scheme, so
+/// that is what decides whether a store is read again or an import kept.
+fn same_host(a: &str, b: &str) -> bool {
+    match (crate::engine::parse_url(a), crate::engine::parse_url(b)) {
+        (Ok(x), Ok(y)) => x.tls == y.tls && x.host.eq_ignore_ascii_case(&y.host),
+        _ => a == b,
+    }
+}
+
 fn write_capture_extras(
     d: &mut DownloadItem,
     extras: CaptureExtras,
@@ -9432,6 +9474,82 @@ mod tests {
     /// The extension fills in what it knows and says nothing about the rest;
     /// "nothing" arrives as both `None` and `""`, and neither may reach the
     /// item — a blank name would replace the one derived from the URL.
+    /// The leak the import must not have: paste address A, paste address B
+    /// over it while A's import is still running, press OK. A's session was
+    /// attached to B's download.
+    #[test]
+    fn an_import_that_lands_after_the_host_changed_is_asked_again_not_applied() {
+        let mut app = App::default();
+        app.cfg.settings.cookies_from_browser = "firefox".into();
+        app.add_url.address = "https://b.test/x".into();
+        app.add_url.cookies_of = "https://a.test/x".into();
+        app.add_url.cookies_importing = true;
+        let _ = app.update(Message::AddrCookiesImported(Box::new(Ok((
+            "sid=for-a".into(),
+            "firefox — 1 cookie(s) for a.test".into(),
+        )))));
+        assert_eq!(
+            app.add_url.capture.cookies, None,
+            "a.test's session on b.test"
+        );
+        assert!(!app.add_url.cookies_imported);
+        assert_eq!(
+            app.add_url.cookies_of, "https://b.test/x",
+            "the address in the box is the one asked about"
+        );
+        assert!(app.add_url.cookies_importing);
+    }
+
+    /// An earlier import's cookies go the moment the host changes — before
+    /// any re-import answers — and a typed value, which is the user's, stays.
+    /// Typing further into the SAME host's path is not a change of host.
+    #[test]
+    fn moving_to_another_host_drops_what_an_import_attached_but_not_what_was_typed() {
+        let mut app = App::default();
+        app.add_url.address = "https://a.test/x".into();
+        app.add_url.cookies_of = "https://a.test/x".into();
+        app.add_url.capture.cookies = Some("sid=for-a".into());
+        app.add_url.capture.cookie_source = Some("firefox".into());
+        app.add_url.cookies_imported = true;
+
+        let _ = app.update(Message::AddrChanged("https://a.test/x/deeper".into()));
+        assert_eq!(app.add_url.capture.cookies.as_deref(), Some("sid=for-a"));
+
+        let _ = app.update(Message::AddrChanged("https://b.test/x".into()));
+        assert_eq!(app.add_url.capture.cookies, None);
+        assert_eq!(app.add_url.capture.cookie_source, None);
+        assert!(!app.add_url.cookies_imported);
+
+        let _ = app.update(Message::AddrCookies("typed=1".into()));
+        let _ = app.update(Message::AddrChanged("https://c.test/x".into()));
+        assert_eq!(app.add_url.capture.cookies.as_deref(), Some("typed=1"));
+    }
+
+    /// Checks finish in disk order, not in typing order; only the newest may
+    /// say what the box will read.
+    #[test]
+    fn a_stale_cookie_check_does_not_answer_for_a_newer_one() {
+        let mut app = App::default();
+        app.options.draft.cookies_from_browser = "firefox".into();
+        let _ = app.check_cookie_source();
+        let old = app.options.cookie_check_gen;
+        app.options.draft.cookies_from_browser = "chrome".into();
+        let _ = app.check_cookie_source();
+        assert_ne!(old, app.options.cookie_check_gen);
+
+        let _ = app.update(Message::OptCookieChecked(old, Box::new(Ok("/old".into()))));
+        assert!(
+            app.options.cookie_checking,
+            "the newer check is still running"
+        );
+        assert_eq!(app.options.cookie_check, None);
+
+        let now = app.options.cookie_check_gen;
+        let _ = app.update(Message::OptCookieChecked(now, Box::new(Ok("/new".into()))));
+        assert!(!app.options.cookie_checking);
+        assert_eq!(app.options.cookie_check, Some(Ok("/new".into())));
+    }
+
     #[test]
     fn a_capture_says_nothing_rather_than_saying_nothing_twice() {
         let mut extras = CaptureExtras {

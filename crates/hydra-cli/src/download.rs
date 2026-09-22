@@ -275,8 +275,6 @@ fn targets_for(
     agent: &str,
     proxy: Option<&str>,
     no_proxy: bool,
-    jar: &CookieJar,
-    now: u64,
 ) -> Result<Vec<(Url, Target)>, String> {
     // Precedence: --no-proxy beats --proxy beats the environment. A user who
     // passes --no-proxy and still egresses through one would be misled about
@@ -328,8 +326,7 @@ fn targets_for(
             }
             let t = parsed
                 .to_target(pxr)?
-                .with_headers(headers.to_vec(), Some(agent.to_string()))
-                .with_jar(jar, now);
+                .with_headers(headers.to_vec(), Some(agent.to_string()));
             Ok((parsed, t))
         })
         .collect()
@@ -1073,20 +1070,24 @@ pub async fn probe_public<C: hya_net::Connector>(
 
 /// The jar a reporting command starts with.
 ///
-/// Notices are dropped rather than printed: these commands write ONE answer to
-/// stdout — a digest, a header value, a JSON document — and a consent line on
-/// stdout would end up inside it. The browser import path still asks the
-/// platform for consent in its own right, and the download path, which has a
-/// `Progress` to log through, prints the line.
+/// Notices go to stderr: these commands write ONE answer to stdout — a digest,
+/// a header value, a JSON document — and the consent line must not end up
+/// inside it, but a browser store read without a word is exactly what the line
+/// exists to prevent.
 async fn open_jar_for(args: &crate::cli::Cli, host: &str, now: u64) -> Result<CookieJar, String> {
     let Some(spec) = crate::cookies::CookieSpec::from_cli(args)? else {
         return Ok(CookieJar::new());
     };
     let host = host.to_string();
-    tokio::task::spawn_blocking(move || spec.open(&host, now))
+    let (jar, notes) = tokio::task::spawn_blocking(move || spec.open(&host, now))
         .await
-        .map_err(|e| format!("cookie import did not finish: {e}"))?
-        .map(|(jar, _notes)| jar)
+        .map_err(|e| format!("cookie import did not finish: {e}"))??;
+    if !args.quiet {
+        for n in notes {
+            eprintln!("hydra: {n}");
+        }
+    }
+    Ok(jar)
 }
 
 /// The jar this job starts with, and what the user should be told about it.
@@ -1158,7 +1159,11 @@ where
     // happens — that is how a redirect is discovered at all — but the hop is not
     // taken.
     let max_hops = max_redirs as usize;
-    let mut target = t.clone();
+    // `t` carries the USER's headers and nothing the jar produced: the jar's
+    // `Cookie:` is derived here, per hop, so a cookie the chain expires with
+    // `Max-Age=0` is gone from the next request rather than restored from a
+    // copy taken before it was.
+    let mut target = t.clone().with_jar(jar, now);
     let mut current = u.clone();
     let mut chain = hya_net::polite::RedirectChain::new(&current.to_string());
     let mut via_html = false;
@@ -2008,8 +2013,6 @@ pub async fn run(job: Job) -> Outcome {
         &job.user_agent,
         job.proxy.as_deref(),
         job.no_proxy,
-        &jar,
-        now,
     ) {
         Ok(v) => v,
         Err(e) => return failed(&job, 0, e),
@@ -4165,6 +4168,52 @@ mod tests {
             }
         });
         port
+    }
+
+    /// `hydra checksum` and `--server-response` describe an object a login
+    /// gate may hide, so they read the same jar a download would — and say so
+    /// on stderr, where the consent line cannot land inside the one answer
+    /// they write to stdout.
+    #[tokio::test]
+    async fn a_reporting_command_reads_the_jar_it_was_given() {
+        let dir = std::env::temp_dir().join(format!("hydra_cookie_{}", scratch_name()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar_path = dir.join("jar.txt");
+        std::fs::write(&jar_path, "127.0.0.1\tFALSE\t/\tFALSE\t0\tsid\tabc\n").unwrap();
+
+        let argv = [
+            "hydra",
+            "--load-cookies",
+            jar_path.to_str().unwrap(),
+            "http://127.0.0.1/x",
+        ];
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(argv);
+        let jar = open_jar_for(&args, "127.0.0.1", 0).await.unwrap();
+        assert_eq!(
+            jar.header_value("127.0.0.1", "/x", false, 0).as_deref(),
+            Some("sid=abc")
+        );
+
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(["hydra", "http://127.0.0.1/x"]);
+        assert!(
+            open_jar_for(&args, "127.0.0.1", 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no flag, no jar"
+        );
+
+        let absent = dir.join("absent.txt");
+        let argv = [
+            "hydra",
+            "--load-cookies",
+            absent.to_str().unwrap(),
+            "http://127.0.0.1/x",
+        ];
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(argv);
+        let e = open_jar_for(&args, "127.0.0.1", 0).await.unwrap_err();
+        assert!(e.contains("absent.txt"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The headline behaviour: a redirect that SETS a session must be able to

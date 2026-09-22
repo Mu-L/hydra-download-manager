@@ -141,14 +141,15 @@ fn from_chromium_time(micros: i64) -> Option<u64> {
 /// browser version this code cannot see.
 fn decrypt(key: &Key, blob: &[u8], host: &str) -> Option<String> {
     let plain = decrypt_raw(key, blob)?;
-    if let Ok(s) = std::str::from_utf8(&plain) {
-        return Some(s.to_string());
+    // The binding is tested BEFORE the plain reading: a hash that happens to
+    // be valid UTF-8 would otherwise be returned as the first 32 bytes of the
+    // value, and the order costs one comparison.
+    if let Some((bound, rest)) = plain.split_at_checked(32) {
+        if bound == sha256(host.as_bytes()) {
+            return std::str::from_utf8(rest).ok().map(str::to_string);
+        }
     }
-    let (bound, rest) = plain.split_at_checked(32)?;
-    if bound == sha256(host.as_bytes()) {
-        return std::str::from_utf8(rest).ok().map(str::to_string);
-    }
-    None
+    std::str::from_utf8(&plain).ok().map(str::to_string)
 }
 
 fn sha256(b: &[u8]) -> [u8; 32] {

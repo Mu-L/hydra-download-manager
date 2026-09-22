@@ -819,15 +819,15 @@ async fn async_main() -> std::process::ExitCode {
         }
     };
     if cookie_spec.is_some()
-        && args
-            .headers
-            .iter()
-            .any(|h| h.len() > 7 && h[..7].eq_ignore_ascii_case("cookie:"))
+        && args.headers.iter().any(|h| {
+            h.get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("cookie:"))
+        })
         && !args.quiet
     {
         eprintln!(
-            "hydra: both a cookie flag and -H 'Cookie: ...' were given; the jar wins, \
-             because a jar and a fixed header are two answers to the same question"
+            "hydra: both a cookie flag and -H 'Cookie: ...' were given; wherever the \
+             jar has a cookie for the host, it replaces the header"
         );
     }
 

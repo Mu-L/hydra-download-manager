@@ -186,12 +186,8 @@ impl CookieSpec {
         let Some(path) = &self.save else {
             return Ok(None);
         };
-        let body = netscape::render(jar, self.keep_session, now);
+        let (body, n) = netscape::render(jar, self.keep_session, now);
         write_private(path, &body).map_err(|e| format!("{}: {e}", path.display()))?;
-        let n = body
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.is_empty())
-            .count();
         Ok(Some(format!("wrote {n} cookies to {}", path.display())))
     }
 }

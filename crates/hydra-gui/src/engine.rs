@@ -1237,14 +1237,18 @@ pub async fn check_cookie_source(spec: String) -> Result<String, String> {
 /// the update loop would freeze the window behind it.
 pub async fn import_cookies(spec: String, url: String) -> Result<(String, String), String> {
     let source: hya_net::cookies::browser::Source = spec.parse().map_err(|e| format!("{e}"))?;
-    let host = crate::engine::parse_url(&url)?.host;
+    let u = crate::engine::parse_url(&url)?;
     tokio::task::spawn_blocking(move || {
         let now = hya_net::cookies::now_secs();
+        let host = u.host;
         let import =
             hya_net::cookies::browser::load(&source, &host, now).map_err(|e| e.to_string())?;
+        // Selected for the address as typed: a `Secure` cookie stays out of a
+        // plaintext download, and a cookie scoped below `/` is found when the
+        // path is under it.
         let header = import
             .jar
-            .header_value(&host, "/", true, now)
+            .header_value(&host, &u.path, u.tls, now)
             .unwrap_or_default();
         let mut why = format!(
             "{} — {} cookie(s) for {host} from {}",
@@ -1289,13 +1293,28 @@ pub fn request_headers(
     headers
 }
 
-fn target_for(u: &ParsedUrl, spec: &StartSpec, route: &Route) -> Target {
+/// `first` is the address the user named, as [`named_target`] builds it. A
+/// hop or a mirror on another origin is not entitled to the login and cookies
+/// that were typed for that one, and every target a transfer sends is built
+/// here, so no path can keep the credentials that another drops.
+fn target_for(u: &ParsedUrl, spec: &StartSpec, route: &Route, first: &Target) -> Target {
     let headers = request_headers(
         spec.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
         spec.cookies.as_deref(),
         spec.referer.as_deref(),
     );
-    target_via(route.http(), u, headers, &spec.user_agent)
+    target_via(route.http(), u, Vec::new(), &spec.user_agent).with_headers_from(
+        first,
+        headers,
+        Some(spec.user_agent.clone()),
+    )
+}
+
+/// The address the user named, bare, for [`target_for`] to measure hops
+/// against.
+fn named_target(spec: &StartSpec, route: &Route) -> Result<Target, String> {
+    let u = parse_url(&spec.url)?;
+    Ok(target_via(route.http(), &u, Vec::new(), &spec.user_agent))
 }
 
 /// Probe the mirror list and decide who fetches, who waits, and with how many
@@ -1322,6 +1341,7 @@ fn target_for(u: &ParsedUrl, spec: &StartSpec, route: &Route) -> Target {
 #[allow(clippy::too_many_arguments)]
 async fn plan_sources(
     spec: &StartSpec,
+    first: &Target,
     primary_url: &ParsedUrl,
     primary_target: &Target,
     primary_probe: &Probe,
@@ -1417,10 +1437,11 @@ async fn plan_sources(
         let gate = gate.clone();
         let primary_validator = primary_validator.clone();
         let route = route.clone();
+        let first = first.clone();
         set.spawn(async move {
             let _permit = gate.acquire_owned().await.ok()?;
             let u = parse_url(&m.url).ok()?;
-            let t = target_for(&u, &spec, &route);
+            let t = target_for(&u, &spec, &route, &first);
             let hop = std::time::Instant::now();
             let pr = probe_resilient(conn.as_ref(), &t).await.ok()?;
             if pr.is_redirect() || pr.status >= 300 || !pr.ranges {
@@ -1918,6 +1939,22 @@ async fn run_download(
         id,
         line: crate::i18n::tr("Connecting..."),
     });
+    // The address the user named, kept for the whole chain and every mirror:
+    // it is what decides which requests are still entitled to the login and
+    // cookies they typed for it.
+    let first = match named_target(&spec, &route) {
+        Ok(t) => t,
+        Err(e) => {
+            ev(Event::Failed {
+                id,
+                error: e,
+                done: 0,
+                held: spec.held.clone(),
+                permission_denied: false,
+            });
+            return;
+        }
+    };
     let mut url = spec.url.clone();
     // The mirror the CURRENT attempt started from, as the document spells it.
     //
@@ -1971,7 +2008,7 @@ async fn run_download(
                 return;
             }
         };
-        let t = target_for(&u, &spec, &route);
+        let t = target_for(&u, &spec, &route, &first);
         let t_hop = std::time::Instant::now();
         // Stop has to reach a download that is still CONNECTING, not only one
         // that is already moving bytes. A plain await here read the flag never:
@@ -2278,7 +2315,7 @@ async fn run_download(
         _ => u,
     };
 
-    let target = target_for(&u, &spec, &route);
+    let target = target_for(&u, &spec, &route, &first);
     let temp = spec.temp_path.clone();
     if let Some(dir) = std::path::Path::new(&temp).parent() {
         ensure_writable_dir(dir);
@@ -2386,7 +2423,7 @@ async fn run_download(
     // degenerates to exactly the previous single-source behaviour when
     // `spec.mirrors` is empty, which is what every non-Metalink caller passes.
     let (targets, per, bench, sources) = plan_sources(
-        &spec, &u, &target, &p, size, delta, n, &connector, &route, id,
+        &spec, &first, &u, &target, &p, size, delta, n, &connector, &route, id,
     )
     .await;
     let mut sched =
@@ -7341,12 +7378,46 @@ mod peek_zip_tests {
             ..StartSpec::plain()
         };
         let u = parse_url("https://cdn.example.com/a.mp4?e=1&s=2").unwrap();
-        let t = format!("{:?}", target_for(&u, &spec, &Route::direct()));
+        let first = target_via(None, &u, Vec::new(), &spec.user_agent);
+        let t = format!("{:?}", target_for(&u, &spec, &Route::direct(), &first));
         assert!(
             t.contains("Referer: https://www.example.com/watch"),
             "no referer on the target: {t}"
         );
         assert!(t.contains("Cookie: sid=1"), "no cookie on the target: {t}");
+    }
+
+    /// The transfer's own redirect loop and its mirror probes build their
+    /// targets here too, so a hop off the named origin must leave the login
+    /// and the cookies behind — the probe dialog already did, and a download
+    /// that then sent them anyway was the leak the rule exists to stop.
+    #[test]
+    fn a_target_on_another_origin_carries_no_credentials() {
+        let spec = StartSpec {
+            url: "https://files.example.com/a.mp4".into(),
+            auth: Some(("u".into(), "p".into())),
+            cookies: Some("sid=1".into()),
+            referer: Some("https://www.example.com/watch".into()),
+            user_agent: "hydra-test".into(),
+            ..StartSpec::plain()
+        };
+        let first = named_target(&spec, &Route::direct()).unwrap();
+        let away = parse_url("https://cdn.other.net/a.mp4").unwrap();
+        let t = target_for(&away, &spec, &Route::direct(), &first);
+        assert!(
+            t.headers
+                .iter()
+                .all(|h| !h.starts_with("Authorization:") && !h.starts_with("Cookie:")),
+            "credentials crossed the origin: {:?}",
+            t.headers
+        );
+        assert!(t.headers.iter().any(|h| h.starts_with("Referer:")));
+        assert_eq!(t.agent.as_deref(), Some("hydra-test"));
+
+        let home = parse_url("https://files.example.com/b.mp4").unwrap();
+        let t = target_for(&home, &spec, &Route::direct(), &first);
+        assert!(t.headers.iter().any(|h| h.starts_with("Authorization:")));
+        assert!(t.headers.iter().any(|h| h == "Cookie: sid=1"));
     }
 }
 

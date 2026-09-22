@@ -93,7 +93,7 @@ fn parse_line(raw: &str) -> Option<Cookie> {
     })
 }
 
-/// Render a jar as a `cookies.txt` body.
+/// Render a jar as a `cookies.txt` body, and say how many cookies it holds.
 ///
 /// Session cookies are written only when `keep_session` is set — wget's
 /// `--keep-session-cookies`, and the reason it exists: a session cookie is the
@@ -105,8 +105,9 @@ fn parse_line(raw: &str) -> Option<Cookie> {
 /// name or value contains a tab or a newline: the format has no escape for
 /// either, so writing it would produce a file that parses back as a different
 /// cookie.
-pub fn render(jar: &CookieJar, keep_session: bool, now: u64) -> String {
+pub fn render(jar: &CookieJar, keep_session: bool, now: u64) -> (String, usize) {
     let mut out = String::from(BANNER);
+    let mut n = 0;
     for c in jar.iter() {
         match c.expires {
             Some(e) if e <= now => continue,
@@ -137,8 +138,9 @@ pub fn render(jar: &CookieJar, keep_session: bool, now: u64) -> String {
             c.name,
             c.value,
         ));
+        n += 1;
     }
-    out
+    (out, n)
 }
 
 #[cfg(test)]
@@ -186,19 +188,22 @@ mod tests {
     #[test]
     fn round_trips_through_render_and_parse() {
         let (jar, _) = parse(SAMPLE);
-        let (back, skipped) = parse(&render(&jar, true, 0));
+        let (text, n) = render(&jar, true, 0);
+        let (back, skipped) = parse(&text);
         assert_eq!(skipped, 0);
         assert_eq!(jar, back);
+        assert_eq!(n, jar.len(), "the count is what a reader will find");
     }
 
     #[test]
     fn render_drops_session_cookies_unless_asked_and_always_drops_expired() {
         let (jar, _) = parse(SAMPLE);
-        let without = render(&jar, false, 0);
+        let (without, n) = render(&jar, false, 0);
         assert!(!without.contains("csrf"));
         assert!(without.contains("session"));
+        assert_eq!(n, jar.len() - 1);
 
-        let expired = render(&jar, true, 2_000_000_001);
+        let (expired, _) = render(&jar, true, 2_000_000_001);
         assert!(!expired.contains("session"));
         assert!(expired.contains("csrf"));
     }
@@ -209,8 +214,10 @@ mod tests {
         jar.insert(Cookie::new("ok", "fine", "example.org"));
         jar.insert(Cookie::new("bad", "a\tb", "example.org"));
         jar.insert(Cookie::new("worse", "a\nexample.org\tTRUE", "example.org"));
-        let (back, skipped) = parse(&render(&jar, true, 0));
+        let (text, n) = render(&jar, true, 0);
+        let (back, skipped) = parse(&text);
         assert_eq!(skipped, 0);
+        assert_eq!(n, 1, "a refused cookie is not counted as written");
         assert_eq!(back.len(), 1);
         assert_eq!(back.iter().next().unwrap().name, "ok");
     }

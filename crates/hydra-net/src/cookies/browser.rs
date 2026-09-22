@@ -716,7 +716,16 @@ impl TempCopy {
             store: store.to_path_buf(),
             why,
         };
-        std::fs::create_dir_all(&dir).map_err(|e| lock(e.to_string()))?;
+        // Owner-only, set at creation: the copy holds every site's cookies
+        // until it is read and scoped, and on Linux the temp root is shared
+        // with every other user of the machine.
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir).map_err(|e| lock(e.to_string()))?;
         let file = dir.join("store");
         // A refusal here is the platform's, not the browser's lock: say which.
         std::fs::copy(store, &file).map_err(|e| match e.kind() {
@@ -808,6 +817,17 @@ mod tests {
             !dir.exists(),
             "the copy is removed when it goes out of scope"
         );
+    }
+
+    /// The copy holds every site's cookies until it is scoped, and on Linux
+    /// the temp root is shared with every user of the machine.
+    #[cfg(unix)]
+    #[test]
+    fn the_copy_lives_in_a_directory_only_its_owner_can_enter() {
+        use std::os::unix::fs::PermissionsExt;
+        let copy = TempCopy::of(&fixture("wal.sqlite")).unwrap();
+        let mode = std::fs::metadata(&copy.dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
     }
 
     #[test]

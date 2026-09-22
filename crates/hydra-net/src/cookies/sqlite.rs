@@ -132,7 +132,12 @@ impl Db {
             return Err(Error::TooLarge(len));
         }
         let bytes = std::fs::read(path)?;
-        let wal = std::fs::read(wal_path(path)).unwrap_or_default();
+        // The log is bounded by the same cap for the same reason.
+        let wal = match std::fs::metadata(wal_path(path)) {
+            Ok(m) if m.len() > MAX_DB_BYTES => return Err(Error::TooLarge(m.len())),
+            Ok(_) => std::fs::read(wal_path(path)).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
         Self::from_bytes(bytes, wal)
     }
 
@@ -339,7 +344,14 @@ impl Db {
         let local = if k <= x { k } else { m };
         let mut out = page.get(at..at + local)?.to_vec();
         let mut next = be32(page, at + local);
+        // The chain gets the same cycle guard as the tree: an overflow page
+        // that names itself would otherwise be followed until `out` reached
+        // `size`, and `size` is whatever the varint said.
+        let mut seen = std::collections::HashSet::new();
         while next != 0 && out.len() < size {
+            if !seen.insert(next) {
+                return None;
+            }
             let p = self.page(next)?;
             let take = (size - out.len()).min(self.usable - 4);
             out.extend_from_slice(p.get(4..4 + take)?);
@@ -610,6 +622,29 @@ mod tests {
         };
         assert_eq!(get("sid").as_deref(), Some("from-the-wal"));
         assert_eq!(get("fresh").as_deref(), Some("only-in-wal"));
+    }
+
+    /// The module promises that a corrupt file terminates. The b-tree walk
+    /// always did; the overflow chain is the walk that had no guard, and a
+    /// page naming itself as its own continuation was followed until `out`
+    /// reached whatever size the record claimed.
+    #[test]
+    fn an_overflow_page_that_names_itself_ends_the_read() {
+        let page_size = 512;
+        let mut bytes = vec![0u8; page_size * 2];
+        bytes[page_size..page_size + 4].copy_from_slice(&2u32.to_be_bytes());
+        let db = Db {
+            bytes,
+            wal: Vec::new(),
+            wal_pages: Default::default(),
+            page_size,
+            usable: page_size,
+        };
+        // A 1 000 000-byte payload keeps 256 bytes on the page (§1.6's `K`
+        // for this page size), so the overflow pointer sits right after them.
+        let mut cell = vec![b'x'; 300];
+        cell[256..260].copy_from_slice(&2u32.to_be_bytes());
+        assert_eq!(db.payload(&cell, 0, 1_000_000), None);
     }
 
     #[test]

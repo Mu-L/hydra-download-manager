@@ -164,7 +164,7 @@ fn encode_request_target(path: &str) -> std::borrow::Cow<'_, str> {
 const ORIGIN_CREDENTIALS: &[&str] = &["authorization", "proxy-authorization", "cookie"];
 
 /// A verbatim `Name: value` header line names this field.
-fn is_field(line: &str, name: &str) -> bool {
+pub(crate) fn is_field(line: &str, name: &str) -> bool {
     line.len() > name.len()
         && line.as_bytes()[name.len()] == b':'
         && line[..name.len()].eq_ignore_ascii_case(name)
