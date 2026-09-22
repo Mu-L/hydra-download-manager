@@ -645,9 +645,17 @@ async fn resolve_link(
     headers: &[String],
     route: &Route,
 ) -> Option<(String, Probe)> {
+    // The address asked for, kept for the whole chain: `headers` carry this
+    // download's login and cookies, and a hop off this origin is not entitled
+    // to them.
+    let first = target_via(route.http(), &parse_url(&url).ok()?, Vec::new(), user_agent);
     for _ in 0..10 {
         let u = parse_url(&url).ok()?;
-        let t = target_via(route.http(), &u, headers.to_vec(), user_agent);
+        let t = target_via(route.http(), &u, Vec::new(), user_agent).with_headers_from(
+            &first,
+            headers.to_vec(),
+            Some(user_agent.to_string()),
+        );
         let p = probe_resilient(connector, &t).await.ok()?;
         if p.is_redirect() {
             url = join_url(&u, p.location.as_deref().unwrap_or(""))?;
@@ -1201,6 +1209,65 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// Whether a `BROWSER[:PROFILE]` setting can actually be read, and from where.
+///
+/// Returns the store path on success. Off the UI thread for the same reason
+/// [`import_cookies`] is, and like it, this is the consent line's source: the
+/// user is shown the exact file before any download uses it.
+pub async fn check_cookie_source(spec: String) -> Result<String, String> {
+    let source: hya_net::cookies::browser::Source = spec.parse().map_err(|e| format!("{e}"))?;
+    tokio::task::spawn_blocking(move || {
+        hya_net::cookies::browser::check(&source)
+            .map(|p| p.display().to_string())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cookie check did not finish: {e}"))?
+}
+
+/// Import a browser's cookies for the host `url` names.
+///
+/// Returns the `Cookie:` header value and a one-line description of where it
+/// came from, which Properties shows and the Add URL dialog prints under the
+/// field. The description is the consent line: a download manager reading a
+/// browser's keychain without saying so is indistinguishable from malware.
+///
+/// Off the UI thread, deliberately. On macOS the key lives in the Keychain and
+/// asking for it can put a system dialog in front of the user; doing that from
+/// the update loop would freeze the window behind it.
+pub async fn import_cookies(spec: String, url: String) -> Result<(String, String), String> {
+    let source: hya_net::cookies::browser::Source = spec.parse().map_err(|e| format!("{e}"))?;
+    let u = crate::engine::parse_url(&url)?;
+    tokio::task::spawn_blocking(move || {
+        let now = hya_net::cookies::now_secs();
+        let host = u.host;
+        let import =
+            hya_net::cookies::browser::load(&source, &host, now).map_err(|e| e.to_string())?;
+        // Selected for the address as typed: a `Secure` cookie stays out of a
+        // plaintext download, and a cookie scoped below `/` is found when the
+        // path is under it.
+        let header = import
+            .jar
+            .header_value(&host, &u.path, u.tls, now)
+            .unwrap_or_default();
+        let mut why = format!(
+            "{} — {} cookie(s) for {host} from {}",
+            source.browser,
+            import.jar.len(),
+            import.store.display()
+        );
+        if import.undecryptable > 0 {
+            why.push_str(&format!(
+                " ({} could not be decrypted)",
+                import.undecryptable
+            ));
+        }
+        Ok((header, why))
+    })
+    .await
+    .map_err(|e| format!("cookie import did not finish: {e}"))?
+}
+
 /// The request headers a download's credentials turn into: HTTP Basic for a
 /// login, `Cookie:` for a cookie string, `Referer:` for the page the file was
 /// linked from. Shared by the transfer and by the probes that must see the
@@ -1226,13 +1293,28 @@ pub fn request_headers(
     headers
 }
 
-fn target_for(u: &ParsedUrl, spec: &StartSpec, route: &Route) -> Target {
+/// `first` is the address the user named, as [`named_target`] builds it. A
+/// hop or a mirror on another origin is not entitled to the login and cookies
+/// that were typed for that one, and every target a transfer sends is built
+/// here, so no path can keep the credentials that another drops.
+fn target_for(u: &ParsedUrl, spec: &StartSpec, route: &Route, first: &Target) -> Target {
     let headers = request_headers(
         spec.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str())),
         spec.cookies.as_deref(),
         spec.referer.as_deref(),
     );
-    target_via(route.http(), u, headers, &spec.user_agent)
+    target_via(route.http(), u, Vec::new(), &spec.user_agent).with_headers_from(
+        first,
+        headers,
+        Some(spec.user_agent.clone()),
+    )
+}
+
+/// The address the user named, bare, for [`target_for`] to measure hops
+/// against.
+fn named_target(spec: &StartSpec, route: &Route) -> Result<Target, String> {
+    let u = parse_url(&spec.url)?;
+    Ok(target_via(route.http(), &u, Vec::new(), &spec.user_agent))
 }
 
 /// Probe the mirror list and decide who fetches, who waits, and with how many
@@ -1259,6 +1341,7 @@ fn target_for(u: &ParsedUrl, spec: &StartSpec, route: &Route) -> Target {
 #[allow(clippy::too_many_arguments)]
 async fn plan_sources(
     spec: &StartSpec,
+    first: &Target,
     primary_url: &ParsedUrl,
     primary_target: &Target,
     primary_probe: &Probe,
@@ -1354,10 +1437,11 @@ async fn plan_sources(
         let gate = gate.clone();
         let primary_validator = primary_validator.clone();
         let route = route.clone();
+        let first = first.clone();
         set.spawn(async move {
             let _permit = gate.acquire_owned().await.ok()?;
             let u = parse_url(&m.url).ok()?;
-            let t = target_for(&u, &spec, &route);
+            let t = target_for(&u, &spec, &route, &first);
             let hop = std::time::Instant::now();
             let pr = probe_resilient(conn.as_ref(), &t).await.ok()?;
             if pr.is_redirect() || pr.status >= 300 || !pr.ranges {
@@ -1855,6 +1939,22 @@ async fn run_download(
         id,
         line: crate::i18n::tr("Connecting..."),
     });
+    // The address the user named, kept for the whole chain and every mirror:
+    // it is what decides which requests are still entitled to the login and
+    // cookies they typed for it.
+    let first = match named_target(&spec, &route) {
+        Ok(t) => t,
+        Err(e) => {
+            ev(Event::Failed {
+                id,
+                error: e,
+                done: 0,
+                held: spec.held.clone(),
+                permission_denied: false,
+            });
+            return;
+        }
+    };
     let mut url = spec.url.clone();
     // The mirror the CURRENT attempt started from, as the document spells it.
     //
@@ -1908,7 +2008,7 @@ async fn run_download(
                 return;
             }
         };
-        let t = target_for(&u, &spec, &route);
+        let t = target_for(&u, &spec, &route, &first);
         let t_hop = std::time::Instant::now();
         // Stop has to reach a download that is still CONNECTING, not only one
         // that is already moving bytes. A plain await here read the flag never:
@@ -2215,7 +2315,7 @@ async fn run_download(
         _ => u,
     };
 
-    let target = target_for(&u, &spec, &route);
+    let target = target_for(&u, &spec, &route, &first);
     let temp = spec.temp_path.clone();
     if let Some(dir) = std::path::Path::new(&temp).parent() {
         ensure_writable_dir(dir);
@@ -2323,7 +2423,7 @@ async fn run_download(
     // degenerates to exactly the previous single-source behaviour when
     // `spec.mirrors` is empty, which is what every non-Metalink caller passes.
     let (targets, per, bench, sources) = plan_sources(
-        &spec, &u, &target, &p, size, delta, n, &connector, &route, id,
+        &spec, &first, &u, &target, &p, size, delta, n, &connector, &route, id,
     )
     .await;
     let mut sched =
@@ -7278,12 +7378,46 @@ mod peek_zip_tests {
             ..StartSpec::plain()
         };
         let u = parse_url("https://cdn.example.com/a.mp4?e=1&s=2").unwrap();
-        let t = format!("{:?}", target_for(&u, &spec, &Route::direct()));
+        let first = target_via(None, &u, Vec::new(), &spec.user_agent);
+        let t = format!("{:?}", target_for(&u, &spec, &Route::direct(), &first));
         assert!(
             t.contains("Referer: https://www.example.com/watch"),
             "no referer on the target: {t}"
         );
         assert!(t.contains("Cookie: sid=1"), "no cookie on the target: {t}");
+    }
+
+    /// The transfer's own redirect loop and its mirror probes build their
+    /// targets here too, so a hop off the named origin must leave the login
+    /// and the cookies behind — the probe dialog already did, and a download
+    /// that then sent them anyway was the leak the rule exists to stop.
+    #[test]
+    fn a_target_on_another_origin_carries_no_credentials() {
+        let spec = StartSpec {
+            url: "https://files.example.com/a.mp4".into(),
+            auth: Some(("u".into(), "p".into())),
+            cookies: Some("sid=1".into()),
+            referer: Some("https://www.example.com/watch".into()),
+            user_agent: "hydra-test".into(),
+            ..StartSpec::plain()
+        };
+        let first = named_target(&spec, &Route::direct()).unwrap();
+        let away = parse_url("https://cdn.other.net/a.mp4").unwrap();
+        let t = target_for(&away, &spec, &Route::direct(), &first);
+        assert!(
+            t.headers
+                .iter()
+                .all(|h| !h.starts_with("Authorization:") && !h.starts_with("Cookie:")),
+            "credentials crossed the origin: {:?}",
+            t.headers
+        );
+        assert!(t.headers.iter().any(|h| h.starts_with("Referer:")));
+        assert_eq!(t.agent.as_deref(), Some("hydra-test"));
+
+        let home = parse_url("https://files.example.com/b.mp4").unwrap();
+        let t = target_for(&home, &spec, &Route::direct(), &first);
+        assert!(t.headers.iter().any(|h| h.starts_with("Authorization:")));
+        assert!(t.headers.iter().any(|h| h == "Cookie: sid=1"));
     }
 }
 

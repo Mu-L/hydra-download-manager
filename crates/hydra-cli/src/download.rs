@@ -8,6 +8,7 @@
 use crate::progress::{ConnView, Counters, Progress};
 use crate::url::{proxy_from_env, Sidecar, Url};
 use hya_core::{detect_format, Category, Scheduler, Source};
+use hya_net::cookies::CookieJar;
 use hya_net::polite::{Politeness, RateLimiter};
 use hya_net::{fetch_range_retry, probe_resilient, SparseSink, Target, TlsCapableConnector};
 use sha2::{Digest, Sha256};
@@ -195,6 +196,14 @@ pub struct Job {
     /// to `--logfile`, and silenced by `-q`. A bare `eprintln!` obeys none of
     /// those, and a mirror list has plenty to say.
     pub metalink_notes: Vec<String>,
+    /// The cookie flags, unresolved.
+    ///
+    /// `None` when none were given, which is what keeps a run without a cookie
+    /// flag byte-identical: no file is read, no header is added, nothing is
+    /// written. Resolved inside [`run`] rather than by the caller because a
+    /// browser import is scoped to the host being downloaded from, and only the
+    /// job knows what that is.
+    pub cookies: Option<crate::cookies::CookieSpec>,
     /// Which entry and which mirrors to take, when a document is followed.
     ///
     /// Carried on the job rather than read from `Cli` because the follow happens
@@ -209,7 +218,7 @@ pub struct Job {
 /// `Default` is the canonical "nothing happened yet" value (`ok: false`, every
 /// counter zero, every option `None`); construct partial outcomes with
 /// struct-update syntax rather than spelling out all 22 fields.
-#[derive(serde::Serialize, Clone, Default)]
+#[derive(serde::Serialize, Clone, Default, Debug)]
 pub struct Outcome {
     pub url: String,
     pub output: String,
@@ -897,6 +906,7 @@ pub fn proxy_for_public(_u: &Url, proxy: Option<&str>, no_proxy: bool) -> Option
 pub fn default_job() -> Job {
     Job {
         ticks: None,
+        cookies: None,
         urls: Vec::new(),
         output: None,
         conns: None,
@@ -999,17 +1009,33 @@ pub async fn probe_public<C: hya_net::Connector>(
     let mut cur = u.clone();
     let mut chain = hya_net::polite::RedirectChain::new(&cur.to_string());
     let mut hops = 0u32;
+    // The same jar the transfer path keeps, for the same reason: `hydra
+    // checksum` and `--server-response` describe the object REACHED, and a
+    // login-gated one is only reachable by a chain that carries what it was
+    // handed. The cookie flags are read here too, so a jar file or a browser
+    // import answers a question about the object as well as a download of it.
+    let now = hya_net::cookies::now_secs();
+    let mut jar = open_jar_for(args, &cur.host, now).await?;
+    // The address the user named, kept for the whole chain: it is what decides
+    // whether a later hop is still entitled to the credentials they typed.
+    let first = u.to_target(
+        proxy_for_public(u, args.proxy.as_deref(), args.no_proxy)
+            .as_ref()
+            .map(|(h, p)| (h.as_str(), *p)),
+    )?;
     loop {
         let px = proxy_for_public(&cur, args.proxy.as_deref(), args.no_proxy);
         let target = cur
             .to_target(px.as_ref().map(|(h, p)| (h.as_str(), *p)))?
-            .with_headers(args.headers.clone(), Some(args.user_agent.clone()));
+            .with_headers_from(&first, args.headers.clone(), Some(args.user_agent.clone()))
+            .with_jar(&jar, now);
         // One rule for "HEAD said nothing usable", shared with the GUI and the
         // engine rather than restated here: a HEAD that states `Content-Length: 0`
         // has answered, and a ranged GET against a zero-length object is refused.
         let pr = hya_net::probe_resilient(c, &target)
             .await
             .map_err(|e| e.to_string())?;
+        jar.store_response(&pr.raw_head, &cur.host, &cur.path, now);
         if pr.is_redirect() && hops < args.max_redirs {
             let next = pr
                 .location
@@ -1042,6 +1068,45 @@ pub async fn probe_public<C: hya_net::Connector>(
     }
 }
 
+/// The jar a reporting command starts with.
+///
+/// Notices go to stderr: these commands write ONE answer to stdout — a digest,
+/// a header value, a JSON document — and the consent line must not end up
+/// inside it, but a browser store read without a word is exactly what the line
+/// exists to prevent.
+async fn open_jar_for(args: &crate::cli::Cli, host: &str, now: u64) -> Result<CookieJar, String> {
+    let Some(spec) = crate::cookies::CookieSpec::from_cli(args)? else {
+        return Ok(CookieJar::new());
+    };
+    let host = host.to_string();
+    let (jar, notes) = tokio::task::spawn_blocking(move || spec.open(&host, now))
+        .await
+        .map_err(|e| format!("cookie import did not finish: {e}"))??;
+    if !args.quiet {
+        for n in notes {
+            eprintln!("hydra: {n}");
+        }
+    }
+    Ok(jar)
+}
+
+/// The jar this job starts with, and what the user should be told about it.
+///
+/// Off the executor: reading a jar file touches the filesystem and a browser
+/// import may spawn the platform's secret-store helper, neither of which
+/// belongs on an async runtime thread.
+async fn open_jar(job: &Job, now: u64) -> Result<(CookieJar, Vec<String>), String> {
+    let Some(spec) = job.cookies.clone() else {
+        return Ok((CookieJar::new(), Vec::new()));
+    };
+    let Some(host) = job.urls.first().and_then(|u| Url::parse(u)).map(|u| u.host) else {
+        return Ok((CookieJar::new(), Vec::new()));
+    };
+    tokio::task::spawn_blocking(move || spec.open(&host, now))
+        .await
+        .map_err(|e| format!("cookie import did not finish: {e}"))?
+}
+
 /// One source after redirect resolution: what described it, and where it ended up.
 struct Resolved {
     probe: hya_net::Probe,
@@ -1058,6 +1123,13 @@ struct Resolved {
     /// redirector page means the URL they had named a forwarding stub. Nobody
     /// asked for `index.html`.
     via_html: bool,
+    /// The jar as this chain left it.
+    ///
+    /// Returned rather than shared through a lock because mirrors are probed
+    /// CONCURRENTLY: one jar behind a mutex would serialise the fan-out and,
+    /// worse, let one mirror's `Set-Cookie` be selected for another mirror's
+    /// next hop. A clone per chain cannot do either.
+    jar: CookieJar,
 }
 
 ///
@@ -1072,6 +1144,8 @@ async fn probe_resolving<C>(
     t: &Target,
     log: &mut Vec<(u8, String)>,
     max_redirs: u32,
+    jar: &CookieJar,
+    now: u64,
 ) -> Result<Resolved, String>
 where
     C: hya_net::Connector,
@@ -1085,10 +1159,23 @@ where
     // happens — that is how a redirect is discovered at all — but the hop is not
     // taken.
     let max_hops = max_redirs as usize;
-    let mut target = t.clone();
+    // `t` carries the USER's headers and nothing the jar produced: the jar's
+    // `Cookie:` is derived here, per hop, so a cookie the chain expires with
+    // `Max-Age=0` is gone from the next request rather than restored from a
+    // copy taken before it was.
+    let mut target = t.clone().with_jar(jar, now);
     let mut current = u.clone();
     let mut chain = hya_net::polite::RedirectChain::new(&current.to_string());
     let mut via_html = false;
+    // The jar travels with the chain, whether or not a cookie flag was given.
+    // A login-gated CDN answers the first request with `Set-Cookie` and a `302`
+    // and expects the cookie back on the second; without this the second hop
+    // goes out bare and the download `403`s in a way that looks like a server
+    // fault. Holding it costs nothing and reaches nothing — the jar dies with
+    // the chain, is never written, and selects by the destination host — so
+    // making it conditional on a flag would only mean the users who did not
+    // know to pass one still cannot fetch the file.
+    let mut jar = jar.clone();
     // `0..=max_hops`: the extra pass is what answers the request that the last
     // permitted hop arrived at. Without it a budget of N would resolve only N-1.
     for hop in 0..=max_hops {
@@ -1098,6 +1185,12 @@ where
         let pr = probe_resilient(c, &target)
             .await
             .map_err(|e| e.to_string())?;
+        // Counted, never quoted: the value is a bearer credential and `-v` is
+        // read in terminals, CI logs and bug reports.
+        let set = jar.store_response(&pr.raw_head, &current.host, &current.path, now);
+        if set > 0 {
+            log.push((2, format!("{} set {set} cookie(s)", current.host)));
+        }
 
         if pr.is_redirect() {
             let loc = pr.location.clone().unwrap_or_default();
@@ -1121,7 +1214,9 @@ where
             let px = proxy_for(&next);
             target = next
                 .to_target(px.as_ref().map(|(h, p)| (h.as_str(), *p)))
-                .map_err(|e| format!("redirect target unusable: {e}"))?;
+                .map_err(|e| format!("redirect target unusable: {e}"))?
+                .with_headers_from(t, t.headers.clone(), t.agent.clone())
+                .with_jar(&jar, now);
             current = next;
             continue;
         }
@@ -1146,7 +1241,9 @@ where
                 let px = proxy_for(&next);
                 target = next
                     .to_target(px.as_ref().map(|(h, p)| (h.as_str(), *p)))
-                    .map_err(|e| format!("redirect target unusable: {e}"))?;
+                    .map_err(|e| format!("redirect target unusable: {e}"))?
+                    .with_headers_from(t, t.headers.clone(), t.agent.clone())
+                    .with_jar(&jar, now);
                 current = next;
                 via_html = true;
                 continue;
@@ -1173,6 +1270,7 @@ where
             target,
             url: current,
             via_html,
+            jar,
         });
     }
     Err(format!("too many redirects (--max-redirs {max_redirs})"))
@@ -1263,6 +1361,8 @@ struct Probed {
     /// than the level below, and settled at one connection on a link that
     /// scaled to eight.
     first_rtt: f64,
+    /// Every chain's jar, merged, for `--save-cookies` to write out.
+    jar: CookieJar,
 }
 
 async fn probe_all(
@@ -1272,6 +1372,8 @@ async fn probe_all(
     max_redirs: u32,
     attested_size: Option<u64>,
     want_seats: usize,
+    jar: &CookieJar,
+    now: u64,
 ) -> Result<Probed, String> {
     // Probed CONCURRENTLY, bounded.
     //
@@ -1301,10 +1403,11 @@ async fn probe_all(
         let c = conn.clone();
         let gate = gate.clone();
         let (u, t) = (u.clone(), t.clone());
+        let jar = jar.clone();
         set.spawn(async move {
             let mut log: Vec<(u8, String)> = Vec::new();
             let permit = gate.acquire_owned().await;
-            let r = probe_resolving(c.as_ref(), &u, &t, &mut log, max_redirs).await;
+            let r = probe_resolving(c.as_ref(), &u, &t, &mut log, max_redirs, &jar, now).await;
             drop(permit);
             (i, u, r, log)
         });
@@ -1432,6 +1535,10 @@ async fn probe_all(
     // user can act on, which for an object that answers `400` is the status
     // the server already gave.
     let mut lone_failure: Option<String> = None;
+    // What every chain learned, folded back together for `--save-cookies`.
+    // Merging is safe because a jar selects by the host of the request it is
+    // asked about, so two mirrors' sessions cannot be confused for each other.
+    let mut merged = jar.clone();
     let mut keep = Vec::new();
     // Targets after redirect resolution, paired with the index they came from.
     let mut resolved_targets: Vec<(usize, Target)> = Vec::new();
@@ -1443,6 +1550,7 @@ async fn probe_all(
         }
         match res {
             Ok(r) => {
+                merged.extend(r.jar);
                 let (pr, resolved) = (r.probe, r.target);
                 // A redirect may have moved the object to a different host; the
                 // transfer must use the resolved target, not the one we started from.
@@ -1604,6 +1712,7 @@ async fn probe_all(
                 .map(|d| d.as_secs_f64())
                 .unwrap_or(0.05)
                 .clamp(0.05, 45.0),
+            jar: merged,
         }),
         // One URL, one answer. With a mirror list the per-source lines above
         // have already said what each one did, and the summary is the honest
@@ -1887,6 +1996,17 @@ fn sha256_file(path: &Path) -> Option<String> {
 }
 
 pub async fn run(job: Job) -> Outcome {
+    let now = hya_net::cookies::now_secs();
+    // Resolved before any target is built, because the `Cookie:` header is part
+    // of the target. The host it is scoped to is the FIRST url — the one the
+    // user named. Mirrors discovered from a Metalink document are other
+    // operators' hosts and are served by the same jar only if a cookie actually
+    // domain-matches them, which is the jar's own rule and not a special case
+    // here.
+    let (jar, cookie_notes) = match open_jar(&job, now).await {
+        Ok(v) => v,
+        Err(e) => return failed(&job, 0, e),
+    };
     let pairs = match targets_for(
         &job.urls,
         &job.headers,
@@ -1954,6 +2074,13 @@ pub async fn run(job: Job) -> Outcome {
     // "did it work", which is the bar and the result line.
     for n in &job.metalink_notes {
         p.event(1, n);
+    }
+    // Level 0: reading a browser's cookie store is something the user is TOLD
+    // about, not something they have to raise the verbosity to discover. A
+    // download manager that opens a keychain quietly is indistinguishable from
+    // malware, and the difference is entirely whether it said so.
+    for n in &cookie_notes {
+        p.event(0, n);
     }
 
     // One connector for the whole job: it carries the TLS session cache, so the
@@ -2039,6 +2166,7 @@ pub async fn run(job: Job) -> Outcome {
         renamed,
         late: late_mirrors,
         first_rtt,
+        jar: final_jar,
     } = match probe_all(
         &conn,
         &pairs,
@@ -2046,12 +2174,31 @@ pub async fn run(job: Job) -> Outcome {
         job.max_redirs,
         job.attested.as_ref().map(|a| a.size),
         want_seats,
+        &jar,
+        now,
     )
     .await
     {
         Ok(v) => v,
         Err(e) => return failed(&job, 0, e),
     };
+
+    // Written HERE rather than after the transfer, and that is the complete
+    // moment rather than an early one: cookies are handed out by the redirect
+    // chain, which has just finished, and the range requests that follow reuse
+    // the resolved target without reading `Set-Cookie` again. Saving here also
+    // means a transfer that fails half way still leaves the session that was
+    // issued to it, which is the one the retry will want.
+    if let Some(spec) = &job.cookies {
+        match spec.save(&final_jar, now) {
+            Ok(Some(note)) => p.event(0, &note),
+            Ok(None) => {}
+            // A jar the user asked to keep and silently did not get is worse
+            // than a failed download: they find out at the next login.
+            Err(e) => return failed(&job, 0, e),
+        }
+    }
+
     // ---- the URL is a MIRROR LIST, not the object -------------------------
     //
     // `https://mirrors.fedoraproject.org/metalink?repo=fedora-40&arch=x86_64` has
@@ -3931,6 +4078,216 @@ mod tests {
         port
     }
 
+    /// A login-gated origin: `/login` hands out a session and forwards to
+    /// `/file`, which serves the object only to a request that carries it.
+    ///
+    /// This is issue #227's third failure in miniature. A client with no jar
+    /// sends the second hop bare and is answered `403`, which looks like a
+    /// server fault and is not.
+    async fn spawn_gated_origin(body: std::sync::Arc<Vec<u8>>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match s.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        let end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let text = String::from_utf8_lossy(&head[..end]).to_string();
+                        head.drain(..end);
+                        let line = text.lines().next().unwrap_or("").to_string();
+                        let method = line.split_whitespace().next().unwrap_or("").to_string();
+                        let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let has_session = text
+                            .lines()
+                            .filter(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                            .any(|l| l.contains("sid=granted"));
+
+                        if path.starts_with("/login") {
+                            let h = "HTTP/1.1 302 Found\r\nLocation: /file\r\n\
+                                     Set-Cookie: sid=granted; Path=/; Max-Age=3600\r\n\
+                                     Set-Cookie: tracker=x; Domain=127.0.0.2; Path=/\r\n\
+                                     Content-Length: 0\r\n\r\n";
+                            if s.write_all(h.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if !has_session {
+                            let h = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
+                            if s.write_all(h.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let total = body.len();
+                        let range = text
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                            .and_then(|l| l.split_once('=').map(|(_, v)| v.trim().to_string()));
+                        let (status, lo, hi) = match range.as_deref() {
+                            Some(r) => {
+                                let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+                                let lo: usize = a.parse().unwrap_or(0);
+                                let hi: usize = b.parse().unwrap_or(total - 1);
+                                ("206 Partial Content", lo, hi.min(total - 1))
+                            }
+                            None => ("200 OK", 0, total - 1),
+                        };
+                        let len = hi - lo + 1;
+                        let mut h = format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\n\
+                             ETag: \"gated\"\r\nContent-Type: application/octet-stream\r\n"
+                        );
+                        if range.is_some() {
+                            h.push_str(&format!("Content-Range: bytes {lo}-{hi}/{total}\r\n"));
+                        }
+                        h.push_str("\r\n");
+                        if s.write_all(h.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        if method != "HEAD" && s.write_all(&body[lo..=hi]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// `hydra checksum` and `--server-response` describe an object a login
+    /// gate may hide, so they read the same jar a download would — and say so
+    /// on stderr, where the consent line cannot land inside the one answer
+    /// they write to stdout.
+    #[tokio::test]
+    async fn a_reporting_command_reads_the_jar_it_was_given() {
+        let dir = std::env::temp_dir().join(format!("hydra_cookie_{}", scratch_name()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar_path = dir.join("jar.txt");
+        std::fs::write(&jar_path, "127.0.0.1\tFALSE\t/\tFALSE\t0\tsid\tabc\n").unwrap();
+
+        let argv = [
+            "hydra",
+            "--load-cookies",
+            jar_path.to_str().unwrap(),
+            "http://127.0.0.1/x",
+        ];
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(argv);
+        let jar = open_jar_for(&args, "127.0.0.1", 0).await.unwrap();
+        assert_eq!(
+            jar.header_value("127.0.0.1", "/x", false, 0).as_deref(),
+            Some("sid=abc")
+        );
+
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(["hydra", "http://127.0.0.1/x"]);
+        assert!(
+            open_jar_for(&args, "127.0.0.1", 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no flag, no jar"
+        );
+
+        let absent = dir.join("absent.txt");
+        let argv = [
+            "hydra",
+            "--load-cookies",
+            absent.to_str().unwrap(),
+            "http://127.0.0.1/x",
+        ];
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(argv);
+        let e = open_jar_for(&args, "127.0.0.1", 0).await.unwrap_err();
+        assert!(e.contains("absent.txt"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The headline behaviour: a redirect that SETS a session must be able to
+    /// send it back on the next hop.
+    ///
+    /// This works with NO cookie flag, which is a deliberate departure from
+    /// "no flag, no change": a chain-scoped jar is what makes `-L` correct, it
+    /// touches no disk and no other host, and without it the only users who can
+    /// fetch from a login-gated CDN are the ones who already knew to pass a
+    /// flag. What stays opt-in is everything that OUTLIVES the chain — reading
+    /// a jar file, writing one, importing from a browser.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_that_hands_out_a_session_can_be_followed() {
+        let body: Vec<u8> = (0..200_000u64).map(|i| (i % 251) as u8).collect();
+        let want = hya_net::digest::to_lower_hex(&Sha256::digest(&body));
+        let port = spawn_gated_origin(std::sync::Arc::new(body)).await;
+        let dir = std::env::temp_dir().join(format!("hydra_cookie_{}", scratch_name()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("http://127.0.0.1:{port}/login");
+
+        let mut bare = default_job();
+        bare.urls = vec![url.clone()];
+        bare.output = Some(dir.join("bare.bin"));
+        bare.print_checksum = true;
+        let out = run(bare).await;
+        assert!(out.ok, "the hop must carry what the hop was given: {out:?}");
+        assert_eq!(out.sha256.as_deref(), Some(want.as_str()));
+
+        let jar_path = dir.join("jar.txt");
+        let argv = [
+            "hydra",
+            "--cookie-jar",
+            jar_path.to_str().unwrap(),
+            "--keep-session-cookies",
+            &url,
+        ];
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(argv);
+        let mut job = default_job();
+        job.urls = vec![url.clone()];
+        job.output = Some(dir.join("gated.bin"));
+        job.cookies = crate::cookies::CookieSpec::from_cli(&args).unwrap();
+        assert!(run(job).await.ok);
+
+        // Written back, and scoped: the origin also set a cookie for a host it
+        // is not under, which must never have been stored at all.
+        let saved = std::fs::read_to_string(&jar_path).unwrap();
+        assert!(saved.contains("sid"), "the session was not saved: {saved}");
+        assert!(
+            !saved.contains("tracker"),
+            "a Domain the setting host is not under must never be stored: {saved}"
+        );
+
+        // And a second run reads it back, so the login hop is not needed at all:
+        // `/file` answers `403` to a request that arrives without a session.
+        let argv = ["hydra", "--load-cookies", jar_path.to_str().unwrap(), &url];
+        let args = <crate::cli::Cli as clap::Parser>::parse_from(argv);
+        let mut job = default_job();
+        job.urls = vec![format!("http://127.0.0.1:{port}/file")];
+        job.output = Some(dir.join("direct.bin"));
+        job.cookies = crate::cookies::CookieSpec::from_cli(&args).unwrap();
+        assert!(
+            run(job).await.ok,
+            "a jar read from disk must authenticate the very first request"
+        );
+
+        // Without one, that same first request is refused — which is what the
+        // jar is for, and proof the origin really is gated.
+        let mut job = default_job();
+        job.urls = vec![format!("http://127.0.0.1:{port}/file")];
+        job.output = Some(dir.join("refused.bin"));
+        assert!(!run(job).await.ok, "the origin is not actually gated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The reported SHA-256 must be the file's SHA-256, however it was computed.
     ///
     /// A single-connection transfer hashes the bytes as they land instead of
@@ -3975,6 +4332,217 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An origin that redirects `/start` once and records the headers of every
+    /// request it was sent, so a test can assert on what actually reached the
+    /// wire rather than on what the code meant to send.
+    ///
+    /// `to` is where it forwards, which lets one helper cover both a
+    /// same-origin hop and a hop to somewhere else. `html` picks WHICH kind of
+    /// forwarding: a `302`, or the page that says the same thing in a meta
+    /// refresh — two different branches of the same hop rule.
+    async fn spawn_recording_origin(
+        to: String,
+        html: bool,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    return;
+                };
+                let (sink, to) = (sink.clone(), to.clone());
+                let page = format!(
+                    "<html><head><meta http-equiv=\"refresh\" content=\"0; url={to}\">\
+                     </head><body>going</body></html>"
+                );
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match s.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => head.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        let end = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        let text = String::from_utf8_lossy(&head[..end]).to_string();
+                        head.drain(..end);
+                        sink.lock().unwrap().push(text.clone());
+                        let method = text.split_whitespace().next().unwrap_or("").to_string();
+                        let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                        let reply = if path.starts_with("/start") && html {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                                 Content-Length: {}\r\n\r\n",
+                                page.len()
+                            )
+                        } else if path.starts_with("/start") {
+                            format!(
+                                "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\n\r\n"
+                            )
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nAccept-Ranges: bytes\r\n\
+                             ETag: \"rec\"\r\n\r\n"
+                                .to_string()
+                        };
+                        if s.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let body: &[u8] = match (path.starts_with("/start"), html, &method[..]) {
+                            (_, _, "HEAD") => b"",
+                            (true, true, _) => page.as_bytes(),
+                            (true, false, _) => b"",
+                            (false, _, _) => b"forty-two",
+                        };
+                        if !body.is_empty() && s.write_all(body).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// Requests recorded for `path`, as raw head text.
+    fn requests_for<'a>(seen: &'a [String], path: &str) -> Vec<&'a String> {
+        seen.iter()
+            .filter(|r| r.split_whitespace().nth(1) == Some(path))
+            .collect()
+    }
+
+    /// The reported bug: every hop after a redirect went out with no `-H`
+    /// headers and no `-U` agent, because the hop rebuilt its target from the
+    /// URL alone. A `hydra -H 'X-Api-Key: …'` against a redirecting host
+    /// silently lost the key, and the transfer — which runs against this
+    /// resolved target — lost it too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_hop_still_carries_the_headers_the_user_passed() {
+        let (port, seen) = spawn_recording_origin("/landed".into(), false).await;
+        let u = crate::url::Url::parse(&format!("http://127.0.0.1:{port}/start")).expect("url");
+        let t = u.to_target(None).expect("target").with_headers(
+            vec![
+                "X-Api-Key: k-123".to_string(),
+                "Authorization: Bearer t-456".to_string(),
+            ],
+            Some("hydra-test/1".to_string()),
+        );
+        let c = hya_net::TlsCapableConnector::new().expect("connector");
+        let mut log = Vec::new();
+        let r = probe_resolving(&c, &u, &t, &mut log, 8, &CookieJar::new(), 0)
+            .await
+            .expect("the chain resolves");
+
+        let seen = seen.lock().unwrap();
+        let landed = requests_for(&seen, "/landed");
+        assert!(!landed.is_empty(), "the redirect was never followed");
+        for req in &landed {
+            assert!(
+                req.contains("X-Api-Key: k-123"),
+                "header lost on the hop: {req}"
+            );
+            assert!(
+                req.contains("User-Agent: hydra-test/1"),
+                "agent lost on the hop: {req}"
+            );
+            // Same origin, so the credential is still this host's to receive.
+            assert!(req.contains("Authorization: Bearer t-456"), "{req}");
+        }
+        // And the target handed to the transfer carries them, which is the half
+        // of the bug a probe-only assertion would miss.
+        assert!(r.target.headers.iter().any(|h| h == "X-Api-Key: k-123"));
+        assert_eq!(r.target.agent.as_deref(), Some("hydra-test/1"));
+    }
+
+    /// The boundary the fix must not cross: a hop to a different origin keeps
+    /// the ordinary headers and leaves the credential behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_to_another_origin_leaves_the_credential_behind() {
+        let (other, seen_other) = spawn_recording_origin("/landed".into(), false).await;
+        // `localhost` and `127.0.0.1` resolve to the same machine and are
+        // different origins, which is exactly the case a host comparison has to
+        // get right.
+        let (port, _seen) =
+            spawn_recording_origin(format!("http://localhost:{other}/landed"), false).await;
+        let u = crate::url::Url::parse(&format!("http://127.0.0.1:{port}/start")).expect("url");
+        let t = u.to_target(None).expect("target").with_headers(
+            vec![
+                "X-Api-Key: k-123".to_string(),
+                "Authorization: Bearer t-456".to_string(),
+                "Cookie: sid=secret".to_string(),
+            ],
+            Some("hydra-test/1".to_string()),
+        );
+        let c = hya_net::TlsCapableConnector::new().expect("connector");
+        let mut log = Vec::new();
+        probe_resolving(&c, &u, &t, &mut log, 8, &CookieJar::new(), 0)
+            .await
+            .expect("the chain resolves");
+
+        let seen = seen_other.lock().unwrap();
+        let landed = requests_for(&seen, "/landed");
+        assert!(!landed.is_empty(), "the cross-origin hop was never taken");
+        for req in &landed {
+            assert!(
+                req.contains("X-Api-Key: k-123"),
+                "ordinary header lost: {req}"
+            );
+            assert!(
+                req.contains("User-Agent: hydra-test/1"),
+                "agent lost: {req}"
+            );
+            assert!(
+                !req.contains("Bearer t-456"),
+                "a bearer token reached another origin: {req}"
+            );
+            assert!(
+                !req.contains("sid=secret"),
+                "a hand-written cookie reached another origin: {req}"
+            );
+        }
+    }
+
+    /// A forwarding page is the same hop written in HTML, and it rebuilds its
+    /// target through the same line — so it drops the same headers unless it is
+    /// fixed too. Charged to the same rule and tested separately because a
+    /// `3xx` test cannot reach this branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_html_redirector_hop_carries_the_headers_too() {
+        let (port, seen) = spawn_recording_origin("/landed".into(), true).await;
+        let u = crate::url::Url::parse(&format!("http://127.0.0.1:{port}/start")).expect("url");
+        let t = u.to_target(None).expect("target").with_headers(
+            vec!["X-Api-Key: k-123".to_string()],
+            Some("hydra-test/1".to_string()),
+        );
+        let c = hya_net::TlsCapableConnector::new().expect("connector");
+        let mut log = Vec::new();
+        let r = probe_resolving(&c, &u, &t, &mut log, 8, &CookieJar::new(), 0)
+            .await
+            .expect("the page forwards");
+        assert!(r.via_html, "the hop was a 3xx, not the page");
+
+        let seen = seen.lock().unwrap();
+        let landed = requests_for(&seen, "/landed");
+        assert!(!landed.is_empty(), "the page was never followed");
+        for req in &landed {
+            assert!(
+                req.contains("X-Api-Key: k-123"),
+                "header lost on the hop: {req}"
+            );
+            assert!(
+                req.contains("User-Agent: hydra-test/1"),
+                "agent lost on the hop: {req}"
+            );
+        }
+    }
+
     /// An error status from the probe is an answer about the URL, not a
     /// description of a 24-byte object.
     ///
@@ -3993,7 +4561,7 @@ mod tests {
         let t = u.to_target(None).expect("target");
         let c = hya_net::TlsCapableConnector::new().expect("connector");
         let mut log = Vec::new();
-        let r = probe_resolving(&c, &u, &t, &mut log, 8).await;
+        let r = probe_resolving(&c, &u, &t, &mut log, 8, &CookieJar::new(), 0).await;
         let err = match r {
             Ok(res) => panic!(
                 "a 400 resolved to a {}-byte object instead of an error",
@@ -4212,7 +4780,7 @@ mod tests {
         let u = Url::parse(&format!("http://127.0.0.1:{port}/obj")).expect("url");
         let t = u.to_target(None).expect("target");
         let mut log = Vec::new();
-        let err = match probe_resolving(&net, &u, &t, &mut log, 8).await {
+        let err = match probe_resolving(&net, &u, &t, &mut log, 8, &CookieJar::new(), 0).await {
             Ok(r) => panic!("a loop resolved to a {}-byte object", r.probe.size),
             Err(e) => e,
         };
@@ -4239,7 +4807,7 @@ mod tests {
         let u = Url::parse(&format!("http://127.0.0.1:{port}/obj")).expect("url");
         let t = u.to_target(None).expect("target");
         let mut log = Vec::new();
-        let err = match probe_resolving(&net, &u, &t, &mut log, 8).await {
+        let err = match probe_resolving(&net, &u, &t, &mut log, 8, &CookieJar::new(), 0).await {
             Ok(r) => panic!("a loop resolved to a {}-byte object", r.probe.size),
             Err(e) => e,
         };

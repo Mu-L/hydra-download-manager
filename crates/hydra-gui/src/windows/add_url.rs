@@ -21,7 +21,9 @@ const GAP: f32 = 8.0;
 
 /// Every label in the column, so one width fits all of them and the rows
 /// stay aligned.
-const LABELS: [&str; 5] = ["Address", "Stream", "Quality", "Record", "Metalink"];
+const LABELS: [&str; 6] = [
+    "Address", "Cookies", "Stream", "Quality", "Record", "Metalink",
+];
 
 fn label_w() -> f32 {
     LABELS
@@ -92,6 +94,41 @@ pub fn view(app: &App) -> El<'_> {
             .size(theme::FONT_SIZE)
             .style(theme::input)
             .width(Length::Fill),
+    ]
+    .spacing(GAP)
+    .align_y(iced::Alignment::Center);
+
+    // Cookies sit with the credentials because they are one: a session is
+    // what gets a file out of a university mirror or a private GitLab, and a
+    // user who has one in hand has nowhere else in this dialog to put it.
+    let cookie_note: El<'_> = if st.cookies_importing {
+        text(tr("Reading the browser's cookies..."))
+            .size(theme::FONT_SIZE - 1.0)
+            .color(theme::dim_text(&iced::Theme::Light))
+            .into()
+    } else {
+        match &st.cookie_note {
+            Some(n) => row![
+                iced::widget::space::horizontal().width(label_w()),
+                text(n.clone())
+                    .size(theme::FONT_SIZE - 1.0)
+                    .color(theme::dim_text(&iced::Theme::Light)),
+            ]
+            .spacing(GAP)
+            .into(),
+            None => iced::widget::space::horizontal().height(0.0).into(),
+        }
+    };
+    let cookies = row![
+        label(tr("Cookies")),
+        text_input(
+            "name=value; name2=value2",
+            st.capture.cookies.as_deref().unwrap_or("")
+        )
+        .on_input(Message::AddrCookies)
+        .size(theme::FONT_SIZE)
+        .style(theme::input)
+        .width(Length::Fill),
     ]
     .spacing(GAP)
     .align_y(iced::Alignment::Center);
@@ -320,6 +357,8 @@ pub fn view(app: &App) -> El<'_> {
         address,
         auth,
         creds,
+        cookies,
+        cookie_note,
         iced::widget::space::vertical().height(GAP),
         stream,
         metalink,

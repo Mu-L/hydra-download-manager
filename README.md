@@ -40,6 +40,7 @@
   - [Basic Download](#basic-download)
   - [Multi-Connection & Mirror Sources](#multi-connection--mirror-sources)
   - [Metalink](#metalink)
+  - [Cookies and Authenticated Downloads](#cookies-and-authenticated-downloads)
   - [CLI Compatibility (`wget` / `curl` Mode)](#cli-compatibility-wget--curl-mode)
   - [Interactive Queue Manager (TUI)](#interactive-queue-manager-tui)
   - [Remote Checksum Lookup & Verification](#remote-checksum-lookup--verification)
@@ -511,6 +512,62 @@ URL into **Add URL** and it shows what the list offers — files, sizes, how man
 mirrors are usable, whether per-chunk verification is available — before adding
 one download per entry. `libhydra` exposes it too, through
 `hydra_metalink_parse`/`_open`/`_fetch` and `hydra_job_create_from_metalink`.
+
+### Cookies and Authenticated Downloads
+
+A file behind a login — a university mirror, a private GitLab artifact, a forum
+attachment, a paywalled dataset — needs the session your browser already has.
+
+```bash
+# A cookie string, the way curl spells it
+hydra --cookie "session=abc; csrf=def" https://example.org/file.iso
+
+# A Netscape cookies.txt, read before the first request and written back after
+hydra --cookie-jar ./jar.txt https://example.org/file.iso
+
+# wget's one-direction spellings
+hydra --load-cookies ./cookies.txt https://example.org/file.iso
+hydra --save-cookies ./cookies.txt --keep-session-cookies https://example.org/file.iso
+
+# Or take them straight out of the browser that has the session
+hydra --cookies-from-browser firefox https://example.org/file.iso
+hydra --cookies-from-browser "chrome:Profile 2" https://example.org/file.iso
+```
+
+`--cookies-from-browser` reads the browser's own store — Firefox, LibreWolf and
+Zen from `cookies.sqlite`; Chrome, Chromium, Edge, Brave, Vivaldi and Opera from
+their encrypted `Cookies` database, decrypted through the platform keychain the
+way the browser does it; Safari from `Cookies.binarycookies`. A running browser
+does not have to be closed: the store is copied and read from the copy.
+
+On macOS, a browser profile lives behind the system privacy control, so the
+first run reports that it cannot read the store and names the path. Grant **Full
+Disk Access** to whatever is running hydra — your terminal, or Hydra itself for
+the desktop app — in System Settings ▸ Privacy & Security, and try again.
+
+Three things it will not do:
+
+- **Read more than it needs.** Only the host being downloaded from is kept; the
+  rest of the profile is discarded before the first request, and nothing is
+  written to disk unless `--cookie-jar` or `--save-cookies` asked for it.
+- **Do it quietly.** The run names the exact file it read and the host it read
+  it for. A download manager that opens a browser keychain without saying so is
+  indistinguishable from malware.
+- **Let a cookie cross an origin.** The jar selects by the host of the request
+  about to be sent, so a redirect from one site to another carries the second
+  site's cookies and nothing else. `Domain=` may only widen a cookie to a domain
+  the setting host is under, never to a public suffix. Values are never logged at
+  any `-v` level, and a jar file is written `0600`.
+
+Following a redirect chain that hands out a session works with no flag at all:
+a `Set-Cookie` on a `302` is held for the rest of that chain, which is what a
+login-gated CDN expects. The jar dies with the chain — nothing is read from or
+written to disk unless one of the flags above asked.
+
+In the desktop app, **Add URL** has a Cookies field, **Options ▸ Connection ▸
+Use cookies from** picks a browser and profile for downloads added by hand, and
+**Properties** shows where a download's cookies came from. Captures from the
+Hydra browser extension already carry the page's own cookies and are unaffected.
 
 ### CLI Compatibility (`wget` / `curl` Mode)
 

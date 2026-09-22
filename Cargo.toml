@@ -52,6 +52,15 @@ sha1 = "0.11"
 # block cipher is how you get a subtly wrong one.
 aes = "0.9"
 cbc = { version = "0.2", features = ["block-padding"] }
+# Browser cookie import. Chromium encrypts every cookie value at rest, so
+# reading its store means undoing exactly the scheme it applied: PBKDF2-HMAC-SHA1
+# to the key, then AES-128-CBC (macOS, Linux) or AES-256-GCM (Windows). The
+# `aes` and `cbc` crates above already cover the block cipher; these are the
+# constructions layered over them, taken from the same audited family rather
+# than hand-rolled — a HMAC or a GHASH that is subtly wrong fails by decrypting
+# to plausible garbage, which is the hardest kind of bug to notice.
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 # SIMD byte search with runtime dispatch (AVX2/SSE2 on x86-64, NEON on aarch64)
 # and a scalar fallback. Used by the protocol framing paths.
 memchr = "2"

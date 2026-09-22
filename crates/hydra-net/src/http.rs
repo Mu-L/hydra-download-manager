@@ -2634,11 +2634,6 @@ fn redirect_loop(location: &str) -> io::Error {
 /// measured by where the bytes come from rather than by which proxy carries
 /// them. Scheme counts (RFC 6454 §4): an `http` hop is not the `https` origin
 /// that set the cookie, however alike the two addresses read.
-fn same_origin(prev: &Target, tls: bool, host: &str, port: u16) -> bool {
-    let (prev_host, prev_port) = prev.origin_endpoint();
-    tls == prev.tls && port == prev_port && host.eq_ignore_ascii_case(&prev_host)
-}
-
 /// The target a `Location` names, relative to the one that produced it.
 ///
 /// `https` is followed, not refused. It used to be: an absolute TLS `Location`
@@ -2666,7 +2661,7 @@ fn retarget(prev: &Target, location: &str) -> Option<Target> {
             None => (rest, "/"),
         };
         let (host, port) = split_authority(auth, if tls { 443 } else { 80 })?;
-        let mut next = match &prev.origin {
+        let next = match &prev.origin {
             // Through a forward proxy the request stays in absolute form and the
             // proxy does the reaching, so the authority travels as text — and so
             // does the scheme, which `via_proxy` alone would drop, turning a
@@ -2678,11 +2673,10 @@ fn retarget(prev: &Target, location: &str) -> Option<Target> {
             None if tls => Target::direct_tls(&host, port, path),
             None => Target::direct(&host, port, path),
         };
-        if same_origin(prev, tls, &host, port) {
-            next.headers = prev.headers.clone();
-            next.agent = prev.agent.clone();
-        }
-        Some(next)
+        // One rule for what a hop may carry, shared with the probe chains: the
+        // agent and ordinary headers always, the origin's credentials only
+        // while the chain is still on it.
+        Some(next.with_headers_from(prev, prev.headers.clone(), prev.agent.clone()))
     };
     if let Some(rest) = loc.strip_prefix("https://") {
         return absolute(true, rest);
@@ -2713,6 +2707,19 @@ fn unix_now() -> u64 {
 /// rather than reimplementing header parsing or issuing a second request.
 pub fn header_lookup(head: &str, name: &str) -> Option<String> {
     header_value(head, name)
+}
+
+/// Every value of a named header in a raw response head, in the order sent.
+///
+/// Separate from [`header_lookup`] because `Set-Cookie` is the one header a
+/// server routinely repeats, and a lookup that answers with the first would
+/// silently drop every session cookie after it.
+pub fn header_all(head: &str, name: &str) -> Vec<String> {
+    head.split("\r\n")
+        .skip(1)
+        .filter(|l| crate::is_field(l, name))
+        .map(|l| l[name.len() + 1..].trim().to_string())
+        .collect()
 }
 
 pub(crate) fn header_value(head: &str, name: &str) -> Option<String> {
@@ -3681,10 +3688,15 @@ mod retarget_tests {
     /// Host comparison is case-insensitive, port and scheme are part of the
     /// origin. The last two are what stop a cookie set over TLS, or for one
     /// service, from being replayed somewhere it was never issued for.
+    ///
+    /// The agent and an ordinary header go everywhere: they identify the
+    /// client, not the account, and a hop that lost them used to arrive as a
+    /// different program with no `-H` at all.
     #[test]
-    fn only_a_genuinely_same_origin_hop_keeps_them() {
+    fn only_a_genuinely_same_origin_hop_keeps_the_credentials() {
         let mut prev = Target::direct_tls("h.example", 443, "/a");
-        prev.headers = vec!["Cookie: s=1".into()];
+        prev.headers = vec!["Cookie: s=1".into(), "X-Trace: 1".into()];
+        prev.agent = Some("hydra-test/1".into());
         let kept = retarget(&prev, "https://H.EXAMPLE/b").expect("usable");
         assert_eq!(kept.headers, prev.headers, "the host case is not the host");
         for elsewhere in [
@@ -3693,7 +3705,15 @@ mod retarget_tests {
             "https://other.example/b",
         ] {
             let n = retarget(&prev, elsewhere).expect("usable");
-            assert!(n.headers.is_empty(), "{elsewhere} must not carry them");
+            assert_eq!(
+                n.headers,
+                ["X-Trace: 1"],
+                "{elsewhere} must not carry the cookie"
+            );
+            assert_eq!(
+                n.agent, prev.agent,
+                "{elsewhere} must still know who is asking"
+            );
         }
     }
 
