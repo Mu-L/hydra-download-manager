@@ -572,10 +572,18 @@ pub enum OptTab {
     FileTypes,
     SaveTo,
     Downloads,
+    /// Connection's four sections are four leaves, so the sub-tab row can
+    /// address them the same way it addresses [`OptTab::Proxy`] — and so a
+    /// menu item can deep-link to the one it means rather than to a tab the
+    /// user then has to scroll.
     Connection,
+    Cookies,
+    SpeedLimit,
+    Quota,
     Proxy,
     Sites,
     Extensions,
+    MediaTools,
     Sounds,
 }
 
@@ -7011,7 +7019,7 @@ impl App {
                 self.sync_native_menu();
                 Task::none()
             }
-            MenuAction::SpeedLimitSettings => self.open_options(Some(OptTab::Connection)),
+            MenuAction::SpeedLimitSettings => self.open_options(Some(OptTab::SpeedLimit)),
             MenuAction::Options => self.open_options(None),
             MenuAction::Extensions => self.open_options(Some(OptTab::Extensions)),
             MenuAction::CheckUpdates => {

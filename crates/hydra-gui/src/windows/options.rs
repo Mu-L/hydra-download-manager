@@ -519,41 +519,39 @@ const PAC_LABEL_W: f32 = 80.0;
 const LOGIN_USER_W: f32 = 140.0;
 const LOGIN_PASS_W: f32 = 120.0;
 
-fn connection(app: &App) -> El<'_> {
+/// A selectable row in one of the Connection lists.
+///
+/// The exception list and the speed-profile list are the same shape — a
+/// left-aligned name, a right-aligned value, selected or not — and live on
+/// different sub-tabs, so the shape is a function rather than written twice.
+fn list_row<'a>(
+    name: String,
+    value: String,
+    value_w: f32,
+    selected: bool,
+    on_press: Message,
+) -> El<'a> {
+    button(row![cell(name, Length::Fill), cell(value, value_w)].spacing(6))
+        .padding([1, 2])
+        .width(Length::Fill)
+        .style(theme::btn_row(selected))
+        .on_press(on_press)
+        .into()
+}
+
+fn conn_limits(app: &App) -> El<'_> {
     let s = &app.options.draft;
     let st = &app.options;
     let conn_opts: Vec<usize> = vec![1, 2, 4, 8, 16, 32];
     let mut exc = column![].spacing(2);
     for (i, (server, n)) in s.conn_exceptions.iter().enumerate() {
-        exc = exc.push(
-            button(
-                row![
-                    cell(server.clone(), Length::Fill),
-                    cell(n.to_string(), 70.0),
-                ]
-                .spacing(6),
-            )
-            .padding([1, 2])
-            .width(Length::Fill)
-            .style(theme::btn_row(st.sel_exc == Some(i)))
-            .on_press(o(OptField::ExcSel(i))),
-        );
-    }
-    let mut profiles = column![].spacing(2);
-    for (i, p) in s.speed_profiles.iter().enumerate() {
-        profiles = profiles.push(
-            button(
-                row![
-                    cell(tr(&p.name), Length::Fill),
-                    cell(crate::fmt::limit(p.limit), 90.0),
-                ]
-                .spacing(6),
-            )
-            .padding([1, 2])
-            .width(Length::Fill)
-            .style(theme::btn_row(st.sel_profile == Some(i)))
-            .on_press(o(OptField::ProfileSel(i))),
-        );
+        exc = exc.push(list_row(
+            server.clone(),
+            n.to_string(),
+            70.0,
+            st.sel_exc == Some(i),
+            o(OptField::ExcSel(i)),
+        ));
     }
     column![
         section(tr("Connections and Limits")),
@@ -596,6 +594,15 @@ fn connection(app: &App) -> El<'_> {
             ),
         ]
         .spacing(8),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn conn_cookies(app: &App) -> El<'_> {
+    let s = &app.options.draft;
+    let st = &app.options;
+    column![
         section(tr("Cookies")),
         hinted(
             row![
@@ -616,12 +623,33 @@ fn connection(app: &App) -> El<'_> {
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
-            tr("Reads that browser's own cookie store for downloads you add by hand, \
+            tr(
+                "Reads that browser's own cookie store for downloads you add by hand, \
                 and only for the site being downloaded from. Downloads captured by the \
                 Hydra browser extension already carry the page's cookies and are not \
-                affected. The Add URL dialog names the file it read."),
+                affected. The Add URL dialog names the file it read."
+            ),
         ),
         cookie_status(st),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn conn_speed(app: &App) -> El<'_> {
+    let s = &app.options.draft;
+    let st = &app.options;
+    let mut profiles = column![].spacing(2);
+    for (i, p) in s.speed_profiles.iter().enumerate() {
+        profiles = profiles.push(list_row(
+            tr(&p.name),
+            crate::fmt::limit(p.limit),
+            90.0,
+            st.sel_profile == Some(i),
+            o(OptField::ProfileSel(i)),
+        ));
+    }
+    column![
         section(tr("Speed limiter")),
         // Switch and value share a row. Two rows read no better and this tab
         // has to fit its window without scrolling.
@@ -668,6 +696,15 @@ fn connection(app: &App) -> El<'_> {
             ),
         ]
         .spacing(8),
+    ]
+    .spacing(8)
+    .into()
+}
+
+fn conn_quota(app: &App) -> El<'_> {
+    let s = &app.options.draft;
+    let st = &app.options;
+    column![
         section(tr("Download limits")),
         hinted(
             check(s.dl_limit_enabled, tr("Download limits")).on_toggle(|b| o(OptField::DlLimit(b))),
@@ -1186,14 +1223,23 @@ fn extensions(app: &App) -> El<'_> {
             tr("Not on store yet"),
             None,
         ),
-        section(tr("Media tools")),
-        ffmpeg_row(hya_stream::ffmpeg()),
     ]
     .spacing(10);
     if let Some(el) = portable {
         col = col.push(el);
     }
     col.into()
+}
+
+/// The external tools a download may need after the bytes arrive.
+///
+/// Its own page rather than a section under the browser extensions: ffmpeg is
+/// what remuxes MPEG-TS and merges DASH video with its audio, which has
+/// nothing to do with which browser captured the download.
+fn media_tools(_app: &App) -> El<'_> {
+    column![section(tr("Media tools")), ffmpeg_row(hya_stream::ffmpeg()),]
+        .spacing(10)
+        .into()
 }
 
 /// The file column, header and rows off the same number.
@@ -1243,56 +1289,131 @@ fn sounds(app: &App) -> El<'_> {
     .into()
 }
 
+/// The top-level groups, in order, each holding the pages it owns.
+///
+/// Nine tabs over two rows became four over one plus a row of sub-tabs: the
+/// chrome is the same height, and the hierarchy is stated instead of implied
+/// by a flat list where "Sounds" sat beside "Connection". It is also where a
+/// page contributed by a plugin goes, without a tenth top-level tab and a
+/// third row to hold it.
+///
+/// Every [`OptTab`] must appear exactly once; [`GROUPS`] is the only place
+/// that decides where a page lives, and a test holds it to both halves of
+/// that.
+const GROUPS: &[(&str, &[OptTab])] = &[
+    // "Application", not "General": the group holds the General page, and a
+    // group named after one of its own pages reads as a tab containing itself.
+    ("Application", &[OptTab::General, OptTab::Sounds]),
+    (
+        "Files",
+        &[OptTab::FileTypes, OptTab::SaveTo, OptTab::Downloads],
+    ),
+    (
+        "Connection",
+        &[
+            OptTab::Connection,
+            OptTab::Cookies,
+            OptTab::SpeedLimit,
+            OptTab::Quota,
+            OptTab::Proxy,
+            OptTab::Sites,
+        ],
+    ),
+    ("Extensions", &[OptTab::Extensions, OptTab::MediaTools]),
+];
+
+/// The sub-tab label for one page.
+///
+/// `Connection` reads "Connections" because it is no longer the whole tab —
+/// it is the connection-count page inside the group that carries that name.
+fn leaf_label(t: OptTab) -> &'static str {
+    match t {
+        OptTab::General => "General",
+        OptTab::Sounds => "Sounds",
+        OptTab::FileTypes => "File types",
+        OptTab::SaveTo => "Save to",
+        OptTab::Downloads => "Downloads",
+        OptTab::Connection => "Connections",
+        OptTab::Cookies => "Cookies",
+        OptTab::SpeedLimit => "Speed limiter",
+        OptTab::Quota => "Download limits",
+        OptTab::Proxy => "Proxy / Socks",
+        OptTab::Sites => "Sites Logins",
+        OptTab::Extensions => "Browser extensions",
+        OptTab::MediaTools => "Media tools",
+    }
+}
+
+/// The group holding `cur`, falling back to the first so a page that is
+/// somehow unlisted still draws a window rather than none.
+fn group_of(cur: OptTab) -> &'static (&'static str, &'static [OptTab]) {
+    GROUPS
+        .iter()
+        .find(|(_, pages)| pages.contains(&cur))
+        .unwrap_or(&GROUPS[0])
+}
+
+/// A sub-tab: lighter than [`tab_btn`], so the second row reads as belonging
+/// to the group above it rather than as another bank of tabs.
+fn sub_btn<'a>(label: String, page: OptTab, cur: OptTab) -> El<'a> {
+    button(crate::windows::centered(label, theme::FONT_SIZE - 1.0))
+        .padding([3, 12])
+        .style(theme::btn_tab(page == cur))
+        .on_press(Message::OptTabSet(page))
+        .into()
+}
+
 pub fn view(app: &App) -> El<'_> {
     let cur = app.options.tab;
-    let tabs_top = row![
-        tab_btn(tr("General"), OptTab::General, cur),
-        tab_btn(tr("File types"), OptTab::FileTypes, cur),
-        tab_btn(tr("Save to"), OptTab::SaveTo, cur),
-        tab_btn(tr("Downloads"), OptTab::Downloads, cur),
-        tab_btn(tr("Connection"), OptTab::Connection, cur),
-    ]
-    .spacing(1);
-    let tabs_bottom = row![
-        tab_btn(tr("Proxy / Socks"), OptTab::Proxy, cur),
-        tab_btn(tr("Sites Logins"), OptTab::Sites, cur),
-        tab_btn(tr("Extensions"), OptTab::Extensions, cur),
-        tab_btn(tr("Sounds"), OptTab::Sounds, cur),
-    ]
-    .spacing(1);
+    let (_, pages) = group_of(cur);
+
+    let mut groups = row![].spacing(1);
+    for (name, members) in GROUPS {
+        // A group already open keeps the page the user is on; otherwise
+        // selecting it lands on its first. No second message type: the group
+        // button IS a page button, it just picks which page.
+        let target = if members.contains(&cur) {
+            cur
+        } else {
+            members[0]
+        };
+        groups = groups.push(tab_btn(tr(name), target, cur));
+    }
+    // A group with one page draws no sub-tab row: a single button that is
+    // always selected and goes nowhere is a row of chrome saying nothing. The
+    // pane takes the height instead.
+    let subs: El<'_> = if pages.len() > 1 {
+        let mut r = row![].spacing(6);
+        for page in *pages {
+            r = r.push(sub_btn(tr(leaf_label(*page)), *page, cur));
+        }
+        r.into()
+    } else {
+        iced::widget::space::vertical().height(0.0).into()
+    };
 
     let body: El<'_> = match cur {
         OptTab::General => general(app),
         OptTab::FileTypes => file_types(app),
         OptTab::SaveTo => save_to(app),
         OptTab::Downloads => downloads(app),
-        OptTab::Connection => connection(app),
+        OptTab::Connection => conn_limits(app),
+        OptTab::Cookies => conn_cookies(app),
+        OptTab::SpeedLimit => conn_speed(app),
+        OptTab::Quota => conn_quota(app),
         OptTab::Proxy => proxy(app),
         OptTab::Sites => sites(app),
         OptTab::Extensions => extensions(app),
+        OptTab::MediaTools => media_tools(app),
         OptTab::Sounds => sounds(app),
     };
 
-    // Notebook metaphor: the row holding the selected tab sits adjacent to
-    // the content pane (physically swaps the rows on selection), so the
-    // active tab always joins its page.
-    let active_in_top = matches!(
-        cur,
-        OptTab::General
-            | OptTab::FileTypes
-            | OptTab::SaveTo
-            | OptTab::Downloads
-            | OptTab::Connection
-    );
-    let (first_row, second_row) = if active_in_top {
-        (tabs_bottom, tabs_top)
-    } else {
-        (tabs_top, tabs_bottom)
-    };
+    // The notebook metaphor the two-row bar needed a row swap for now holds by
+    // construction: the sub-tab row is always the one adjacent to the pane.
     container(
         column![
-            first_row,
-            second_row,
+            groups,
+            subs,
             container(scrollable(container(body).padding(14).width(Length::Fill)))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -1320,6 +1441,99 @@ pub fn view(app: &App) -> El<'_> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Every page belongs to exactly one group. A page listed twice would draw
+    /// under whichever group `group_of` found first; a page listed nowhere
+    /// would be unreachable, and `view` would silently fall back to General
+    /// while the menu deep-link still pointed at it.
+    #[test]
+    fn every_page_is_in_exactly_one_group() {
+        const ALL: &[OptTab] = &[
+            OptTab::General,
+            OptTab::FileTypes,
+            OptTab::SaveTo,
+            OptTab::Downloads,
+            OptTab::Connection,
+            OptTab::Cookies,
+            OptTab::SpeedLimit,
+            OptTab::Quota,
+            OptTab::Proxy,
+            OptTab::Sites,
+            OptTab::Extensions,
+            OptTab::MediaTools,
+            OptTab::Sounds,
+        ];
+        for page in ALL {
+            let holding: Vec<&str> = GROUPS
+                .iter()
+                .filter(|(_, pages)| pages.contains(page))
+                .map(|(name, _)| *name)
+                .collect();
+            assert_eq!(holding.len(), 1, "{page:?} is in {holding:?}");
+        }
+        let listed: usize = GROUPS.iter().map(|(_, pages)| pages.len()).sum();
+        assert_eq!(
+            listed,
+            ALL.len(),
+            "GROUPS and ALL disagree on the page list"
+        );
+    }
+
+    #[test]
+    fn a_group_is_found_from_any_page_it_holds() {
+        assert_eq!(group_of(OptTab::Sounds).0, "Application");
+        assert_eq!(group_of(OptTab::SaveTo).0, "Files");
+        assert_eq!(group_of(OptTab::Proxy).0, "Connection");
+        assert_eq!(group_of(OptTab::Quota).0, "Connection");
+        assert_eq!(group_of(OptTab::Extensions).0, "Extensions");
+    }
+
+    /// Opening a group lands on its first page, and re-selecting the group you
+    /// are already in does not throw away the page you are reading.
+    #[test]
+    fn selecting_a_group_keeps_the_page_when_it_is_already_open() {
+        let target = |group: &str, cur: OptTab| {
+            let (_, members) = GROUPS.iter().find(|(n, _)| *n == group).unwrap();
+            if members.contains(&cur) {
+                cur
+            } else {
+                members[0]
+            }
+        };
+        assert_eq!(target("Connection", OptTab::General), OptTab::Connection);
+        assert_eq!(target("Connection", OptTab::Proxy), OptTab::Proxy);
+        assert_eq!(target("Files", OptTab::Proxy), OptTab::FileTypes);
+    }
+
+    /// No two pages may share a label: the sub-tab row is the only thing
+    /// telling them apart, and the group name is not repeated on it.
+    #[test]
+    fn every_page_label_is_distinct() {
+        for (_, pages) in GROUPS {
+            let mut seen: Vec<&str> = pages.iter().map(|p| leaf_label(*p)).collect();
+            let before = seen.len();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), before, "duplicate label in {seen:?}");
+        }
+    }
+
+    /// The group holding the connection pages is named "Connection"; the page
+    /// inside it is "Connections". Close, and deliberately so — but the group
+    /// name must not be reused verbatim as one of its own sub-tabs, which
+    /// would read as a tab containing itself.
+    ///
+    /// Only groups that actually DRAW a sub-tab row are held to this; a
+    /// one-page group draws none, so `Extensions` holding `Extensions` is
+    /// never rendered as a tab inside itself.
+    #[test]
+    fn no_group_name_is_also_one_of_its_page_labels() {
+        for (name, pages) in GROUPS.iter().filter(|(_, p)| p.len() > 1) {
+            for page in *pages {
+                assert_ne!(leaf_label(*page), *name, "{name} contains itself");
+            }
+        }
+    }
 
     #[test]
     fn the_browser_picker_keeps_the_profile_already_named() {
@@ -1445,6 +1659,67 @@ mod tests {
     fn both_states_of_the_row_lay_out() {
         let _found: El<'_> = ffmpeg_row(Some("/usr/local/bin/ffmpeg".into()));
         let _missing: El<'_> = ffmpeg_row(None);
+    }
+
+    /// Every page builds, on the group it belongs to.
+    ///
+    /// Splitting one Connection tab into four pages moved four section bodies
+    /// between functions, and a `column![]` that lost a bracket in the move
+    /// takes the whole window down when the user opens it rather than when the
+    /// suite runs. The same reason [`both_states_of_the_row_lay_out`] exists,
+    /// applied to the pages the split created.
+    #[test]
+    fn every_page_lays_out() {
+        let app = App::default();
+        for (_, pages) in GROUPS {
+            for page in *pages {
+                let _built: El<'_> = match page {
+                    OptTab::General => general(&app),
+                    OptTab::FileTypes => file_types(&app),
+                    OptTab::SaveTo => save_to(&app),
+                    OptTab::Downloads => downloads(&app),
+                    OptTab::Connection => conn_limits(&app),
+                    OptTab::Cookies => conn_cookies(&app),
+                    OptTab::SpeedLimit => conn_speed(&app),
+                    OptTab::Quota => conn_quota(&app),
+                    OptTab::Proxy => proxy(&app),
+                    OptTab::Sites => sites(&app),
+                    OptTab::Extensions => extensions(&app),
+                    OptTab::MediaTools => media_tools(&app),
+                    OptTab::Sounds => sounds(&app),
+                };
+            }
+        }
+    }
+
+    /// The whole window builds on every page, sub-tab row and all — including
+    /// the one-page group, where the row is skipped and the two branches of
+    /// that decision are what this walks.
+    #[test]
+    fn the_window_builds_on_every_page() {
+        let mut app = App::default();
+        for (_, pages) in GROUPS {
+            for page in *pages {
+                app.options.tab = *page;
+                let _window: El<'_> = view(&app);
+            }
+        }
+    }
+
+    /// A page whose list has rows lays out too: the exception and profile
+    /// lists are built by a loop that an empty draft never enters.
+    #[test]
+    fn the_connection_lists_lay_out_with_rows_in_them() {
+        let mut app = App::default();
+        app.options.draft.conn_exceptions = vec![("mirror.test".into(), 4)];
+        app.options.sel_exc = Some(0);
+        {
+            let _limits: El<'_> = conn_limits(&app);
+        }
+        app.options.sel_profile = Some(0);
+        {
+            let _speed: El<'_> = conn_speed(&app);
+        }
     }
 
     /// A budget the file name alone cannot meet still shows the file name:
