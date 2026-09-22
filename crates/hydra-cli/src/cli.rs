@@ -480,6 +480,58 @@ pub struct Cli {
     #[arg(skip)]
     pub header_queries: Vec<String>,
 
+    /// Send these cookies: a literal `name=value; name2=value2`, or the path
+    /// of a Netscape `cookies.txt` file (`-b`, curl's `--cookie`).
+    ///
+    /// Which one it is follows curl's rule — an argument containing `=` is a
+    /// cookie string, anything else is a filename — because that is what every
+    /// script already written against `-b` expects.
+    #[arg(short = 'b', long = "cookie", value_name = "DATA|FILE")]
+    pub cookie: Option<String>,
+
+    /// Read cookies from FILE before the first request and write the jar back
+    /// to it at the end (curl's `--cookie-jar`).
+    ///
+    /// Both directions, unlike curl's write-only `-c`: a jar that is read as
+    /// well as written is what makes a rotating session survive between runs,
+    /// which is the whole reason to keep one on disk. `--load-cookies` and
+    /// `--save-cookies` name one direction each when that is what is wanted.
+    #[arg(long = "cookie-jar", value_name = "FILE")]
+    pub cookie_jar: Option<PathBuf>,
+
+    /// Read cookies from FILE and do not write it back (wget's
+    /// `--load-cookies`).
+    #[arg(long = "load-cookies", value_name = "FILE")]
+    pub load_cookies: Option<PathBuf>,
+
+    /// Write the jar to FILE when the transfer finishes (wget's
+    /// `--save-cookies`). Created with owner-only permissions.
+    #[arg(long = "save-cookies", value_name = "FILE")]
+    pub save_cookies: Option<PathBuf>,
+
+    /// Write session cookies to the jar file too (wget's
+    /// `--keep-session-cookies`).
+    ///
+    /// A session cookie is the one a browser would drop on exit, and also the
+    /// one that usually holds the login. Persisting it is a choice rather than
+    /// a default because it writes a live credential to disk.
+    #[arg(long = "keep-session-cookies")]
+    pub keep_session_cookies: bool,
+
+    /// Discard session cookies read from a jar file (wget's
+    /// `--junk-session-cookies`).
+    #[arg(long = "junk-session-cookies")]
+    pub junk_session_cookies: bool,
+
+    /// Take cookies for the host being downloaded from out of a browser's own
+    /// store, e.g. `firefox`, `chrome:Profile 2`, `safari`.
+    ///
+    /// Only that host's cookies are kept; the rest of the profile is discarded
+    /// before the first request, and nothing is written to disk unless
+    /// `--cookie-jar` or `--save-cookies` also asked for it.
+    #[arg(long = "cookies-from-browser", value_name = "BROWSER[:PROFILE]")]
+    pub cookies_from_browser: Option<String>,
+
     /// User-Agent to send (`-U`).
     #[arg(
         short = 'U',

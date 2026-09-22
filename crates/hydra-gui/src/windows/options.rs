@@ -398,6 +398,111 @@ fn quota_line(app: &App) -> String {
     )
 }
 
+/// The picker's entry for "do not read cookies from a browser".
+///
+/// Public because `App::update` compares against it: the picker speaks labels
+/// and the setting stores a `BROWSER[:PROFILE]` string, so exactly one value
+/// has to mean "off" and both sides must agree which.
+pub const COOKIES_OFF: &str = "Do not";
+
+/// Every browser the picker offers, taken from the library rather than listed
+/// here so a browser added there shows up without a second edit.
+fn cookie_browsers() -> Vec<String> {
+    std::iter::once(tr(COOKIES_OFF))
+        .chain(
+            hya_net::cookies::browser::Browser::ALL
+                .iter()
+                .map(|b| b.name().to_string()),
+        )
+        .collect()
+}
+
+fn cookie_browser(s: &crate::model::Settings) -> String {
+    match s.cookies_from_browser.split(':').next().unwrap_or("") {
+        "" => tr(COOKIES_OFF),
+        b => b.to_string(),
+    }
+}
+
+fn cookie_profile(s: &crate::model::Settings) -> &str {
+    s.cookies_from_browser
+        .split_once(':')
+        .map(|(_, p)| p)
+        .unwrap_or("")
+}
+
+/// The setting after the browser picker moved to `label`, keeping whatever
+/// profile was already named.
+///
+/// Both halves of the setting are edited by separate controls but stored as one
+/// `BROWSER[:PROFILE]` string, so each edit has to rebuild the whole thing. A
+/// pure function rather than two arms of the options handler because getting
+/// `chrome:Profile 2` back out of "the user just changed the browser" is the
+/// part that can be wrong, and it is testable on its own.
+pub fn with_browser(current: &str, label: &str) -> String {
+    if label == tr(COOKIES_OFF) || label.is_empty() {
+        return String::new();
+    }
+    match current.split_once(':') {
+        Some((_, profile)) if !profile.trim().is_empty() => format!("{label}:{profile}"),
+        _ => label.to_string(),
+    }
+}
+
+/// The setting after the profile box was edited. With no browser chosen there
+/// is nothing for a profile to be a profile OF, so it stays empty.
+pub fn with_profile(current: &str, profile: &str) -> String {
+    let browser = current.split(':').next().unwrap_or("");
+    match (browser.is_empty(), profile.trim().is_empty()) {
+        (true, _) => String::new(),
+        (false, true) => browser.to_string(),
+        (false, false) => format!("{browser}:{}", profile.trim()),
+    }
+}
+
+/// What the chosen browser's store turned out to be, or why it could not be
+/// read.
+///
+/// Answered when the browser is PICKED, not when a download needs it: the
+/// common failure is a permission the user has to grant somewhere else
+/// entirely, and discovering that one download at a time is discovering it in
+/// the wrong place.
+fn cookie_status(st: &crate::app::OptionsState) -> crate::app::El<'_> {
+    if st.cookie_checking {
+        return indented(
+            text(tr("Checking..."))
+                .size(theme::FONT_SIZE - 1.0)
+                .color(theme::dim_text(&iced::Theme::Light)),
+        );
+    }
+    match &st.cookie_check {
+        Some(Ok(path)) => indented(
+            text(format!("{} {path}", tr("Will read")))
+                .size(theme::FONT_SIZE - 1.0)
+                .color(theme::dim_text(&iced::Theme::Light)),
+        ),
+        Some(Err(why)) => indented(
+            text(why.clone())
+                .size(theme::FONT_SIZE - 1.0)
+                .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B)),
+        ),
+        None => iced::widget::space::horizontal().height(0.0).into(),
+    }
+}
+
+/// A line under the row above it, lined up with that row's fields.
+fn indented<'a>(t: iced::widget::Text<'a, iced::Theme, iced::Renderer>) -> crate::app::El<'a> {
+    row![
+        iced::widget::space::horizontal().width(COOKIE_LABEL_W),
+        t.width(Length::Fill),
+    ]
+    .into()
+}
+
+/// Width of the "Use cookies from" label, so the line under it lines up with
+/// the picker rather than with the window edge.
+const COOKIE_LABEL_W: f32 = 110.0;
+
 /// Height of the Connection tab's two row lists.
 ///
 /// The tab is long enough that its height is a budget, not a free choice: at
@@ -491,6 +596,32 @@ fn connection(app: &App) -> El<'_> {
             ),
         ]
         .spacing(8),
+        section(tr("Cookies")),
+        hinted(
+            row![
+                text(tr("Use cookies from")).size(theme::FONT_SIZE),
+                pick_list(cookie_browsers(), Some(cookie_browser(s)), |b| o(
+                    OptField::CookiesBrowser(b)
+                ))
+                .text_size(theme::FONT_SIZE)
+                .style(theme::picker)
+                .padding([5, 8])
+                .width(150.0),
+                text(tr("Profile")).size(theme::FONT_SIZE),
+                text_input(&tr("default"), cookie_profile(s))
+                    .on_input(|v| o(OptField::CookiesProfile(v)))
+                    .size(theme::FONT_SIZE)
+                    .style(theme::input)
+                    .width(Length::Fill),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            tr("Reads that browser's own cookie store for downloads you add by hand, \
+                and only for the site being downloaded from. Downloads captured by the \
+                Hydra browser extension already carry the page's cookies and are not \
+                affected. The Add URL dialog names the file it read."),
+        ),
+        cookie_status(st),
         section(tr("Speed limiter")),
         // Switch and value share a row. Two rows read no better and this tab
         // has to fit its window without scrolling.
@@ -1189,6 +1320,59 @@ pub fn view(app: &App) -> El<'_> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn the_browser_picker_keeps_the_profile_already_named() {
+        assert_eq!(with_browser("", "firefox"), "firefox");
+        assert_eq!(with_browser("chrome:Profile 2", "edge"), "edge:Profile 2");
+        assert_eq!(with_browser("chrome", "edge"), "edge");
+    }
+
+    #[test]
+    fn choosing_the_off_entry_clears_the_whole_setting() {
+        assert_eq!(with_browser("chrome:Profile 2", &tr(COOKIES_OFF)), "");
+        assert_eq!(with_browser("chrome", ""), "");
+    }
+
+    #[test]
+    fn a_profile_without_a_browser_is_nothing_to_read_from() {
+        assert_eq!(with_profile("", "Profile 2"), "");
+        assert_eq!(with_profile("chrome", "Profile 2"), "chrome:Profile 2");
+        assert_eq!(with_profile("chrome:Profile 2", "  "), "chrome");
+        assert_eq!(with_profile("chrome:Profile 2", " Work "), "chrome:Work");
+    }
+
+    #[test]
+    fn what_is_stored_reads_back_into_the_two_controls() {
+        let mut s = crate::model::Settings::default();
+        assert_eq!(cookie_browser(&s), tr(COOKIES_OFF));
+        assert_eq!(cookie_profile(&s), "");
+
+        s.cookies_from_browser = with_profile(&with_browser("", "chrome"), "Profile 2");
+        assert_eq!(s.cookies_from_browser, "chrome:Profile 2");
+        assert_eq!(cookie_browser(&s), "chrome");
+        assert_eq!(cookie_profile(&s), "Profile 2");
+        // And it is a spelling the library parses, which is the point of
+        // storing one string rather than two fields.
+        assert!(s
+            .cookies_from_browser
+            .parse::<hya_net::cookies::browser::Source>()
+            .is_ok());
+    }
+
+    /// The picker offers every browser the library can read, so adding one
+    /// there does not silently leave the GUI a browser short.
+    #[test]
+    fn the_picker_offers_every_browser_the_library_knows() {
+        let offered = cookie_browsers();
+        assert_eq!(
+            offered.len(),
+            hya_net::cookies::browser::Browser::ALL.len() + 1
+        );
+        for b in hya_net::cookies::browser::Browser::ALL {
+            assert!(offered.iter().any(|o| o == b.name()), "{b} is missing");
+        }
+    }
 
     #[test]
     fn short_paths_are_left_alone() {

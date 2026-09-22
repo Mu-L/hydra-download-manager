@@ -2715,6 +2715,23 @@ pub fn header_lookup(head: &str, name: &str) -> Option<String> {
     header_value(head, name)
 }
 
+/// Every value of a named header in a raw response head, in the order sent.
+///
+/// Separate from [`header_lookup`] because `Set-Cookie` is the one header a
+/// server routinely repeats, and a lookup that answers with the first would
+/// silently drop every session cookie after it.
+pub fn header_all(head: &str, name: &str) -> Vec<String> {
+    head.split("\r\n")
+        .skip(1)
+        .filter(|l| {
+            l.len() > name.len()
+                && l.as_bytes()[name.len()] == b':'
+                && l[..name.len()].eq_ignore_ascii_case(name)
+        })
+        .map(|l| l[name.len() + 1..].trim().to_string())
+        .collect()
+}
+
 pub(crate) fn header_value(head: &str, name: &str) -> Option<String> {
     head.split("\r\n")
         .skip(1)

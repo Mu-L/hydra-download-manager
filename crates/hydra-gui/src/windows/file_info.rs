@@ -289,6 +289,19 @@ pub fn view(app: &App) -> El<'_> {
                 .width(Length::Fill)
                 .into(),
         ));
+        // Where the session came from, never a second copy of it. A download
+        // that works when nothing else does is carrying a bearer credential,
+        // and the user is entitled to know whether it was typed, captured by
+        // the extension, or read out of a browser profile.
+        if let Some(src) = app.item(st.dl).and_then(|d| d.cookie_source.clone()) {
+            rows.push((
+                None,
+                text(src)
+                    .size(theme::FONT_SIZE - 1.0)
+                    .color(theme::dim_text(&iced::Theme::Light))
+                    .into(),
+            ));
+        }
     }
     rows.push((Some(tr("Proxy")), proxy_row(st)));
     if let Some(why) = proxy_problem(st) {

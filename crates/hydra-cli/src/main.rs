@@ -35,6 +35,7 @@ mod cli;
 mod compat;
 mod compat_link;
 mod completions;
+mod cookies;
 mod download;
 mod metalink;
 mod preview;
@@ -807,6 +808,29 @@ async fn async_main() -> std::process::ExitCode {
         }
     }
 
+    // Validated before anything is opened: a browser name that does not exist
+    // is a typo in the command line, and reporting it after a probe has already
+    // gone out is reporting it in the wrong place.
+    let cookie_spec = match cookies::CookieSpec::from_cli(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("hydra: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if cookie_spec.is_some()
+        && args
+            .headers
+            .iter()
+            .any(|h| h.len() > 7 && h[..7].eq_ignore_ascii_case("cookie:"))
+        && !args.quiet
+    {
+        eprintln!(
+            "hydra: both a cookie flag and -H 'Cookie: ...' were given; the jar wins, \
+             because a jar and a fixed header are two answers to the same question"
+        );
+    }
+
     match no_save_digest_notice(&args) {
         Ok(None) => {}
         Ok(Some(note)) => {
@@ -822,6 +846,7 @@ async fn async_main() -> std::process::ExitCode {
 
     let job = download::Job {
         ticks: None,
+        cookies: cookie_spec,
         // `multi` implies at least two, so indexing is safe there; the other
         // arm takes the whole list, which a `--metalink` run leaves empty until
         // `with_metalink` fills it in from the document.

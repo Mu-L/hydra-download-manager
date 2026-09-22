@@ -645,9 +645,17 @@ async fn resolve_link(
     headers: &[String],
     route: &Route,
 ) -> Option<(String, Probe)> {
+    // The address asked for, kept for the whole chain: `headers` carry this
+    // download's login and cookies, and a hop off this origin is not entitled
+    // to them.
+    let first = target_via(route.http(), &parse_url(&url).ok()?, Vec::new(), user_agent);
     for _ in 0..10 {
         let u = parse_url(&url).ok()?;
-        let t = target_via(route.http(), &u, headers.to_vec(), user_agent);
+        let t = target_via(route.http(), &u, Vec::new(), user_agent).with_headers_from(
+            &first,
+            headers.to_vec(),
+            Some(user_agent.to_string()),
+        );
         let p = probe_resilient(connector, &t).await.ok()?;
         if p.is_redirect() {
             url = join_url(&u, p.location.as_deref().unwrap_or(""))?;
@@ -1199,6 +1207,61 @@ fn base64(data: &[u8]) -> String {
         });
     }
     out
+}
+
+/// Whether a `BROWSER[:PROFILE]` setting can actually be read, and from where.
+///
+/// Returns the store path on success. Off the UI thread for the same reason
+/// [`import_cookies`] is, and like it, this is the consent line's source: the
+/// user is shown the exact file before any download uses it.
+pub async fn check_cookie_source(spec: String) -> Result<String, String> {
+    let source: hya_net::cookies::browser::Source = spec.parse().map_err(|e| format!("{e}"))?;
+    tokio::task::spawn_blocking(move || {
+        hya_net::cookies::browser::check(&source)
+            .map(|p| p.display().to_string())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("cookie check did not finish: {e}"))?
+}
+
+/// Import a browser's cookies for the host `url` names.
+///
+/// Returns the `Cookie:` header value and a one-line description of where it
+/// came from, which Properties shows and the Add URL dialog prints under the
+/// field. The description is the consent line: a download manager reading a
+/// browser's keychain without saying so is indistinguishable from malware.
+///
+/// Off the UI thread, deliberately. On macOS the key lives in the Keychain and
+/// asking for it can put a system dialog in front of the user; doing that from
+/// the update loop would freeze the window behind it.
+pub async fn import_cookies(spec: String, url: String) -> Result<(String, String), String> {
+    let source: hya_net::cookies::browser::Source = spec.parse().map_err(|e| format!("{e}"))?;
+    let host = crate::engine::parse_url(&url)?.host;
+    tokio::task::spawn_blocking(move || {
+        let now = hya_net::cookies::now_secs();
+        let import =
+            hya_net::cookies::browser::load(&source, &host, now).map_err(|e| e.to_string())?;
+        let header = import
+            .jar
+            .header_value(&host, "/", true, now)
+            .unwrap_or_default();
+        let mut why = format!(
+            "{} — {} cookie(s) for {host} from {}",
+            source.browser,
+            import.jar.len(),
+            import.store.display()
+        );
+        if import.undecryptable > 0 {
+            why.push_str(&format!(
+                " ({} could not be decrypted)",
+                import.undecryptable
+            ));
+        }
+        Ok((header, why))
+    })
+    .await
+    .map_err(|e| format!("cookie import did not finish: {e}"))?
 }
 
 /// The request headers a download's credentials turn into: HTTP Basic for a

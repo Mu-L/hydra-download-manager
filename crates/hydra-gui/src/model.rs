@@ -62,9 +62,19 @@ pub struct DownloadItem {
     /// HTTP basic credentials from "Use authorization".
     pub auth: Option<(String, String)>,
     /// Cookie header value for sites that gate downloads behind a session
-    /// (filled manually or, later, by the browser extension).
+    /// (filled manually, by the browser extension, or imported from a
+    /// browser's own store).
     #[serde(default)]
     pub cookies: Option<String>,
+    /// Where `cookies` came from, for Properties to show.
+    ///
+    /// A cookie is a bearer credential, and a user looking at a download that
+    /// works when nothing else does is entitled to know whether it is carrying
+    /// something they typed, something the extension captured, or something
+    /// read out of their browser's profile. The DESCRIPTION is stored, never a
+    /// second copy of the value.
+    #[serde(default)]
+    pub cookie_source: Option<String>,
     /// `Referer:` header value for a hotlink-protected origin: the page the
     /// browser was on when the extension captured this file. Sites that gate
     /// their CDN on it answer `403` to a request without it, however good the
@@ -1009,6 +1019,15 @@ pub struct Settings {
     pub virus_scanner: String,
     pub virus_args: String,
     // Connection tab
+    /// `BROWSER[:PROFILE]` to read cookies from for downloads added by hand,
+    /// empty for none. The same spelling the CLI's `--cookies-from-browser`
+    /// takes, parsed by the same code, so the two cannot drift.
+    ///
+    /// Captures from the browser extension are unaffected: they already carry
+    /// the exact cookies the page was using, which is better evidence than
+    /// anything a profile scan can produce.
+    #[serde(default)]
+    pub cookies_from_browser: String,
     pub default_conns: usize,
     /// Measure-and-adapt connection count: the transfer starts at ONE
     /// connection and the in-band ramp (`hya_core::ramp`) admits more only
@@ -1123,6 +1142,7 @@ impl Default for Settings {
             remove_completed: false,
             select_in_file_manager: true,
             user_agent: format!("hydra-gui/{}", env!("CARGO_PKG_VERSION")),
+            cookies_from_browser: String::new(),
             virus_scanner: String::new(),
             virus_args: String::new(),
             // Default: 8 connections; the scheduler settles well at this

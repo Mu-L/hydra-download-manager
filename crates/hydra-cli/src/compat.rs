@@ -423,15 +423,16 @@ fn map_long(p: Personality, name: &str, take: &mut dyn FnMut(bool) -> Option<Str
             "--{name}: hydra is a downloader; it only issues GET and HEAD. \
              Use curl for request bodies and other methods."
         )),
-        "cookie"
-        | "cookie-jar"
-        | "load-cookies"
-        | "save-cookies"
-        | "keep-session-cookies"
-        | "junk-session-cookies" => Map::Reject(format!(
-            "--{name}: cookies are not implemented. Pass a session cookie explicitly \
-             with --header 'Cookie: ...' if a mirror requires one."
-        )),
+        // Cookies: the six flags are native, and both dialects spell them the
+        // same way. curl's `--cookie-jar` is write-only where hydra's also
+        // reads; that is a widening, so a script written against curl still
+        // gets the file it asked for.
+        "cookie" => kv!("cookie", "cookie"),
+        "cookie-jar" => kv!("cookie-jar", "cookie-jar"),
+        "load-cookies" => kv!("load-cookies", "load-cookies"),
+        "save-cookies" => kv!("save-cookies", "save-cookies"),
+        "keep-session-cookies" => bare!("keep-session-cookies"),
+        "junk-session-cookies" => bare!("junk-session-cookies"),
         "user" | "password" | "http-user" | "http-password" | "ftp-user" | "ftp-password"
         | "proxy-user" | "proxy-password" | "ask-password" | "netrc" | "digest" | "ntlm"
         | "negotiate" | "anyauth" | "basic" | "oauth2-bearer" | "aws-sigv4" => {
@@ -568,10 +569,9 @@ fn map_short(p: Personality, ch: char, take: &mut dyn FnMut(bool) -> Option<Stri
                 let _ = take(matches!(ch, 'u' | 'U' | 'E'));
                 Map::Reject(format!("-{ch}: authentication is not implemented"))
             }
-            'b' | 'c' | 'j' => {
-                let _ = take(matches!(ch, 'b' | 'c'));
-                Map::Reject(format!("-{ch}: cookies are not implemented"))
-            }
+            'b' => kv!("cookie", 'b'),
+            'c' => kv!("cookie-jar", 'c'),
+            'j' => bare!("junk-session-cookies"),
             'q' => Map::Inert("there is no .curlrc to disable"),
             'N' => Map::Inert("output is not buffered in a way this would change"),
             other => Map::Reject(format!("-{other}: not a curl option hydra recognises")),
@@ -863,7 +863,6 @@ mod tests {
             (Personality::Wget, vec!["--recursive", "http://x/"], "crawl"),
             (Personality::Curl, vec!["-d", "a=b", "http://x/"], "GET"),
             (Personality::Curl, vec!["--data", "a=b", "http://x/"], "GET"),
-            (Personality::Curl, vec!["-b", "k=v", "http://x/"], "ookies"),
             (Personality::Wget, vec!["--post-data=x", "http://x/"], "GET"),
             (
                 Personality::Curl,
@@ -878,6 +877,58 @@ mod tests {
                 p,
                 args
             );
+        }
+    }
+
+    /// The six cookie flags used to be six `Map::Reject` arms, which is what
+    /// made `wget --load-cookies cookies.txt` fail at the argument parser
+    /// before anything was attempted.
+    #[test]
+    fn the_cookie_flags_translate_in_both_dialects() {
+        for (p, args, want) in [
+            (
+                Personality::Curl,
+                vec!["-b", "k=v", "http://x/"],
+                vec!["--cookie", "k=v"],
+            ),
+            (
+                Personality::Curl,
+                vec!["-c", "jar.txt", "http://x/"],
+                vec!["--cookie-jar", "jar.txt"],
+            ),
+            (
+                Personality::Curl,
+                vec!["-j", "http://x/"],
+                vec!["--junk-session-cookies"],
+            ),
+            (
+                Personality::Wget,
+                vec!["--load-cookies", "c.txt", "http://x/"],
+                vec!["--load-cookies", "c.txt"],
+            ),
+            (
+                Personality::Wget,
+                vec![
+                    "--save-cookies",
+                    "c.txt",
+                    "--keep-session-cookies",
+                    "http://x/",
+                ],
+                vec!["--save-cookies", "c.txt", "--keep-session-cookies"],
+            ),
+        ] {
+            let (out, _) = canonicalize(p, &s(&args)).expect("cookies are supported now");
+            for w in &want {
+                assert!(
+                    out.iter().any(|a| a == w),
+                    "{args:?} -> {out:?}, want {w:?}"
+                );
+            }
+            let full: Vec<String> = std::iter::once("hydra".to_string())
+                .chain(out.iter().cloned())
+                .collect();
+            crate::cli::Cli::try_parse_from(&full)
+                .unwrap_or_else(|e| panic!("{out:?} is not parseable: {e}"));
         }
     }
 

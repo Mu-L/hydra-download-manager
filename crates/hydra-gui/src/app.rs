@@ -335,6 +335,14 @@ pub struct AddUrlState {
     pub metalink_of: String,
     pub metalink_probing: bool,
     pub metalink_error: Option<String>,
+    /// The address whose cookies were imported, so an edited one re-imports
+    /// rather than carrying the previous site's session to a new host.
+    pub cookies_of: String,
+    pub cookies_importing: bool,
+    /// One line naming the store the cookies were read from, or why they
+    /// could not be. Shown under the field, which is what makes the import
+    /// something the user is told about rather than something that happens.
+    pub cookie_note: Option<String>,
 }
 
 /// Height the Add URL dialog must reserve for the mirror-list panel.
@@ -388,6 +396,9 @@ pub struct PendingAdd {
 pub struct CaptureExtras {
     /// Cookie header the extension assembled for this URL.
     pub cookies: Option<String>,
+    /// Where `cookies` came from, in one line, for Properties to show. The
+    /// description travels rather than a second copy of the value.
+    pub cookie_source: Option<String>,
     /// Filename the browser had already resolved (Content-Disposition et
     /// al.) — better than what the URL path implies.
     pub name: Option<String>,
@@ -405,6 +416,7 @@ impl CaptureExtras {
         let take = |v: &mut Option<String>| v.take().filter(|s| !s.is_empty());
         Self {
             cookies: take(&mut self.cookies),
+            cookie_source: take(&mut self.cookie_source),
             name: take(&mut self.name),
             referer: take(&mut self.referer),
             proxy: take(&mut self.proxy),
@@ -597,6 +609,15 @@ pub struct OptionsState {
     pub sel_exc: Option<usize>,
     pub conn_exc_server: String,
     pub conn_exc_n: String,
+    /// Whether the chosen browser's cookie store can actually be read, and
+    /// which file it is — or why not.
+    ///
+    /// Asked when the browser is PICKED rather than when a download needs it:
+    /// on macOS every browser profile is behind the system privacy control, so
+    /// a picker that accepted a browser and then failed on every address would
+    /// be reporting a configuration problem as a download problem.
+    pub cookie_check: Option<Result<String, String>>,
+    pub cookie_checking: bool,
     /// Text buffers for the Download-limit numbers. The draft holds `u64`,
     /// and binding an input straight to `n.to_string()` makes the field
     /// un-clearable: an empty string fails to parse, the commit is skipped
@@ -635,6 +656,8 @@ impl Default for OptionsState {
             sel_exc: None,
             conn_exc_server: String::new(),
             conn_exc_n: String::new(),
+            cookie_check: None,
+            cookie_checking: false,
             dl_limit_mb_txt: String::new(),
             dl_limit_hours_txt: String::new(),
             speed_limit_kb_txt: String::new(),
@@ -1236,6 +1259,15 @@ pub enum Message {
     AddrAuthToggled(bool),
     AddrLogin(String),
     AddrPass(String),
+    /// The Cookies field, typed by hand.
+    AddrCookies(String),
+    /// Options > Connection names a browser: read that host's cookies out of
+    /// it while the dialog is open, so pressing OK starts a download that
+    /// already carries the session.
+    AddrImportCookies,
+    AddrCookiesImported(Box<Result<(String, String), String>>),
+    /// Whether Options' chosen browser can be read, answered off the executor.
+    OptCookieChecked(Box<Result<String, String>>),
     AddUrlOk,
     /// Requests arriving from the browser extension over the extbus socket.
     Ext(crate::extbus::ExtEvent),
@@ -1425,6 +1457,11 @@ pub enum OptField {
     VirusPicked(Option<String>),
     DefaultConns(usize),
     AdaptiveConns(bool),
+    /// Which browser downloads added by hand take their cookies from, as the
+    /// picker's label. The empty label is "do not".
+    CookiesBrowser(String),
+    /// The profile within that browser, blank for its default.
+    CookiesProfile(String),
     ExcSel(usize),
     ExcServer(String),
     ExcConns(String),
@@ -2271,7 +2308,14 @@ impl App {
         if let Some(t) = tab {
             self.options.tab = t;
         }
-        self.open_window(WinKind::Options)
+        // Answered on OPEN as well as on a change: a browser chosen in an
+        // earlier session is the case where "can this still be read?" matters
+        // most, because a profile that moved or a permission that was revoked
+        // would otherwise only show up as failing downloads.
+        Task::batch([
+            self.open_window(WinKind::Options),
+            self.check_cookie_source(),
+        ])
     }
 
     /// Follow the category edits into the download list and the tree.
@@ -2314,9 +2358,25 @@ impl App {
             // for, so the message otherwise runs past the window's bottom.
             WinKind::AddUrl => {
                 // Address row, the authorization tick and its (always drawn)
-                // Login/Password row, the blank line under them, inside the
-                // dialog padding.
-                let mut h = 130.0;
+                // Login/Password row, the Cookies row, the blank line under
+                // them, inside the dialog padding.
+                let mut h = 162.0;
+                // The note under the Cookies field is a real row: without it
+                // the line naming the store the session came from — the one
+                // thing that makes the import something the user was told
+                // about — is drawn below the window's bottom edge.
+                //
+                // TWO lines for a note, one while probing. A store path is
+                // `~/Library/Application Support/Firefox/Profiles/<salt>.default-release/cookies.sqlite`
+                // and its equivalents, which wraps at this width on every
+                // platform — so a second line is the normal case, not the
+                // exception, and reserving one clipped exactly the half of the
+                // path that identifies the profile.
+                if self.add_url.cookies_importing {
+                    h += 22.0;
+                } else if self.add_url.cookie_note.is_some() {
+                    h += 44.0;
+                }
                 let warn = self.add_url.error.is_some()
                     || (!self.add_url.address.trim().is_empty()
                         && site_blocked(
@@ -2373,7 +2433,15 @@ impl App {
                         .and_then(|d| d.error.as_deref())
                         .map(result_row_height)
                         .unwrap_or(0.0);
-                    (680.0, 336.0 + result + proxy)
+                    // The line naming where the cookies came from, and only
+                    // present when there are any. Two lines, for the same
+                    // reason the Add URL dialog reserves two: a browser
+                    // profile path wraps at this width on every platform.
+                    let source = self
+                        .item(dl)
+                        .and_then(|d| d.cookie_source.as_ref())
+                        .map_or(0.0, |_| 48.0);
+                    (680.0, 336.0 + result + proxy + source)
                 }
             }
             // Matches ProgToggleDetails: a box whose details are hidden
@@ -3036,6 +3104,7 @@ impl App {
             q_order,
             auth,
             cookies: None,
+            cookie_source: None,
             referer: None,
             speed_limit: None,
             limit_paused: false,
@@ -4711,7 +4780,16 @@ impl App {
                     self.add_url.metalink = None;
                     self.add_url.metalink_error = None;
                 }
-                let resize = self.resize_open(WinKind::AddUrl);
+                let mut tasks = vec![self.resize_open(WinKind::AddUrl)];
+                // A new address is a new host, and a session belongs to the
+                // host that issued it: re-import rather than carry the
+                // previous site's cookies across.
+                if !self.cfg.settings.cookies_from_browser.trim().is_empty()
+                    && self.add_url.cookies_of != addr
+                    && !addr.is_empty()
+                {
+                    tasks.push(self.update(Message::AddrImportCookies));
+                }
                 // A mirror list reads itself for the same reason a manifest
                 // does: it decides how many files are about to be added and
                 // what they will be called, and a user should see that before
@@ -4720,18 +4798,62 @@ impl App {
                     && !self.add_url.metalink_probing
                     && self.add_url.metalink_of != addr
                 {
-                    return Task::batch([resize, self.update(Message::AddrProbeMetalink)]);
-                }
-                // Automatic: a manifest address inspects itself, so the user
-                // is choosing a quality rather than discovering afterwards
-                // that they could have.
-                if manifest_address(&addr)
+                    tasks.push(self.update(Message::AddrProbeMetalink));
+                } else if manifest_address(&addr)
+                    // Automatic: a manifest address inspects itself, so the
+                    // user is choosing a quality rather than discovering
+                    // afterwards that they could have.
                     && !self.add_url.stream_probing
                     && self.add_url.stream_of != addr
                 {
-                    return Task::batch([resize, self.update(Message::AddrProbeStream)]);
+                    tasks.push(self.update(Message::AddrProbeStream));
                 }
-                resize
+                Task::batch(tasks)
+            }
+            Message::AddrCookies(v) => {
+                let v = v.trim().to_string();
+                self.add_url.capture.cookies = (!v.is_empty()).then(|| v.clone());
+                // Typed beats imported, and says so: the note under the field
+                // would otherwise keep crediting a browser for a value the
+                // user has since replaced.
+                self.add_url.capture.cookie_source =
+                    (!v.is_empty()).then(|| crate::i18n::tr("typed in the Add URL dialog"));
+                self.add_url.cookie_note = None;
+                Task::none()
+            }
+            Message::AddrImportCookies => {
+                let url = self.add_url.address.trim().to_string();
+                let spec = self.cfg.settings.cookies_from_browser.trim().to_string();
+                if url.is_empty() || spec.is_empty() || self.add_url.cookies_importing {
+                    return Task::none();
+                }
+                self.add_url.cookies_importing = true;
+                self.add_url.cookies_of = url.clone();
+                self.add_url.cookie_note = None;
+                Task::perform(crate::engine::import_cookies(spec, url), |r| {
+                    Message::AddrCookiesImported(Box::new(r))
+                })
+            }
+            Message::AddrCookiesImported(result) => {
+                self.add_url.cookies_importing = false;
+                match *result {
+                    // An empty header means the browser simply holds nothing
+                    // for this host. That is an answer, not a failure, and
+                    // overwriting a typed value with it would be a loss.
+                    Ok((header, why)) if !header.is_empty() => {
+                        self.add_url.capture.cookies = Some(header);
+                        self.add_url.capture.cookie_source = Some(why.clone());
+                        self.add_url.cookie_note = Some(why);
+                    }
+                    Ok((_, why)) => self.add_url.cookie_note = Some(why),
+                    Err(e) => self.add_url.cookie_note = Some(e),
+                }
+                self.resize_open(WinKind::AddUrl)
+            }
+            Message::OptCookieChecked(result) => {
+                self.options.cookie_checking = false;
+                self.options.cookie_check = Some(*result);
+                self.resize_open(WinKind::Options)
             }
             Message::AddrProbeStream => {
                 let url = self.add_url.address.trim().to_string();
@@ -5009,6 +5131,7 @@ impl App {
                         address: dl.url,
                         capture: CaptureExtras {
                             cookies: dl.cookies,
+                            cookie_source: None,
                             name: dl.filename,
                             referer: dl.referer,
                             proxy: dl.proxy,
@@ -5278,8 +5401,15 @@ impl App {
                     }
                     d.auth =
                         (!fi.login.is_empty()).then(|| (fi.login.clone(), fi.password.clone()));
-                    d.cookies =
-                        (!fi.cookies.trim().is_empty()).then(|| fi.cookies.trim().to_string());
+                    let typed = fi.cookies.trim();
+                    // An edited value is the user's, whatever it was before:
+                    // leaving the old attribution would credit a browser for
+                    // a session they replaced by hand.
+                    if d.cookies.as_deref().unwrap_or("") != typed {
+                        d.cookie_source =
+                            (!typed.is_empty()).then(|| crate::i18n::tr("edited in Properties"));
+                    }
+                    d.cookies = (!typed.is_empty()).then(|| typed.to_string());
                     d.proxy = new_proxy;
                     was = Some(d.state);
                 }
@@ -7132,6 +7262,26 @@ impl App {
         }
     }
 
+    /// Ask whether the browser Options names can actually be read.
+    ///
+    /// Answered here, when the choice is made, rather than when a download
+    /// needs it: the common failure is a permission the user has to grant
+    /// elsewhere, and finding that out one download at a time is finding it out
+    /// in the wrong place. Does not decrypt, so choosing a Chromium in a
+    /// dropdown cannot put a Keychain prompt on screen.
+    fn check_cookie_source(&mut self) -> Task<Message> {
+        let spec = self.options.draft.cookies_from_browser.trim().to_string();
+        self.options.cookie_check = None;
+        if spec.is_empty() {
+            self.options.cookie_checking = false;
+            return Task::none();
+        }
+        self.options.cookie_checking = true;
+        Task::perform(crate::engine::check_cookie_source(spec), |r| {
+            Message::OptCookieChecked(Box::new(r))
+        })
+    }
+
     fn on_opt_field(&mut self, f: OptField) -> Task<Message> {
         // Editor actions first: they need `self.options` whole.
         match f {
@@ -7235,6 +7385,18 @@ impl App {
             OptField::VirusPicked(None) => {}
             OptField::DefaultConns(n) => s.default_conns = n,
             OptField::AdaptiveConns(b) => s.adaptive_conns = b,
+            // Stored as the one `BROWSER[:PROFILE]` string the CLI parses, so
+            // the two surfaces cannot disagree about what a profile is.
+            OptField::CookiesBrowser(name) => {
+                s.cookies_from_browser =
+                    crate::windows::options::with_browser(&s.cookies_from_browser, &name);
+                return self.check_cookie_source();
+            }
+            OptField::CookiesProfile(v) => {
+                s.cookies_from_browser =
+                    crate::windows::options::with_profile(&s.cookies_from_browser, &v);
+                return self.check_cookie_source();
+            }
             OptField::ExcSel(i) => {
                 self.options.sel_exc = Some(i);
                 if let Some((server, n)) = self.options.draft.conn_exceptions.get(i) {
@@ -7686,6 +7848,14 @@ fn write_capture_extras(
 ) {
     if let Some(c) = extras.cookies {
         d.cookies = Some(c);
+        // An extension capture carries no description of its own; saying where
+        // it came from is the point of the field, so it gets the one true
+        // thing known about it rather than nothing.
+        d.cookie_source = Some(
+            extras
+                .cookie_source
+                .unwrap_or_else(|| crate::i18n::tr("captured by the browser extension")),
+        );
     }
     if let Some(r) = extras.referer {
         d.referer = Some(r);
@@ -8957,6 +9127,7 @@ mod tests {
             q_order: 0,
             auth: None,
             cookies: None,
+            cookie_source: None,
             referer: None,
             speed_limit: None,
             limit_paused: false,
@@ -9257,6 +9428,7 @@ mod tests {
     fn a_capture_says_nothing_rather_than_saying_nothing_twice() {
         let mut extras = CaptureExtras {
             cookies: Some("sid=abc".into()),
+            cookie_source: None,
             name: Some(String::new()),
             referer: None,
             proxy: Some(String::new()),
@@ -9283,6 +9455,7 @@ mod tests {
             &mut d,
             CaptureExtras {
                 cookies: Some("sid=abc".into()),
+                cookie_source: None,
                 name: Some("Setup.exe".into()),
                 referer: Some("https://page.example/".into()),
                 proxy: Some("socks5://127.0.0.1:10808".into()),

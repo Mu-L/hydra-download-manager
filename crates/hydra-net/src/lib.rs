@@ -43,6 +43,7 @@
 //! Vectorized paths are covered by differential tests against scalar references,
 //! maintaining safety and high performance across architectures.
 
+pub mod cookies;
 pub mod digest;
 pub mod framebuf;
 pub mod ftp;
@@ -154,6 +155,21 @@ fn encode_request_target(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Request headers that authenticate the request to ONE origin, and so may not
+/// follow a redirect off it.
+///
+/// The set the Fetch standard strips on a cross-origin redirect, less the
+/// response-only names. `Cookie` is here for a header written out by hand;
+/// a jar scopes its own (see [`Target::with_jar`]).
+const ORIGIN_CREDENTIALS: &[&str] = &["authorization", "proxy-authorization", "cookie"];
+
+/// A verbatim `Name: value` header line names this field.
+fn is_field(line: &str, name: &str) -> bool {
+    line.len() > name.len()
+        && line.as_bytes()[name.len()] == b':'
+        && line[..name.len()].eq_ignore_ascii_case(name)
+}
+
 #[derive(Clone, Debug)]
 pub struct Target {
     /// Host to CONNECT the socket to. For a direct fetch this is the origin; for
@@ -249,6 +265,77 @@ impl Target {
     pub fn with_headers(mut self, headers: Vec<String>, agent: Option<String>) -> Self {
         self.headers = headers;
         self.agent = agent;
+        self
+    }
+
+    /// Attach `headers` and `agent` to a target a redirect chain reached from
+    /// `source`, dropping the ones that authenticate `source` rather than this
+    /// address.
+    ///
+    /// `source` is the address the USER named — the start of the chain, not the
+    /// previous hop. That is what makes `a -> b -> a` restore at `a` what it
+    /// dropped at `b`, and it is the rule curl follows for the same reason: the
+    /// credential was typed for `a`, so leaving `a` is what revokes it and
+    /// returning is what makes it applicable again.
+    ///
+    /// Ordinary headers and the `User-Agent` survive every hop. A hop that
+    /// leaves the origin drops [`ORIGIN_CREDENTIALS`]: a bearer token typed for
+    /// one host must not be handed to whatever that host redirects to, and a
+    /// `https -> http` hop must not put it on the wire in the clear. Cookies
+    /// have their own host-scoped path through [`Target::with_jar`]; the entry
+    /// here is for a `Cookie:` a user wrote out by hand, which nothing else
+    /// would scope.
+    pub fn with_headers_from(
+        self,
+        source: &Target,
+        headers: Vec<String>,
+        agent: Option<String>,
+    ) -> Self {
+        if self.same_origin(source) {
+            return self.with_headers(headers, agent);
+        }
+        let kept = headers
+            .into_iter()
+            .filter(|h| !ORIGIN_CREDENTIALS.iter().any(|name| is_field(h, name)))
+            .collect();
+        self.with_headers(kept, agent)
+    }
+
+    /// Both targets address the same origin: scheme, host and port (RFC 6454).
+    ///
+    /// The ORIGIN, never the socket peer, so two hops through the same forward
+    /// proxy to different sites do not read as one origin. Hosts compare
+    /// case-insensitively because DNS does, and nothing lowercases them on the
+    /// way in.
+    fn same_origin(&self, other: &Target) -> bool {
+        let (a_host, a_port) = self.origin_endpoint();
+        let (b_host, b_port) = other.origin_endpoint();
+        self.tls == other.tls && a_port == b_port && a_host.eq_ignore_ascii_case(&b_host)
+    }
+
+    /// Attach the `Cookie:` header this jar produces for THIS target.
+    ///
+    /// The host is read off the target rather than passed in, and it is the
+    /// ORIGIN host, never the proxy the socket connects to. That is the
+    /// security boundary made structural: there is no argument a caller
+    /// following a redirect could get wrong, because the only host in scope is
+    /// the one the request is about to go to.
+    ///
+    /// A jar with something to say REPLACES any `Cookie:` already attached,
+    /// including one from `-H`: the two are answers to the same question and
+    /// only one can go on the wire. Calling this again after a redirect is
+    /// therefore correct rather than cumulative.
+    ///
+    /// A jar with nothing for this host changes nothing. That is what keeps a
+    /// run with no cookie flag byte-identical — every target is built through
+    /// here, and an empty jar that stripped the header would silently delete
+    /// the `-H 'Cookie: …'` that was the only way to do this before.
+    pub fn with_jar(mut self, jar: &crate::cookies::CookieJar, now: u64) -> Self {
+        let (host, _) = self.origin_endpoint();
+        if let Some(v) = jar.header_value(&host, &self.path, self.tls, now) {
+            self.headers.retain(|h| !is_field(h, "cookie"));
+            self.headers.push(format!("Cookie: {v}"));
+        }
         self
     }
 
@@ -431,9 +518,11 @@ pub mod pool;
 pub mod sink;
 pub mod transfer;
 
+pub use cookies::{Cookie, CookieJar};
+
 pub use http::{
     describe_status, fetch_object, fetch_range_retry, fetch_small, fetch_small_range,
-    fetch_streaming, fetch_streaming_observed, header_lookup, probe, probe_resilient,
+    fetch_streaming, fetch_streaming_observed, header_all, header_lookup, probe, probe_resilient,
     probe_size_via_range, probe_via_get, Probe, Redirect,
 };
 pub use redirect::{html_redirect, html_redirect_target};
@@ -448,3 +537,243 @@ pub use metalink::{MetaUrl, Metalink, MetalinkFile};
 
 pub use socks::{Proxy, ProxyKind};
 pub use tls::{connect_family, IpFamily, MaybeTls, TlsCapableConnector};
+
+#[cfg(test)]
+mod target_jar_tests {
+    use super::*;
+    use crate::cookies::CookieJar;
+
+    fn cookie_headers(t: &Target) -> Vec<&str> {
+        t.headers
+            .iter()
+            .filter(|h| is_field(h, "cookie"))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The header is derived from the target's OWN host, so a caller following
+    /// a redirect cannot hand the previous hop's session to the next one.
+    #[test]
+    fn a_jar_answers_for_the_host_the_request_is_going_to() {
+        let mut jar = CookieJar::new();
+        jar.add_pairs("sid=abc", "files.example.org");
+
+        let hit = Target::direct_tls("files.example.org", 443, "/x").with_jar(&jar, 0);
+        assert_eq!(cookie_headers(&hit), ["Cookie: sid=abc"]);
+
+        let miss = Target::direct_tls("other.test", 443, "/x").with_jar(&jar, 0);
+        assert!(cookie_headers(&miss).is_empty());
+    }
+
+    /// Through a proxy the socket connects to the proxy while the cookies
+    /// belong to the origin. Keying on `host` would send one site's session to
+    /// every site reached through the same proxy.
+    #[test]
+    fn a_proxied_target_is_answered_for_its_origin_not_its_proxy() {
+        let mut jar = CookieJar::new();
+        jar.add_pairs("sid=abc", "origin.example.org");
+        let t =
+            Target::via_proxy("proxy.test", 8080, "origin.example.org:80", "/x").with_jar(&jar, 0);
+        assert_eq!(cookie_headers(&t), ["Cookie: sid=abc"]);
+
+        jar = CookieJar::new();
+        jar.add_pairs("leak=1", "proxy.test");
+        let t =
+            Target::via_proxy("proxy.test", 8080, "origin.example.org:80", "/x").with_jar(&jar, 0);
+        assert!(cookie_headers(&t).is_empty());
+    }
+
+    /// An empty jar must not touch the headers. Every target is built through
+    /// `with_jar`, so stripping here would delete the `-H 'Cookie: …'` that was
+    /// the only way to send a session before the jar existed.
+    #[test]
+    fn an_empty_jar_leaves_an_explicit_header_alone() {
+        let t = Target::direct("example.org", 80, "/")
+            .with_headers(vec!["Cookie: typed=1".into()], None)
+            .with_jar(&CookieJar::new(), 0);
+        assert_eq!(cookie_headers(&t), ["Cookie: typed=1"]);
+    }
+
+    #[test]
+    fn a_jar_with_something_to_say_replaces_the_explicit_header_exactly_once() {
+        let mut jar = CookieJar::new();
+        jar.add_pairs("sid=fromjar", "example.org");
+        let t = Target::direct("example.org", 80, "/")
+            .with_headers(vec!["Cookie: typed=1".into(), "X-Trace: 1".into()], None)
+            .with_jar(&jar, 0)
+            .with_jar(&jar, 0);
+        assert_eq!(cookie_headers(&t), ["Cookie: sid=fromjar"]);
+        assert!(t.headers.iter().any(|h| h == "X-Trace: 1"));
+    }
+
+    /// A `Secure` cookie is withheld from a plaintext target, which is the one
+    /// property of the jar that depends on how the target connects.
+    #[test]
+    fn tls_decides_whether_a_secure_cookie_is_attached() {
+        let mut jar = CookieJar::new();
+        jar.store_response(
+            "HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc; Secure\r\n\r\n",
+            "example.org",
+            "/",
+            0,
+        );
+        assert!(
+            cookie_headers(&Target::direct("example.org", 80, "/").with_jar(&jar, 0)).is_empty()
+        );
+        assert_eq!(
+            cookie_headers(&Target::direct_tls("example.org", 443, "/").with_jar(&jar, 0)),
+            ["Cookie: sid=abc"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod target_redirect_tests {
+    use super::*;
+
+    fn headers() -> Vec<String> {
+        [
+            "Authorization: Bearer secret",
+            "Proxy-Authorization: Basic cHc=",
+            "Cookie: sid=secret",
+            "X-Api-Key: also-secret-but-not-scoped",
+            "Accept: */*",
+        ]
+        .iter()
+        .map(|h| h.to_string())
+        .collect()
+    }
+
+    fn names(t: &Target) -> Vec<&str> {
+        t.headers
+            .iter()
+            .map(|h| h.split(':').next().unwrap_or(""))
+            .collect()
+    }
+
+    /// The reported bug: a hop used to arrive with no headers and no agent at
+    /// all, so `-H 'X-Api-Key: …'` and `-U` were silently lost after any
+    /// redirect.
+    #[test]
+    fn a_same_origin_hop_carries_everything_it_was_given() {
+        let source = Target::direct_tls("example.org", 443, "/a");
+        let hop = Target::direct_tls("example.org", 443, "/b").with_headers_from(
+            &source,
+            headers(),
+            Some("hydra-test/1".into()),
+        );
+        assert_eq!(
+            names(&hop),
+            [
+                "Authorization",
+                "Proxy-Authorization",
+                "Cookie",
+                "X-Api-Key",
+                "Accept"
+            ]
+        );
+        assert_eq!(hop.agent.as_deref(), Some("hydra-test/1"));
+    }
+
+    /// The other half: restoring headers unconditionally would hand a bearer
+    /// token to whatever the first host redirects to.
+    #[test]
+    fn a_hop_to_another_host_drops_the_credentials_and_keeps_the_rest() {
+        let source = Target::direct_tls("example.org", 443, "/a");
+        let hop = Target::direct_tls("elsewhere.test", 443, "/b").with_headers_from(
+            &source,
+            headers(),
+            Some("hydra-test/1".into()),
+        );
+        assert_eq!(names(&hop), ["X-Api-Key", "Accept"]);
+        // The agent is not a credential and identifies the client, not the
+        // account: it survives the hop the token does not.
+        assert_eq!(hop.agent.as_deref(), Some("hydra-test/1"));
+    }
+
+    /// Same host, plaintext: the token would go on the wire where anyone on the
+    /// path can read it, which is exactly what it must not do.
+    #[test]
+    fn a_hop_that_drops_tls_is_not_the_same_origin() {
+        let source = Target::direct_tls("example.org", 443, "/a");
+        let hop =
+            Target::direct("example.org", 443, "/b").with_headers_from(&source, headers(), None);
+        assert_eq!(names(&hop), ["X-Api-Key", "Accept"]);
+    }
+
+    #[test]
+    fn a_hop_to_another_port_on_the_same_host_is_not_the_same_origin() {
+        let source = Target::direct_tls("example.org", 443, "/a");
+        let hop = Target::direct_tls("example.org", 8443, "/b").with_headers_from(
+            &source,
+            headers(),
+            None,
+        );
+        assert_eq!(names(&hop), ["X-Api-Key", "Accept"]);
+    }
+
+    /// DNS is case-insensitive and nothing lowercases a host on the way in, so
+    /// a `Location` that differs only in case is the same place.
+    #[test]
+    fn host_case_alone_does_not_make_a_different_origin() {
+        let source = Target::direct_tls("Example.ORG", 443, "/a");
+        let hop = Target::direct_tls("example.org", 443, "/b").with_headers_from(
+            &source,
+            headers(),
+            None,
+        );
+        assert!(names(&hop).contains(&"Authorization"));
+    }
+
+    /// Through a forward proxy every hop connects to the SAME socket peer, so
+    /// comparing `host` rather than the origin would read two unrelated sites
+    /// as one and hand the first one's token to the second.
+    #[test]
+    fn two_sites_behind_one_proxy_are_not_the_same_origin() {
+        let source = Target::via_proxy("proxy.test", 8080, "example.org:443", "/a");
+        let hop = Target::via_proxy("proxy.test", 8080, "elsewhere.test:443", "/b")
+            .with_headers_from(&source, headers(), None);
+        assert_eq!(names(&hop), ["X-Api-Key", "Accept"]);
+
+        let same = Target::via_proxy("proxy.test", 8080, "example.org:443", "/b")
+            .with_headers_from(&source, headers(), None);
+        assert!(names(&same).contains(&"Authorization"));
+    }
+
+    /// `source` is the address the user named, not the previous hop: a chain
+    /// that leaves the origin and comes back is entitled to the credential
+    /// again, because it was typed for that origin.
+    #[test]
+    fn a_chain_that_returns_to_the_first_origin_is_trusted_again() {
+        let source = Target::direct_tls("example.org", 443, "/a");
+        let away = Target::direct_tls("elsewhere.test", 443, "/b").with_headers_from(
+            &source,
+            headers(),
+            None,
+        );
+        assert!(!names(&away).contains(&"Authorization"));
+
+        let back = Target::direct_tls("example.org", 443, "/c").with_headers_from(
+            &source,
+            headers(),
+            None,
+        );
+        assert!(names(&back).contains(&"Authorization"));
+    }
+
+    /// The filter matches a field NAME, not the line: a header whose value
+    /// merely mentions one must not be mistaken for it.
+    #[test]
+    fn only_the_field_name_decides_what_is_a_credential() {
+        let source = Target::direct_tls("example.org", 443, "/a");
+        let hop = Target::direct_tls("elsewhere.test", 443, "/b").with_headers_from(
+            &source,
+            vec![
+                "X-Note: authorization: none".into(),
+                "AUTHORIZATION: Bearer secret".into(),
+            ],
+            None,
+        );
+        assert_eq!(names(&hop), ["X-Note"]);
+    }
+}
