@@ -180,6 +180,62 @@ fn normalize(url: &str) -> String {
     joined
 }
 
+/// The name a stream should be saved under, from its manifest URL: the
+/// manifest's stem, or the directory above it when the manifest is called
+/// `index`, `master` or another name every stream on the internet shares.
+///
+/// The stem is percent-decoded but otherwise raw — a `%2F` comes back as a
+/// `/` — so a caller writing it to disk still has to make it a leaf name.
+/// `stream` when the URL names nothing usable at all.
+pub fn stream_base_name(url: &str) -> String {
+    let bare = url.split(['?', '#']).next().unwrap_or(url);
+    let path = match bare.find("://") {
+        Some(i) => {
+            let rest = &bare[i + 3..];
+            rest.find('/').map(|j| &rest[j..]).unwrap_or("")
+        }
+        None => bare,
+    };
+    let mut parts = path.rsplit('/').filter(|p| !p.is_empty());
+    let file = parts.next().unwrap_or("stream");
+    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
+    const GENERIC: &[&str] = &[
+        "index", "master", "manifest", "playlist", "mono", "stream", "media", "video", "main",
+    ];
+    // Decoded after the generic test: `master` and `index` never carry an
+    // escape, and comparing the raw segment keeps that test exact.
+    let picked = if GENERIC.contains(&stem.to_ascii_lowercase().as_str()) {
+        parts.next().unwrap_or(stem)
+    } else {
+        stem
+    };
+    let decoded = percent_decode(picked);
+    if decoded.is_empty() {
+        "stream".into()
+    } else {
+        decoded
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +316,37 @@ mod tests {
         let base = parse_url("https://cdn.example/a/m.m3u8").unwrap();
         assert_eq!(join_url(&base, "mailto:someone@example.com"), None);
         assert_eq!(join_url(&base, "data:text/plain,x"), None);
+    }
+
+    #[test]
+    fn a_stream_is_named_after_its_asset_not_its_manifest() {
+        assert_eq!(
+            stream_base_name("https://hls.ex/live_cdn/abc/emcQJ0pGpremocy/index.m3u8"),
+            "emcQJ0pGpremocy"
+        );
+        assert_eq!(stream_base_name("https://cdn.ex/a/master.m3u8"), "a");
+        assert_eq!(stream_base_name("https://cdn.ex/x/MONO.m3u8"), "x");
+        assert_eq!(
+            stream_base_name("https://cdn.ex/a/bbb_30fps.mpd"),
+            "bbb_30fps"
+        );
+        assert_eq!(stream_base_name("https://cdn.ex/a/show.m3u8?t=1#x"), "show");
+        assert_eq!(stream_base_name("https://cdn.ex/"), "stream");
+        assert_eq!(stream_base_name("https://cdn.ex"), "stream");
+        assert_eq!(stream_base_name("relative/dir/index.m3u8"), "dir");
+    }
+
+    #[test]
+    fn the_stem_is_decoded_but_not_sanitised() {
+        assert_eq!(
+            stream_base_name("https://cdn.ex/My%20Show%20%E2%80%94%20Ep1.m3u8"),
+            "My Show — Ep1"
+        );
+        assert_eq!(stream_base_name("https://cdn.ex/a%2Fb.m3u8"), "a/b");
+        assert_eq!(stream_base_name("https://cdn.ex/100%25.m3u8"), "100%");
+        // A broken escape is left as typed; an escaped name that is only
+        // escapes still names something.
+        assert_eq!(stream_base_name("https://cdn.ex/a%2.m3u8"), "a%2");
+        assert_eq!(stream_base_name("https://cdn.ex/%FF.m3u8"), "\u{FFFD}");
     }
 }

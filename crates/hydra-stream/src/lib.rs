@@ -42,8 +42,8 @@ pub mod hls;
 pub mod url;
 
 pub use hls::{
-    fetch_all, ffmpeg, ffmpeg_available, finish, mux, plan_finish, remux, Checkpoint, FetchSeg,
-    Fetcher, Finish, Finished, InFlight, KeyRef, Keys, Meter, Plan, Refusal, Rendition, Resume,
-    Segment, Segments, DEFAULT_CONCURRENCY, MAX_CONCURRENCY,
+    fetch_all, ffmpeg, ffmpeg_available, finish, finish_plan, mux, plan_finish, plan_finish_for,
+    remux, Checkpoint, FetchSeg, Fetcher, Finish, Finished, InFlight, KeyRef, Keys, Meter, Plan,
+    RawAudio, Refusal, Rendition, Resume, Segment, Segments, DEFAULT_CONCURRENCY, MAX_CONCURRENCY,
 };
 pub use url::{join, join_url, parse_url, ParsedUrl};
