@@ -97,6 +97,17 @@ pub(crate) fn parse(text: &str, origin: &str) -> Result<Doc, Detail> {
 
 /// Read a document from a local path.
 pub(crate) fn open(path: &str) -> Result<Doc, Detail> {
+    // Sized before it is read: the cap exists so a document cannot cost
+    // unbounded memory, and reading the whole file to find out it is too big
+    // would spend exactly that.
+    let len = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| crate::err::from_io(&e))?;
+    if len > FETCH_CAP as u64 {
+        return Err(invalid(format!(
+            "{path} is {len} bytes; at most {FETCH_CAP} are read"
+        )));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| crate::err::from_io(&e))?;
     parse(&text, path)
 }
@@ -133,9 +144,7 @@ pub(crate) async fn fetch(
             hya_net::Target::direct(&cur.host, cur.port, &cur.path)
         }
         .with_headers(headers.to_vec(), Some(agent.to_string()));
-        // A HEAD first, only to learn whether this is a redirect. A GET that
-        // lands on a 302 would have to be re-issued anyway, and this way the
-        // capped body fetch happens exactly once against the final host.
+        // HEAD first, so the capped body fetch happens once, on the final host.
         if let Ok(pr) = hya_net::probe(conn.as_ref(), &t).await {
             if pr.is_redirect() {
                 let loc = pr.location.clone().unwrap_or_default();
@@ -218,12 +227,8 @@ pub(crate) fn choose(doc: &Doc, index: usize) -> Result<Chosen, Detail> {
             f.urls.len()
         )));
     }
-    // One TRANSPORT per job. `ranked` keeps every fetchable mirror so
-    // `hydra_metalink_mirrors` can show the whole list, but the engine splices
-    // over HTTP and builds HTTP targets for its probes and reserves — an
-    // `ftp://` entry in a mixed job is a request sent to port 21. The leading
-    // tier carries the transfer; an all-ftp entry keeps its ftp mirrors and
-    // takes the single-stream path.
+    // One transport per job: the engine splices over HTTP, so a mixed list keeps
+    // only the leading tier, and an all-ftp entry takes the single-stream path.
     let lead = tier_of(&ranked[0].3);
     ranked.retain(|(.., proto, _)| tier_of(proto) == lead);
     // A piece list that does not tile the stated size describes a different

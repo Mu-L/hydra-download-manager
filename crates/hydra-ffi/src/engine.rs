@@ -40,6 +40,10 @@ pub(crate) struct EngineCfg {
     pub adaptive_concurrency: bool,
     pub range_stealing: bool,
     pub allow_insecure_tls: bool,
+    /// `hydra_network_policy_t`, the policy the engine starts under.
+    pub network_policy: u32,
+    /// `hydra_power_mode_t`, the mode the engine starts under.
+    pub power_mode: u32,
     pub state_path: Option<String>,
     pub user_agent: String,
 }
@@ -57,6 +61,8 @@ impl Default for EngineCfg {
             adaptive_concurrency: true,
             range_stealing: true,
             allow_insecure_tls: false,
+            network_policy: 0,
+            power_mode: 0,
             state_path: None,
             user_agent: hya_net::DEFAULT_USER_AGENT.to_string(),
         }
@@ -214,6 +220,10 @@ pub(crate) struct JobState {
     /// not the file length, because positioned writes leave holes.
     pub held: Vec<(u64, u64)>,
     pub size: Option<u64>,
+    /// The strong validator (`ETag`) the object had when `held` was recorded.
+    /// A later attempt that sees a different one is fetching a different
+    /// object, and `held` describes the old one.
+    pub validator: Option<String>,
     pub file_name: Option<String>,
     /// The URL actually being fetched, after redirects.
     pub resolved_url: Option<String>,
@@ -238,6 +248,7 @@ impl JobState {
             progress: hydra_progress_t::default(),
             held: Vec::new(),
             size: None,
+            validator: None,
             file_name: None,
             resolved_url: None,
             output_path,
@@ -398,8 +409,8 @@ impl Engine {
             gate: Arc::new(Gate::new(cfg.max_jobs)),
             limiter,
             policy: Mutex::new(hydra_runtime_policy_t {
-                network_policy: 0,
-                power_mode: 0,
+                network_policy: cfg.network_policy,
+                power_mode: cfg.power_mode,
                 allow_cellular: 1,
                 allow_metered: 1,
                 pause_on_low_battery: 0,

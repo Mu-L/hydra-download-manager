@@ -82,6 +82,10 @@ struct JobRecord {
     state: u32,
     #[serde(default)]
     size: Option<u64>,
+    /// The strong validator `held` was recorded against, so a resume can tell
+    /// the object changed underneath it.
+    #[serde(default)]
+    validator: Option<String>,
     #[serde(default)]
     file_name: Option<String>,
     #[serde(default)]
@@ -102,6 +106,49 @@ struct JobRecord {
 
 fn yes() -> bool {
     true
+}
+
+/// The state a restored record comes back in.
+fn restored_state(state: u32) -> u32 {
+    let running = matches!(
+        state,
+        x if x == S::HYDRA_JOB_QUEUED as u32
+            || x == S::HYDRA_JOB_RESOLVING as u32
+            || x == S::HYDRA_JOB_DOWNLOADING as u32
+            || x == S::HYDRA_JOB_VERIFYING as u32
+    );
+    if running || state > S::HYDRA_JOB_CANCELLED as u32 {
+        S::HYDRA_JOB_PAUSED as u32
+    } else {
+        state
+    }
+}
+
+/// Sort, merge and clamp a range map read from disk.
+///
+/// The file is hydra's own, but it is a file: an edit, a partial write that
+/// slipped past the rename, or a bug in an older release can leave spans that
+/// overlap, run backwards or reach past the object. The engine credits each
+/// span it is handed, so the map must describe every byte at most once and
+/// none past the end.
+fn normalize_held(held: Vec<(u64, u64)>, size: Option<u64>) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = held
+        .into_iter()
+        .map(|(lo, hi)| match size {
+            Some(s) => (lo.min(s), hi.min(s)),
+            None => (lo, hi),
+        })
+        .filter(|(lo, hi)| lo < hi)
+        .collect();
+    spans.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for (lo, hi) in spans {
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
 }
 
 #[derive(Serialize, Deserialize)]
@@ -230,6 +277,7 @@ pub(crate) fn save(engine: &Arc<Engine>) -> Result<(), Detail> {
                         g.state
                     },
                     size: g.size,
+                    validator: g.validator.clone(),
                     file_name: g.file_name.clone(),
                     resolved_url: g.resolved_url.clone(),
                     held: g.held.clone(),
@@ -358,11 +406,11 @@ pub(crate) fn restore(engine: &Arc<Engine>) -> Result<usize, Detail> {
             withheld_headers: r.withheld_headers,
             proxy,
             checksum,
-            max_connections: r.max_connections as usize,
+            max_connections: r.max_connections.min(64) as usize,
             max_retries: if r.max_retries == 0 {
                 engine.cfg.max_retries
             } else {
-                r.max_retries
+                r.max_retries.min(64)
             },
             priority: r.priority.min(2),
             max_bytes_per_second: r.max_bytes_per_second,
@@ -397,11 +445,15 @@ pub(crate) fn restore(engine: &Arc<Engine>) -> Result<usize, Detail> {
             },
         );
         let mut g = job.lock();
-        g.state = r.state.min(S::HYDRA_JOB_CANCELLED as u32);
+        // Nothing is executing after a restore, whatever the file claims: a
+        // record that says "downloading" describes a process that is gone,
+        // and a job left in a running state could never be started or removed.
+        g.state = restored_state(r.state);
         g.size = r.size;
+        g.validator = r.validator;
         g.file_name = r.file_name;
         g.resolved_url = r.resolved_url;
-        g.held = r.held;
+        g.held = normalize_held(r.held, r.size);
         g.created_at_ms = r.created_at_ms;
         g.started_at_ms = r.started_at_ms;
         g.finished_at_ms = r.finished_at_ms;
@@ -437,6 +489,30 @@ mod tests {
         assert_eq!(unhex(&hex(&b)).unwrap(), b);
         assert!(unhex("abc").is_none(), "odd length is not a digest");
         assert!(unhex("zz").is_none());
+    }
+
+    #[test]
+    fn a_range_map_from_disk_is_merged_clamped_and_never_double_counted() {
+        assert_eq!(
+            normalize_held(
+                vec![(50, 60), (0, 10), (5, 20), (30, 30), (40, 35)],
+                Some(55)
+            ),
+            vec![(0, 20), (50, 55)]
+        );
+        assert_eq!(normalize_held(vec![(0, 10), (10, 20)], None), vec![(0, 20)]);
+        assert!(normalize_held(vec![(100, 200)], Some(50)).is_empty());
+    }
+
+    #[test]
+    fn a_record_that_claims_to_be_running_comes_back_paused() {
+        for running in [1, 2, 3, 5] {
+            assert_eq!(restored_state(running), S::HYDRA_JOB_PAUSED as u32);
+        }
+        assert_eq!(restored_state(99), S::HYDRA_JOB_PAUSED as u32);
+        for settled in [0, 4, 6, 7, 8] {
+            assert_eq!(restored_state(settled), settled);
+        }
     }
 
     #[test]

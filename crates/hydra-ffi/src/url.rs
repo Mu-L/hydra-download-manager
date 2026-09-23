@@ -3,6 +3,8 @@
 
 //! URL parsing and normalization for supported schemes (`http`, `https`, `ftp`).
 
+use hya_net::url::percent_decode;
+
 /// Parsed URL components required by engine network transports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Url {
@@ -53,24 +55,27 @@ impl Url {
     }
 
     /// Extracts suggested filename from the last path segment.
+    ///
+    /// Decoding admits characters the encoded segment could not contain, so
+    /// the result is reduced to its own basename afterwards on BOTH separators
+    /// whatever the host OS, and cut at a NUL — `%2F`, `%5C` and `%00` must
+    /// not let a URL name a directory, or a different file, than it says.
     pub(crate) fn file_name(&self) -> Option<String> {
-        let seg = self
-            .path
-            .split(['?', '#'])
+        let path = self.path.split(['?', '#']).next().unwrap_or("");
+        let seg = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
+        let decoded = percent_decode(seg);
+        let base = decoded
+            .rsplit(['/', '\\'])
             .next()
             .unwrap_or("")
-            .rsplit('/')
+            .split('\0')
             .next()
-            .unwrap_or("");
-        let name = percent_decode(seg);
-        let base = std::path::Path::new(&name)
-            .file_name()?
-            .to_str()?
-            .to_string();
+            .unwrap_or("")
+            .trim();
         if base.is_empty() || base == "." || base == ".." {
             None
         } else {
-            Some(base)
+            Some(base.to_string())
         }
     }
 
@@ -94,9 +99,12 @@ impl Url {
             ));
         }
         let rest = rest.split('#').next().unwrap_or(rest);
-        let (authority, path) = match rest.find('/') {
-            Some(i) => (&rest[..i], &rest[i..]),
-            None => (rest, "/"),
+        // The authority ends at the first `/` or `?`: `http://h?x=1` has an
+        // empty path and a query, not a host called `h?x=1`.
+        let (authority, path) = match rest.find(['/', '?']) {
+            Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
+            Some(i) => (&rest[..i], rest[i..].to_string()),
+            None => (rest, "/".to_string()),
         };
         let (userinfo, hostport) = match authority.rsplit_once('@') {
             Some((u, h)) => (Some(u), h),
@@ -142,7 +150,7 @@ impl Url {
             scheme,
             host,
             port,
-            path: path.to_string(),
+            path,
             user,
             pass,
         })
@@ -154,73 +162,43 @@ impl Url {
         if loc.is_empty() {
             return Err("empty Location header".into());
         }
-        if loc.contains("://") {
+        if has_scheme(loc) {
             return Url::parse(loc);
         }
-        let base = format!("{}://{}:{}", self.scheme, self.host, self.port);
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        // Protocol-relative: a new authority under the same scheme.
+        if let Some(rest) = loc.strip_prefix("//") {
+            return Url::parse(&format!("{}://{rest}", self.scheme));
+        }
+        let base = format!("{}://{host}:{}", self.scheme, self.port);
         if let Some(rest) = loc.strip_prefix('/') {
             return Url::parse(&format!("{base}/{rest}"));
         }
-        let dir = self.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+        // Relative to the directory of the PATH, never of the query: a `/`
+        // inside `?redirect=/a/b` is not a directory.
+        let path = self.path.split(['?', '#']).next().unwrap_or("/");
+        if let Some(query) = loc.strip_prefix('?') {
+            return Url::parse(&format!("{base}{path}?{query}"));
+        }
+        let dir = path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         Url::parse(&format!("{base}{dir}/{loc}"))
     }
 }
 
-/// Decode `%XX` escapes, leaving anything malformed alone.
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// `Authorization: Basic` payload.
-pub(crate) fn basic_auth(user: &str, pass: &str) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let data = format!("{user}:{pass}");
-    let data = data.as_bytes();
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+/// Whether `s` starts with a URI scheme (`scheme:`), as RFC 3986 spells one.
+///
+/// A bare `contains("://")` would read `next?u=http://x` as absolute.
+fn has_scheme(s: &str) -> bool {
+    let Some((scheme, _)) = s.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 #[cfg(test)]
@@ -283,7 +261,7 @@ mod tests {
     fn a_server_supplied_name_cannot_escape_a_directory() {
         let u = Url::parse("https://example.com/a/%2e%2e%2f%2e%2e%2fetc%2fpasswd").unwrap();
         assert_eq!(u.file_name().as_deref(), Some("passwd"));
-        let u = Url::parse("https://example.com/a/").unwrap();
+        let u = Url::parse("https://example.com/").unwrap();
         assert_eq!(u.file_name(), None);
     }
 
@@ -296,10 +274,44 @@ mod tests {
     }
 
     #[test]
-    fn basic_auth_matches_rfc_7617_examples() {
-        assert_eq!(
-            basic_auth("Aladdin", "open sesame"),
-            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
-        );
+    fn a_protocol_relative_location_changes_the_host_and_keeps_the_scheme() {
+        let base = Url::parse("https://a.example:8443/dir/file").unwrap();
+        let next = base.join("//cdn.example/x/y.bin").unwrap();
+        assert_eq!(next.scheme, "https");
+        assert_eq!(next.host, "cdn.example");
+        assert_eq!(next.port, 443);
+        assert_eq!(next.path, "/x/y.bin");
+    }
+
+    #[test]
+    fn a_relative_location_ignores_the_query_of_the_base() {
+        let base = Url::parse("https://a.example/dir/file?next=/evil/path").unwrap();
+        assert_eq!(base.join("sib").unwrap().path, "/dir/sib");
+        assert_eq!(base.join("?page=2").unwrap().path, "/dir/file?page=2");
+        // A query value that looks like a URL does not make the location absolute.
+        let next = base.join("go?u=http://other.example/z").unwrap();
+        assert_eq!(next.host, "a.example");
+        assert_eq!(next.path, "/dir/go?u=http://other.example/z");
+        // An IPv6 base keeps its brackets when the path is joined.
+        let v6 = Url::parse("http://[::1]:8080/d/f").unwrap();
+        assert_eq!(v6.join("g").unwrap().host, "::1");
+    }
+
+    #[test]
+    fn a_query_without_a_path_is_not_part_of_the_host() {
+        let u = Url::parse("http://h.example?x=1").unwrap();
+        assert_eq!(u.host, "h.example");
+        assert_eq!(u.path, "/?x=1");
+    }
+
+    #[test]
+    fn a_decoded_segment_cannot_smuggle_a_separator_or_a_nul() {
+        let u = Url::parse("https://example.com/a/dir%5Cevil%00.txt").unwrap();
+        assert_eq!(u.file_name().as_deref(), Some("evil"));
+        let u = Url::parse("https://example.com/a/x%2Fy.bin?q=/z").unwrap();
+        assert_eq!(u.file_name().as_deref(), Some("y.bin"));
+        // A trailing slash names the directory before it, as the CLI does.
+        let u = Url::parse("https://example.com/pub/dist/").unwrap();
+        assert_eq!(u.file_name().as_deref(), Some("dist"));
     }
 }
