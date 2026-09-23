@@ -12,10 +12,10 @@
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// What the origin should do.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Behaviour {
     /// Advertise `Accept-Ranges: bytes` and honour `Range`.
     pub ranges: bool,
@@ -28,6 +28,8 @@ pub struct Behaviour {
     pub chunk: usize,
     /// Answer everything with this status instead, when set.
     pub force_status: Option<u16>,
+    /// Answer a request for the first path with a `302` to the second.
+    pub redirect: Option<(String, String)>,
 }
 
 impl Default for Behaviour {
@@ -38,6 +40,7 @@ impl Default for Behaviour {
             delay_ms: 0,
             chunk: 64 * 1024,
             force_status: None,
+            redirect: None,
         }
     }
 }
@@ -52,6 +55,10 @@ pub struct Origin {
     /// Requests answered, for a test that wants to assert on connection reuse.
     #[allow(dead_code)]
     pub requests: Arc<AtomicU64>,
+    /// Every request head received, verbatim, for a test that asserts on what
+    /// was — or was not — sent.
+    #[allow(dead_code)]
+    pub heads: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -66,6 +73,18 @@ impl Drop for Origin {
 impl Origin {
     pub fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// Whether any request carried a header line starting with `prefix`
+    /// (case-insensitive on the name).
+    #[allow(dead_code)]
+    pub fn saw_header(&self, prefix: &str) -> bool {
+        let want = prefix.to_ascii_lowercase();
+        self.heads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|h| h.lines().any(|l| l.to_ascii_lowercase().starts_with(&want)))
     }
 }
 
@@ -86,22 +105,52 @@ pub fn make_body(len: usize) -> Vec<u8> {
 
 /// Start an origin serving `body` on a loopback port.
 pub fn serve(body: Vec<u8>, behaviour: Behaviour) -> Origin {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    serve_at(0, body, behaviour)
+}
+
+/// Start an origin on a specific loopback port — `0` for any free one.
+///
+/// A fixed port is what lets a test replace the object behind a URL a job
+/// already holds: drop the first origin, bind the same port with a different
+/// body.
+#[allow(dead_code)]
+pub fn serve_at(port: u16, body: Vec<u8>, behaviour: Behaviour) -> Origin {
+    // A port just vacated by a dropped origin is released when its accept
+    // thread notices the stop flag, which is a moment after `Drop` returns.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let listener = loop {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => break l,
+            Err(e) if std::time::Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("bind 127.0.0.1:{port}: {e}"),
+        }
+    };
     let port = listener.local_addr().unwrap().port();
     let body = Arc::new(body);
     let stop = Arc::new(AtomicBool::new(false));
     let requests = Arc::new(AtomicU64::new(0));
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let behaviour = Arc::new(behaviour);
 
-    let (b, s, r) = (body.clone(), stop.clone(), requests.clone());
+    let (b, s, r, hs) = (body.clone(), stop.clone(), requests.clone(), heads.clone());
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             if s.load(Ordering::Relaxed) {
                 break;
             }
             let Ok(sock) = conn else { continue };
-            let (b, s, r) = (b.clone(), s.clone(), r.clone());
+            let (b, s, r, hs, bh) = (
+                b.clone(),
+                s.clone(),
+                r.clone(),
+                hs.clone(),
+                behaviour.clone(),
+            );
             std::thread::spawn(move || {
-                let _ = handle(sock, &b, behaviour, &s, &r);
+                let _ = handle(sock, &b, &bh, &s, &r, &hs);
             });
         }
     });
@@ -109,6 +158,7 @@ pub fn serve(body: Vec<u8>, behaviour: Behaviour) -> Origin {
         port,
         body,
         requests,
+        heads,
         stop,
     }
 }
@@ -134,9 +184,10 @@ fn read_head(sock: &mut TcpStream) -> std::io::Result<Option<String>> {
 fn handle(
     mut sock: TcpStream,
     body: &[u8],
-    b: Behaviour,
+    b: &Behaviour,
     stop: &AtomicBool,
     requests: &AtomicU64,
+    heads: &Mutex<Vec<String>>,
 ) -> std::io::Result<()> {
     sock.set_nodelay(true)?;
     // Keep-alive: hya-net pools connections, and a server that closed after
@@ -146,8 +197,10 @@ fn handle(
             return Ok(());
         };
         requests.fetch_add(1, Ordering::Relaxed);
+        heads.lock().unwrap().push(head.clone());
         let start = head.lines().next().unwrap_or("");
         let method = start.split(' ').next().unwrap_or("");
+        let target = start.split(' ').nth(1).unwrap_or("");
         let range = head
             .lines()
             .find(|l| l.to_ascii_lowercase().starts_with("range:"))
@@ -165,6 +218,15 @@ fn handle(
                 format!("HTTP/1.1 {code} Nope\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             sock.write_all(msg.as_bytes())?;
             return Ok(());
+        }
+        if let Some((from, to)) = &b.redirect {
+            if target.ends_with(from.as_str()) {
+                let msg = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                sock.write_all(msg.as_bytes())?;
+                return Ok(());
+            }
         }
 
         let validator = if b.validator {

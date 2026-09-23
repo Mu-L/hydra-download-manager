@@ -798,11 +798,15 @@ fn state_survives_the_engine_that_created_it() {
     );
     let mut p: hydra_progress_t = unsafe { std::mem::zeroed() };
     unsafe { hydra_job_get_progress(h.engine, id, &mut p) };
+    // At least what was reported before the stop, because the transfer's
+    // final range map is recorded on its way out rather than at the last
+    // progress tick — and never the whole object, or the resume proves nothing.
     assert!(
-        p.bytes_downloaded > 0 && p.bytes_downloaded <= held,
-        "the restored range map should describe roughly what was fetched \
-         (restored {}, had {held})",
-        p.bytes_downloaded
+        p.bytes_downloaded >= held && p.bytes_downloaded < body.len() as u64,
+        "the restored range map should describe what was fetched \
+         (restored {}, had {held} of {})",
+        p.bytes_downloaded,
+        body.len()
     );
 
     assert_eq!(
@@ -1475,7 +1479,7 @@ fn a_job_created_from_a_document_assembles_from_mirrors_that_share_no_validator(
         validator: false,
         ..Behaviour::default()
     };
-    let a = serve(body.clone(), no_validator);
+    let a = serve(body.clone(), no_validator.clone());
     let b = serve(body.clone(), no_validator);
     let urls = vec![a.url("/object.bin"), b.url("/object.bin")];
     let chunk = 1 << 20;
@@ -1717,4 +1721,631 @@ fn live_metalink_through_the_abi() {
 
     unsafe { hydra_metalink_file_array_free(&mut files) };
     unsafe { hydra_metalink_free(doc) };
+}
+
+// ============================================================ review fixes
+
+/// A request head the origin received for `path`, or a panic naming what it did
+/// receive.
+fn head_for(origin: &support::Origin, path: &str) -> String {
+    let heads = origin.heads.lock().unwrap();
+    heads
+        .iter()
+        .find(|h| {
+            h.lines()
+                .next()
+                .is_some_and(|l| l.split(' ').nth(1).is_some_and(|t| t.ends_with(path)))
+        })
+        .cloned()
+        .unwrap_or_else(|| panic!("no request for {path}; saw {heads:?}"))
+}
+
+fn has_header(head: &str, prefix: &str) -> bool {
+    let want = prefix.to_ascii_lowercase();
+    head.lines()
+        .any(|l| l.to_ascii_lowercase().starts_with(&want))
+}
+
+/// A job configuration as a program built against an OLDER header would pass
+/// it: `size` stops before `checksum`, so everything from there on — including
+/// `auto_start` — is memory the caller never initialised and the library must
+/// not read.
+fn short_job_config(urls: *const *const c_char, out: *const c_char) -> hydra_job_config_t {
+    let mut cfg: hydra_job_config_t = unsafe { std::mem::zeroed() };
+    let short = std::mem::offset_of!(hydra_job_config_t, checksum) as u32;
+    assert_eq!(
+        unsafe { hydra_job_config_init(&mut cfg, short) },
+        hydra_error_code_t::HYDRA_OK
+    );
+    assert_eq!(cfg.size, short);
+    cfg.urls = urls;
+    cfg.url_count = 1;
+    cfg.output_path = out;
+    // What an old caller's stack might hold past the end of its struct.
+    cfg.auto_start = 1;
+    cfg.checksum.algorithm = 99;
+    cfg.priority = 99;
+    cfg
+}
+
+#[test]
+fn a_short_job_config_is_read_as_a_prefix_and_never_auto_starts() {
+    let h = harness("shortjob", false, |_| {});
+    let url = CString::new("http://127.0.0.1:1/x").unwrap();
+    let urls: [*const c_char; 1] = [url.as_ptr()];
+    let out = CString::new(h.dir.join("x").to_string_lossy().into_owned()).unwrap();
+    let cfg = short_job_config(urls.as_ptr(), out.as_ptr());
+
+    let mut id: hydra_job_id_t = 0;
+    assert_eq!(
+        unsafe { hydra_job_create(h.engine, &cfg, &mut id) },
+        hydra_error_code_t::HYDRA_OK,
+        "{}",
+        last_error()
+    );
+    let mut st = hydra_job_state_t::HYDRA_JOB_CANCELLED;
+    unsafe { hydra_job_get_state(h.engine, id, &mut st) };
+    assert_eq!(
+        st,
+        hydra_job_state_t::HYDRA_JOB_CREATED,
+        "a field past the caller's `size` must not be read"
+    );
+
+    // The same rule on the Metalink path, which patches a copy of the struct.
+    let body = make_body(16);
+    let xml = meta4(
+        "x.bin",
+        body.len(),
+        &sha256_hex(&body),
+        &["http://127.0.0.1:1/x.bin".to_string()],
+        None,
+    );
+    let doc = parse_doc(&xml);
+    let mut id2: hydra_job_id_t = 0;
+    assert_eq!(
+        unsafe { hydra_job_create_from_metalink(h.engine, doc, 0, &cfg, &mut id2) },
+        hydra_error_code_t::HYDRA_OK,
+        "{}",
+        last_error()
+    );
+    unsafe { hydra_job_get_state(h.engine, id2, &mut st) };
+    assert_eq!(st, hydra_job_state_t::HYDRA_JOB_CREATED);
+
+    // And NULL is a refusal there too, not a crash.
+    assert_eq!(
+        unsafe { hydra_job_create_from_metalink(h.engine, doc, 0, ptr::null(), &mut id2) },
+        hydra_error_code_t::HYDRA_ERR_INVALID_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { hydra_job_create_from_metalink(h.engine, doc, 0, &cfg, ptr::null_mut()) },
+        hydra_error_code_t::HYDRA_ERR_INVALID_ARGUMENT
+    );
+    unsafe { hydra_metalink_free(doc) };
+}
+
+#[test]
+fn config_init_zeroes_the_tail_of_a_larger_struct() {
+    // A program built against a NEWER header, whose struct has fields appended
+    // past what this library knows: those fields must come back zero, which
+    // is the value every appended field is defined to default from — not
+    // whatever the caller's stack held.
+    const EXTRA: usize = 64;
+    let mut words = [u64::MAX; (std::mem::size_of::<hydra_engine_config_t>() + EXTRA) / 8];
+    let total = std::mem::size_of_val(&words) as u32;
+    let rc = unsafe { hydra_engine_config_init(words.as_mut_ptr() as *mut _, total) };
+    assert_eq!(rc, hydra_error_code_t::HYDRA_OK);
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, total as usize) };
+    let cfg = unsafe { &*(words.as_ptr() as *const hydra_engine_config_t) };
+    assert_eq!(cfg.size, total, "size is the caller's, not this build's");
+    assert!(
+        bytes[std::mem::size_of::<hydra_engine_config_t>()..]
+            .iter()
+            .all(|&b| b == 0),
+        "the appended tail must be zeroed"
+    );
+
+    let mut words = [u64::MAX; (std::mem::size_of::<hydra_job_config_t>() + EXTRA) / 8];
+    let total = std::mem::size_of_val(&words) as u32;
+    let rc = unsafe { hydra_job_config_init(words.as_mut_ptr() as *mut _, total) };
+    assert_eq!(rc, hydra_error_code_t::HYDRA_OK);
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, total as usize) };
+    assert!(bytes[std::mem::size_of::<hydra_job_config_t>()..]
+        .iter()
+        .all(|&b| b == 0));
+
+    // A size no configuration struct will ever reach is a refusal, so a
+    // garbage argument cannot make the library scribble kilobytes of zeros.
+    let mut cfg: hydra_engine_config_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { hydra_engine_config_init(&mut cfg, 1 << 20) },
+        hydra_error_code_t::HYDRA_ERR_INVALID_ARGUMENT
+    );
+}
+
+#[test]
+fn the_initial_policy_in_the_engine_config_is_applied() {
+    let h = harness("initpolicy", false, |c| {
+        c.network_policy = hydra_network_policy_t::HYDRA_NETWORK_UNMETERED as u32;
+        c.power_mode = hydra_power_mode_t::HYDRA_POWER_RESTRICTED as u32;
+    });
+    let mut p: hydra_runtime_policy_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { hydra_engine_get_policy(h.engine, &mut p) },
+        hydra_error_code_t::HYDRA_OK
+    );
+    assert_eq!(
+        p.network_policy,
+        hydra_network_policy_t::HYDRA_NETWORK_UNMETERED as u32
+    );
+    assert_eq!(
+        p.power_mode,
+        hydra_power_mode_t::HYDRA_POWER_RESTRICTED as u32
+    );
+
+    let mut cfg: hydra_engine_config_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        hydra_engine_config_init(
+            &mut cfg,
+            std::mem::size_of::<hydra_engine_config_t>() as u32,
+        )
+    };
+    cfg.power_mode = 7;
+    assert!(
+        unsafe { hydra_engine_create(&cfg) }.is_null(),
+        "an unknown power mode is a refusal, not a default"
+    );
+}
+
+#[test]
+fn wake_releases_a_forever_waiter_with_again() {
+    let h = harness("wake", false, |_| {});
+    let engine = h.engine as usize;
+    let waiter = std::thread::spawn(move || {
+        let mut ev: hydra_event_t = unsafe { std::mem::zeroed() };
+        unsafe { hydra_event_wait(engine as *mut hydra_engine_t, HYDRA_WAIT_FOREVER, &mut ev) }
+    });
+    // Nothing observable says when the waiter has parked, so wake until it
+    // returns; a wake that lands before the wait begins is meant to be lost.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !waiter.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "hydra_event_wake did not release the waiter"
+        );
+        assert_eq!(
+            unsafe { hydra_event_wake(h.engine) },
+            hydra_error_code_t::HYDRA_OK
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        waiter.join().unwrap(),
+        hydra_error_code_t::HYDRA_ERR_AGAIN,
+        "a woken wait reports nothing to do, not a failure"
+    );
+}
+
+#[test]
+fn a_jobs_events_are_ordered_and_its_terminal_event_is_its_last() {
+    use hydra_event_type_t as T;
+    let body = make_body(1024 * 1024);
+    let origin = serve(body, Behaviour::default());
+    let h = harness("ordering", false, |c| c.progress_interval_ms = 10);
+    let id = make_job(&h, &origin.url("/o.bin"), &h.dir.join("o.bin"), |_| {});
+    unsafe { hydra_job_start(h.engine, id) };
+
+    let mut seen: Vec<T> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        let mut ev: hydra_event_t = unsafe { std::mem::zeroed() };
+        if unsafe { hydra_event_wait(h.engine, 500, &mut ev) } != hydra_error_code_t::HYDRA_OK {
+            continue;
+        }
+        assert_eq!(ev.job_id, id);
+        seen.push(ev.kind);
+        if is_terminal_event(ev.kind) {
+            break;
+        }
+    }
+    assert_eq!(seen.last(), Some(&T::HYDRA_EVENT_COMPLETED), "{seen:?}");
+    assert!(
+        seen.starts_with(&[
+            T::HYDRA_EVENT_JOB_CREATED,
+            T::HYDRA_EVENT_JOB_QUEUED,
+            T::HYDRA_EVENT_JOB_STARTED
+        ]),
+        "{seen:?}"
+    );
+    let resolved = seen
+        .iter()
+        .position(|k| *k == T::HYDRA_EVENT_RESOLVED)
+        .expect("RESOLVED");
+    assert!(
+        seen.iter()
+            .position(|k| *k == T::HYDRA_EVENT_PROGRESS)
+            .is_none_or(|p| p > resolved),
+        "PROGRESS before RESOLVED: {seen:?}"
+    );
+
+    // Nothing may follow the terminal event — in particular not a progress
+    // sample that was pending when the completion was queued.
+    for _ in 0..3 {
+        let mut ev: hydra_event_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { hydra_event_wait(h.engine, 100, &mut ev) };
+        assert_eq!(
+            rc,
+            hydra_error_code_t::HYDRA_ERR_AGAIN,
+            "an event ({:?}) was delivered after the job's terminal event",
+            ev.kind
+        );
+    }
+}
+
+#[test]
+fn a_resumed_job_discards_ranges_from_an_object_of_a_different_size() {
+    let first = make_body(2 * 1024 * 1024);
+    let origin = serve(
+        first.clone(),
+        Behaviour {
+            delay_ms: 25,
+            chunk: 32 * 1024,
+            ..Behaviour::default()
+        },
+    );
+    let port = origin.port;
+    let h = harness("replaced", false, |c| {
+        c.max_connections = 2;
+        c.adaptive_concurrency = 0;
+        c.progress_interval_ms = 20;
+    });
+    let out = h.dir.join("replaced.bin");
+    let id = make_job(&h, &origin.url("/replaced.bin"), &out, |c| {
+        c.adaptive = 0;
+        c.max_connections = 2;
+    });
+    unsafe { hydra_job_start(h.engine, id) };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(Instant::now() < deadline, "transfer never started moving");
+        let mut p: hydra_progress_t = unsafe { std::mem::zeroed() };
+        unsafe { hydra_job_get_progress(h.engine, id, &mut p) };
+        if p.bytes_downloaded > 64 * 1024 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        unsafe { hydra_job_pause(h.engine, id) },
+        hydra_error_code_t::HYDRA_OK
+    );
+    await_state(
+        &h,
+        id,
+        hydra_job_state_t::HYDRA_JOB_PAUSED,
+        Duration::from_secs(20),
+    );
+    let mut p: hydra_progress_t = unsafe { std::mem::zeroed() };
+    unsafe { hydra_job_get_progress(h.engine, id, &mut p) };
+    assert!(
+        p.bytes_downloaded > 0,
+        "nothing was held, so nothing can be discarded"
+    );
+
+    // The publisher replaces the object behind the same URL with a shorter,
+    // different one. The spans on disk describe the OLD object: splicing them
+    // into the new one would assemble a file of the right length and the wrong
+    // bytes, reported as a success.
+    drop(origin);
+    let second = make_body(1024 * 1024 + 999);
+    let replaced = support::serve_at(port, second.clone(), Behaviour::default());
+    assert_eq!(replaced.port, port);
+
+    assert_eq!(
+        unsafe { hydra_job_resume(h.engine, id) },
+        hydra_error_code_t::HYDRA_OK
+    );
+    let ev = await_terminal(&h, id, Duration::from_secs(120));
+    assert_eq!(
+        ev.kind,
+        hydra_event_type_t::HYDRA_EVENT_COMPLETED,
+        "{}",
+        last_error()
+    );
+    let got = std::fs::read(&out).unwrap();
+    assert_eq!(got.len(), second.len());
+    assert_eq!(
+        sha256(&got),
+        sha256(&second),
+        "held ranges from the old object leaked in"
+    );
+}
+
+#[test]
+fn cancelling_a_job_that_never_started_does_not_delete_a_pre_existing_file() {
+    let h = harness("cancel-untouched", false, |_| {});
+    let out = h.dir.join("precious.bin");
+    std::fs::write(&out, b"the host's own file").unwrap();
+    let id = make_job(&h, "http://127.0.0.1:1/x", &out, |_| {});
+    assert_eq!(
+        unsafe {
+            hydra_job_cancel(
+                h.engine,
+                id,
+                hydra_cancel_mode_t::HYDRA_CANCEL_REMOVE_PARTIAL as u32,
+            )
+        },
+        hydra_error_code_t::HYDRA_OK
+    );
+    await_state(
+        &h,
+        id,
+        hydra_job_state_t::HYDRA_JOB_CANCELLED,
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"the host's own file",
+        "no attempt ever ran, so there is no partial file to remove"
+    );
+}
+
+#[test]
+fn an_http_proxy_login_is_sent_as_proxy_authorization() {
+    let body = make_body(64 * 1024);
+    // The origin stands in for a forward proxy: it ignores the absolute-form
+    // request target and answers with the body, recording what it was sent.
+    let proxy = serve(body.clone(), Behaviour::default());
+    let h = harness("proxyauth", false, |_| {});
+    let out = h.dir.join("via-proxy.bin");
+    let host = CString::new("127.0.0.1").unwrap();
+    let user = CString::new("pu").unwrap();
+    let pass = CString::new("pw").unwrap();
+    let pc = hydra_proxy_config_t {
+        kind: hydra_proxy_type_t::HYDRA_PROXY_HTTP as u32,
+        port: proxy.port,
+        reserved: [0; 2],
+        host: host.as_ptr(),
+        username: user.as_ptr(),
+        password: pass.as_ptr(),
+    };
+    let id = make_job(&h, "http://origin.invalid/via-proxy.bin", &out, |c| {
+        c.proxy = &pc
+    });
+    unsafe { hydra_job_start(h.engine, id) };
+    let ev = await_terminal(&h, id, Duration::from_secs(60));
+    assert_eq!(
+        ev.kind,
+        hydra_event_type_t::HYDRA_EVENT_COMPLETED,
+        "{}",
+        last_error()
+    );
+    assert_eq!(sha256(&std::fs::read(&out).unwrap()), sha256(&body));
+    assert!(
+        proxy.saw_header("Proxy-Authorization: Basic cHU6cHc="),
+        "the proxy login never reached the proxy: {:?}",
+        proxy.heads.lock().unwrap()
+    );
+    assert!(
+        proxy.heads.lock().unwrap().iter().all(|h| h
+            .lines()
+            .next()
+            .unwrap_or("")
+            .contains("http://origin.invalid")),
+        "a request through an HTTP proxy is sent in absolute form"
+    );
+}
+
+#[test]
+fn credentials_do_not_follow_a_cross_origin_redirect() {
+    let body = make_body(64 * 1024);
+    let far = serve(body.clone(), Behaviour::default());
+    let near = serve(
+        body.clone(),
+        Behaviour {
+            redirect: Some(("/away.bin".into(), far.url("/landed.bin"))),
+            ..Behaviour::default()
+        },
+    );
+    let h = harness("redirect-creds", false, |_| {});
+    let user = CString::new("u").unwrap();
+    let pass = CString::new("p").unwrap();
+
+    let out = h.dir.join("away.bin");
+    let id = make_job(&h, &near.url("/away.bin"), &out, |c| {
+        c.username = user.as_ptr();
+        c.password = pass.as_ptr();
+    });
+    unsafe { hydra_job_start(h.engine, id) };
+    let ev = await_terminal(&h, id, Duration::from_secs(60));
+    assert_eq!(
+        ev.kind,
+        hydra_event_type_t::HYDRA_EVENT_COMPLETED,
+        "{}",
+        last_error()
+    );
+    assert_eq!(sha256(&std::fs::read(&out).unwrap()), sha256(&body));
+    assert!(
+        has_header(&head_for(&near, "/away.bin"), "Authorization: Basic"),
+        "the origin the job named gets its login"
+    );
+    assert!(
+        !far.saw_header("Authorization:"),
+        "a login typed for one host followed a redirect to another: {:?}",
+        far.heads.lock().unwrap()
+    );
+
+    // Same origin: the credential stays, because it was typed for this host.
+    let same = serve(
+        body.clone(),
+        Behaviour {
+            redirect: Some(("/moved.bin".into(), "/here.bin".into())),
+            ..Behaviour::default()
+        },
+    );
+    let out2 = h.dir.join("moved.bin");
+    let id2 = make_job(&h, &same.url("/moved.bin"), &out2, |c| {
+        c.username = user.as_ptr();
+        c.password = pass.as_ptr();
+    });
+    unsafe { hydra_job_start(h.engine, id2) };
+    let ev = await_terminal(&h, id2, Duration::from_secs(60));
+    assert_eq!(
+        ev.kind,
+        hydra_event_type_t::HYDRA_EVENT_COMPLETED,
+        "{}",
+        last_error()
+    );
+    assert!(
+        has_header(&head_for(&same, "/here.bin"), "Authorization: Basic"),
+        "a same-origin hop keeps the login"
+    );
+}
+
+#[test]
+fn a_corrupt_state_file_is_refused_and_a_hostile_one_is_sanitised() {
+    let h = harness("hostile-state", true, |_| {});
+    let path = h.dir.join("state.json");
+    let mut n: usize = 0;
+
+    std::fs::write(&path, b"{\"version\": 1, \"jobs\": [{\"id\": 1, \"ur").unwrap();
+    assert_eq!(
+        unsafe { hydra_engine_restore(h.engine, &mut n) },
+        hydra_error_code_t::HYDRA_ERR_PROTOCOL,
+        "a truncated file is refused, not resumed"
+    );
+
+    std::fs::write(&path, b"{\"version\": 99, \"jobs\": []}").unwrap();
+    assert_eq!(
+        unsafe { hydra_engine_restore(h.engine, &mut n) },
+        hydra_error_code_t::HYDRA_ERR_UNSUPPORTED,
+        "a file from a newer hydra is refused rather than guessed at"
+    );
+
+    // A record that claims to be mid-transfer, with a range map that overlaps,
+    // runs backwards and reaches past the object.
+    let out = h.dir.join("hostile.bin").to_string_lossy().into_owned();
+    let record = format!(
+        "{{\"version\": 1, \"jobs\": [{{\"id\": 7, \"urls\": [\"http://127.0.0.1:1/h\"], \
+         \"output_path\": {out:?}, \"state\": 3, \"size\": 1000, \
+         \"held\": [[50, 150], [0, 100], [900, 5000], [40, 30]], \
+         \"max_retries\": 4000000000, \"max_connections\": 4000000000}}]}}"
+    );
+    std::fs::write(&path, record).unwrap();
+    assert_eq!(
+        unsafe { hydra_engine_restore(h.engine, &mut n) },
+        hydra_error_code_t::HYDRA_OK,
+        "{}",
+        last_error()
+    );
+    assert_eq!(n, 1);
+    let mut st = hydra_job_state_t::HYDRA_JOB_CREATED;
+    unsafe { hydra_job_get_state(h.engine, 7, &mut st) };
+    assert_eq!(
+        st,
+        hydra_job_state_t::HYDRA_JOB_PAUSED,
+        "nothing is running after a restore, whatever the file says"
+    );
+    let mut p: hydra_progress_t = unsafe { std::mem::zeroed() };
+    unsafe { hydra_job_get_progress(h.engine, 7, &mut p) };
+    assert_eq!(
+        p.bytes_downloaded, 250,
+        "[0,150) and [900,1000): merged, clamped, counted once"
+    );
+    assert_eq!(p.completed_ranges, 2);
+    // And it is a job the application can act on: not stuck "running".
+    assert_eq!(
+        unsafe { hydra_job_remove(h.engine, 7) },
+        hydra_error_code_t::HYDRA_OK
+    );
+}
+
+#[test]
+fn a_small_object_is_fetched_over_one_connection() {
+    let body = make_body(300 * 1024);
+    let origin = serve(body.clone(), Behaviour::default());
+    let h = harness("small", false, |c| {
+        c.max_connections = 8;
+        c.adaptive_concurrency = 0;
+    });
+    let out = h.dir.join("small.bin");
+    let id = make_job(&h, &origin.url("/small.bin"), &out, |c| {
+        c.max_connections = 8;
+        c.adaptive = 0;
+    });
+    unsafe { hydra_job_start(h.engine, id) };
+    let ev = await_terminal(&h, id, Duration::from_secs(60));
+    assert_eq!(
+        ev.kind,
+        hydra_event_type_t::HYDRA_EVENT_COMPLETED,
+        "{}",
+        last_error()
+    );
+    assert_eq!(sha256(&std::fs::read(&out).unwrap()), sha256(&body));
+    // Eight connections over 300 KiB would be eight requests for ranges that
+    // start deep inside the object; one connection asks from the front only.
+    let inner: Vec<String> = origin
+        .heads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|h| {
+            h.lines().any(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("range: bytes=") && !l.starts_with("range: bytes=0-")
+            })
+        })
+        .cloned()
+        .collect();
+    assert!(inner.is_empty(), "the object was split: {inner:?}");
+}
+
+#[test]
+fn a_url_cannot_name_a_file_outside_its_own_segment() {
+    let body = make_body(1024);
+    let origin = serve(body, Behaviour::default());
+    let h = harness("filename", false, |_| {});
+    let id = make_job(
+        &h,
+        &origin.url("/pub/dir%5C..%5Cevil%00.txt"),
+        &h.dir.join("named.bin"),
+        |_| {},
+    );
+    unsafe { hydra_job_start(h.engine, id) };
+    let ev = await_terminal(&h, id, Duration::from_secs(60));
+    assert_eq!(
+        ev.kind,
+        hydra_event_type_t::HYDRA_EVENT_COMPLETED,
+        "{}",
+        last_error()
+    );
+    let mut snap: hydra_job_snapshot_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { hydra_job_get_snapshot(h.engine, id, &mut snap) },
+        hydra_error_code_t::HYDRA_OK
+    );
+    let name = unsafe { CStr::from_ptr(snap.file_name.data) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { hydra_job_snapshot_free(&mut snap) };
+    assert_eq!(
+        name, "evil",
+        "a decoded separator or NUL must not survive into the name"
+    );
+}
+
+#[test]
+fn an_oversized_metalink_file_is_refused_before_it_is_read() {
+    let dir = scratch("bigdoc");
+    let path = dir.join("huge.meta4");
+    let f = std::fs::File::create(&path).unwrap();
+    f.set_len(4 * 1024 * 1024 + 1).unwrap();
+    drop(f);
+    let c = CString::new(path.to_string_lossy().into_owned()).unwrap();
+    let mut doc: *mut hydra_metalink_t = ptr::null_mut();
+    assert_eq!(
+        unsafe { hydra_metalink_open(c.as_ptr(), &mut doc) },
+        hydra_error_code_t::HYDRA_ERR_INVALID_ARGUMENT
+    );
+    assert!(doc.is_null());
+    let _ = std::fs::remove_dir_all(dir);
 }

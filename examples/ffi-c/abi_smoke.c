@@ -177,6 +177,33 @@ int main(void)
         hydra_engine_destroy(from_old);
     }
 
+    /* The other direction: a program built against a NEWER header, whose
+     * struct carries fields appended past what this library knows. Init must
+     * zero them - the value every appended field defaults from - rather than
+     * leave whatever the caller's stack held. */
+    {
+        union {
+            uint64_t align;
+            unsigned char bytes[sizeof(hydra_engine_config_t) + 64];
+        } newer;
+        size_t i;
+        memset(newer.bytes, 0xFF, sizeof newer.bytes);
+        CHECK(hydra_engine_config_init((hydra_engine_config_t *)newer.bytes,
+                                       (uint32_t)sizeof newer.bytes) == HYDRA_OK,
+              "init refused a larger (newer) struct");
+        CHECK(((hydra_engine_config_t *)newer.bytes)->size == (uint32_t)sizeof newer.bytes,
+              "init stamped this build's size rather than the caller's");
+        for (i = sizeof(hydra_engine_config_t); i < sizeof newer.bytes; i++) {
+            if (newer.bytes[i] != 0) {
+                CHECK(0, "byte %zu past this build's struct was not zeroed", i);
+                break;
+            }
+        }
+        /* And a size no configuration will ever reach is refused outright. */
+        CHECK(hydra_engine_config_init(&cfg, 1u << 20) == HYDRA_ERR_INVALID_ARGUMENT,
+              "an absurd struct_size must be refused");
+    }
+
     /* The one call every embedder makes first and last. */
     hydra_engine_t *engine = hydra_engine_create(&cfg);
     CHECK(engine != NULL, "engine creation returned NULL");
@@ -203,6 +230,22 @@ int main(void)
               "an unknown job id should be NOT_FOUND");
         CHECK(hydra_job_create(engine, NULL, NULL) == HYDRA_ERR_INVALID_ARGUMENT,
               "a NULL job config should be INVALID_ARGUMENT");
+        {
+            /* The Metalink entry point takes the same struct and must refuse
+             * the same NULL rather than read through it. */
+            hydra_metalink_t *doc = NULL;
+            hydra_job_id_t id = 0;
+            CHECK(hydra_metalink_parse(
+                      "<metalink xmlns=\"urn:ietf:params:xml:ns:metalink\"><file name=\"f\">"
+                      "<size>1</size><url>https://example.invalid/f</url></file></metalink>",
+                      &doc) == HYDRA_OK,
+                  "a minimal document should parse");
+            CHECK(hydra_job_create_from_metalink(engine, doc, 0, NULL, &id)
+                      == HYDRA_ERR_INVALID_ARGUMENT,
+                  "a NULL job config should be INVALID_ARGUMENT on the Metalink path too");
+            hydra_metalink_free(doc);
+        }
+        CHECK(hydra_event_wake(engine) == HYDRA_OK, "wake with nobody waiting is fine");
         CHECK(hydra_engine_set_log_callback(engine, NULL, NULL, HYDRA_LOG_INFO) == HYDRA_OK,
               "clearing the log sink should succeed");
 
