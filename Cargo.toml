@@ -75,7 +75,7 @@ webpki-roots = "1.0"
 rustls-pki-types = "1"
 # Benchmark harness. `default-features = false` drops the plotters/rayon tree:
 # the suite reports to stdout and JSON, and nothing here renders SVGs.
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.clippy]
 # The scheduler does real arithmetic on measured quantities; these lints fight it.
