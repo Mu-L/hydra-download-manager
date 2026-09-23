@@ -89,34 +89,9 @@ impl Admission {
             return Admit::Add;
         }
 
-        // The bar is a FRACTION OF PROPORTIONAL SCALING, not a fixed fraction of the
-        // single-connection rate.
-        //
-        // Judging a step against `min_gain_frac * samples[0]` asks the wrong question.
-        // It asks "did throughput improve at all", and on a warming path the answer is
-        // always yes — TCP flows admitted a window ago are still opening their
-        // congestion windows, so aggregate throughput keeps rising whether or not the
-        // extra concurrency is doing anything. Measured consequence: the search reached
-        // the ceiling in 9 of 12 runs on paths where a single connection was 1.8-3.2x
-        // faster than the ceiling it chose.
-        //
-        // The right question is "did throughput improve as much as adding these
-        // connections should have". Doubling from k to 2k on a link with genuine
-        // headroom roughly doubles delivery; doubling on a saturated link leaves it
-        // flat. Comparing the observed ratio against the ratio of connection counts
-        // separates those two cases, and it does so without needing to know the link's
-        // capacity or RTT.
-        //
-        // `min_gain_frac` becomes the share of proportional scaling required: 0.15 means
-        // a step must deliver at least 15% of what perfect scaling would have. That is
-        // permissive enough to admit a genuinely parallel path (where the ratio
-        // approaches 1.0) and strict enough to refuse a saturated one (where it
-        // approaches 0).
         if !self.step_pays(n - 1) {
-            // The previous level was as good: settle at the best one MEASURED, which
-            // is not necessarily the previous one — a noisy window can make an
-            // intermediate level look best, and the point of the search is to end up
-            // where the throughput actually was.
+            // Settle at the best level MEASURED, not the previous one: a noisy
+            // window can make an intermediate level the true peak.
             self.settled = Some(self.best_level());
             Admit::Stop
         } else {
@@ -126,15 +101,15 @@ impl Admission {
 
     /// Did the step into sample `i` deliver enough to justify the connections it added?
     ///
-    /// Measured as a fraction of PROPORTIONAL scaling. Doubling the connections on a
-    /// link with real headroom roughly doubles delivery; doubling on a saturated link
-    /// leaves delivery flat. The ratio of the two separates those cases without needing
-    /// to know the link's capacity or RTT, and it is scale-free, so it works the same at
-    /// 1 -> 2 as at 4 -> 8.
-    ///
-    /// `min_gain_frac` is therefore the share of perfect scaling required: 0.15 means a
-    /// step must realise at least 15% of the throughput it would have gained if the
-    /// added connections were free and the link were unlimited.
+    /// Measured as a fraction of PROPORTIONAL scaling, not of the single-connection
+    /// rate: on a warming path throughput rises whether or not the extra concurrency
+    /// does anything (judging against `samples[0]` sent the search to the ceiling in
+    /// 9 of 12 runs where one connection was 1.8-3.2x faster). Doubling on a link
+    /// with headroom roughly doubles delivery; doubling on a saturated one leaves it
+    /// flat. The ratio separates the two without knowing capacity or RTT and is
+    /// scale-free, so 1 -> 2 is judged like 4 -> 8. `min_gain_frac` is the share of
+    /// perfect scaling required: 0.15 admits a genuinely parallel path (ratio near
+    /// 1.0) and refuses a saturated one (near 0).
     fn step_pays(&self, i: usize) -> bool {
         if i == 0 || i >= self.samples.len() {
             return false;
@@ -162,27 +137,22 @@ impl Admission {
     /// origin load, and less exposure to the repair machinery. That is what lets the
     /// search return "one" on a path a single stream already saturates, which is the
     /// case that motivated the whole in-band ramp.
+    ///
+    /// The last level whose own step paid, by the SAME `step_pays` rule the
+    /// admission test applies, stopping at the first that did not: levels beyond
+    /// it were reached on earlier gains, not their own. Scoring against a band
+    /// around the peak instead let a level be refused and adopted in the same
+    /// breath, because accumulated gains make the top sample the highest even
+    /// when the final step was worthless.
     fn best_level(&self) -> usize {
         if self.samples.is_empty() {
             return 1;
         }
-        // Walk the levels in order and keep the last one whose own step paid its way,
-        // by the SAME per-connection rule the admission test applies. Comparing every
-        // sample against a band around the peak instead would re-admit a level the
-        // test had just refused: gains accumulate, so after several steps the top
-        // sample is the highest even when the final step was worthless.
-        // Uses the SAME rule as `observe_at`, deliberately. An earlier version scored
-        // levels against a band around the peak while `observe_at` tested a per-step
-        // gain, and the two disagreed: a level whose step had just been refused could
-        // still come back as "best", so the search rejected a level and adopted it in
-        // the same breath. One rule, applied in one place, cannot contradict itself.
         let mut best = self.levels.first().copied().unwrap_or(1);
         for i in 1..self.samples.len() {
             if self.step_pays(i) {
                 best = self.levels[i];
             } else {
-                // The first step that fails to pay ends the search. Levels beyond it
-                // were reached on the strength of earlier gains, not their own.
                 break;
             }
         }

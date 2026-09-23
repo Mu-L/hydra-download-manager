@@ -204,8 +204,6 @@ mod tests {
 
     #[test]
     fn a_ranking_shifts_share_without_starving_the_rest() {
-        // Splitting only by rank would concentrate the object on one host and
-        // throw away the redundancy the list exists to provide.
         let s = vec![SourcePlan::ranked(1), SourcePlan::ranked(4)];
         let got = allocate(&s, 6, 8, 16);
         assert_eq!(got.iter().sum::<usize>(), 6);
@@ -215,10 +213,6 @@ mod tests {
 
     #[test]
     fn the_output_is_in_input_order_not_rank_order() {
-        // A caller's targets, hostnames and progress rows are index-aligned with
-        // this. Re-ordering to put the best mirror first would scramble them
-        // silently — every row would describe a different host than it fetches
-        // from.
         let s = vec![SourcePlan::ranked(9), SourcePlan::ranked(1)];
         let got = allocate(&s, 4, 8, 16);
         assert!(got[1] > got[0], "the better mirror is at index 1: {got:?}");
@@ -226,8 +220,6 @@ mod tests {
 
     #[test]
     fn the_aggregate_ceiling_is_never_multiplied_by_the_mirror_count() {
-        // Eight connections over two mirrors is still eight sockets, which is
-        // what an operator feels.
         for n in 1..8usize {
             let got = allocate(&flat(n), 8, 8, 2);
             assert_eq!(got.iter().sum::<usize>(), 2, "n={n} {got:?}");
@@ -236,8 +228,6 @@ mod tests {
 
     #[test]
     fn a_mirrors_own_stated_ceiling_narrows_but_never_widens_the_clients() {
-        // `maxconnections="1"` is an operator of a volunteer machine stating a
-        // limit for their own host, and it must not be rounded up past.
         let s = vec![
             SourcePlan {
                 priority: 1,
@@ -249,8 +239,6 @@ mod tests {
         assert_eq!(got[0], 1, "the stated ceiling binds: {got:?}");
         assert!(got[1] > 1);
 
-        // A mirror claiming it can take sixty-four does not get to override the
-        // user's own politeness setting.
         let greedy = vec![SourcePlan {
             priority: 1,
             max_connections: Some(64),
@@ -260,9 +248,6 @@ mod tests {
 
     #[test]
     fn surplus_budget_is_dropped_rather_than_spent_on_an_unseated_host() {
-        // Every seated source at its ceiling with budget left over. Seating
-        // another host to spend it would defeat the per-host ceiling by
-        // arithmetic — the aggregate would be honoured and the intent would not.
         let s = vec![
             SourcePlan {
                 priority: 1,
@@ -281,7 +266,6 @@ mod tests {
 
     #[test]
     fn more_mirrors_than_sockets_leaves_a_reserve_bench_in_rank_order() {
-        // The normal case for a real mirror list: nineteen hosts, four sockets.
         let s: Vec<SourcePlan> = (0..19).map(|i| SourcePlan::ranked(19 - i as u32)).collect();
         let got = allocate(&s, 4, 4, 16);
         assert_eq!(got.iter().sum::<usize>(), 4);
@@ -299,8 +283,6 @@ mod tests {
 
     #[test]
     fn allocation_is_deterministic_across_runs() {
-        // A download that opens different mirrors on every attempt cannot be
-        // debugged from its logs.
         let s = vec![
             SourcePlan::ranked(3),
             SourcePlan::ranked(3),
