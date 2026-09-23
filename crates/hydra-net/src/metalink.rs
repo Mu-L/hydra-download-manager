@@ -839,9 +839,7 @@ fn read_url(attrs: &[crate::xml::Attr], text: &str) -> Option<MetaUrl> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Metalink over HTTP (RFC 6249)
-// ---------------------------------------------------------------------------
+// Metalink over HTTP (RFC 6249).
 
 /// One parsed `Link:` header field.
 #[derive(Clone, Debug, PartialEq, Eq)]

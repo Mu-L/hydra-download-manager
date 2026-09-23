@@ -173,6 +173,93 @@ impl Proxy {
     }
 }
 
+impl Proxy {
+    /// The proxy the environment names, if any.
+    ///
+    /// `all_proxy`, then `https_proxy`, then `http_proxy`, each in lower case
+    /// and then upper case; the first that is set decides. `Ok(None)` when none
+    /// is set. A value that is set but does not parse is an error naming the
+    /// variable, because a proxy the user configured and then typed wrong is
+    /// not the same thing as no proxy at all.
+    pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_vars(|k| std::env::var(k).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, String> {
+        const VARS: [&str; 6] = [
+            "all_proxy",
+            "ALL_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "HTTP_PROXY",
+        ];
+        for name in VARS {
+            let Some(raw) = var(name) else { continue };
+            if raw.trim().is_empty() {
+                continue;
+            }
+            return Self::parse(&raw)
+                .map(Some)
+                .map_err(|e| format!("{name}: {e}"));
+        }
+        Ok(None)
+    }
+
+    /// Whether `host` should be reached directly rather than through this
+    /// proxy: true when there is no proxy, or when `no_proxy` / `NO_PROXY`
+    /// lists the host.
+    ///
+    /// The list is comma-separated. `*` matches everything; an entry matches
+    /// the host itself or any subdomain of it, with or without a leading dot;
+    /// a `:port` on an entry is ignored. Case does not matter.
+    pub fn bypasses(&self, host: &str) -> bool {
+        if self.kind == ProxyKind::None {
+            return true;
+        }
+        let list = std::env::var("no_proxy")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var("NO_PROXY").ok())
+            .unwrap_or_default();
+        no_proxy_matches(&list, host)
+    }
+}
+
+/// The `no_proxy` rule, curl-style.
+fn no_proxy_matches(list: &str, host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    list.split(',').map(str::trim).any(|entry| {
+        if entry == "*" {
+            return true;
+        }
+        let entry = match entry.strip_prefix('[') {
+            // A bracketed IPv6 literal, with or without a port.
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => entry.rsplit_once(':').map_or(entry, |(h, port)| {
+                // `host:port` — unless the colon belongs to a bare IPv6 address.
+                if port.chars().all(|c| c.is_ascii_digit()) {
+                    h
+                } else {
+                    entry
+                }
+            }),
+        };
+        let entry = entry
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        !entry.is_empty()
+            && (host == entry
+                || host
+                    .strip_suffix(entry.as_str())
+                    .is_some_and(|prefix| prefix.ends_with('.')))
+    })
+}
+
 /// Complete a SOCKS handshake on an already-connected stream, leaving it ready to
 /// carry application bytes to `(dst_host, dst_port)`.
 pub async fn handshake<S>(s: &mut S, proxy: &Proxy, dst_host: &str, dst_port: u16) -> io::Result<()>
@@ -418,6 +505,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_environment_is_read_in_curl_order_with_case_variants() {
+        let env = |pairs: &'static [(&str, &str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(Proxy::from_vars(env(&[])), Ok(None));
+        let p = Proxy::from_vars(env(&[("HTTP_PROXY", "proxy.corp:3128")]))
+            .unwrap()
+            .unwrap();
+        assert_eq!((p.kind, p.port), (ProxyKind::Http, 3128));
+        // all_proxy wins over the scheme-specific ones.
+        let p = Proxy::from_vars(env(&[
+            ("http_proxy", "http://h:1"),
+            ("all_proxy", "socks5://s:1080"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.kind, ProxyKind::Socks5);
+        // An empty value is "unset", not a proxy with no host.
+        assert_eq!(Proxy::from_vars(env(&[("https_proxy", "  ")])), Ok(None));
+        // A value that is set but wrong is reported, naming the variable.
+        let e = Proxy::from_vars(env(&[("https_proxy", "ftp://p:1")])).unwrap_err();
+        assert!(e.starts_with("https_proxy:"), "{e}");
+    }
+
+    #[test]
+    fn no_proxy_matches_hosts_domains_and_wildcards() {
+        let list = "localhost, .internal.example, corp.example:8080, 10.0.0.1, [::1]:80";
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "a.internal.example",
+            "internal.example",
+            "corp.example",
+            "sub.corp.example",
+            "10.0.0.1",
+            "::1",
+        ] {
+            assert!(no_proxy_matches(list, host), "{host} should bypass");
+        }
+        for host in [
+            "notlocalhost",
+            "internal.example.com",
+            "xcorp.example",
+            "10.0.0.10",
+            "",
+        ] {
+            assert!(!no_proxy_matches(list, host), "{host} should not bypass");
+        }
+        assert!(no_proxy_matches("*", "anything.example"));
+        assert!(!no_proxy_matches("", "anything.example"));
+        // No proxy at all bypasses everything, whatever the list says.
+        assert!(Proxy::none().bypasses("anything.example"));
+    }
 
     #[test]
     fn schemes_and_default_ports_parse() {

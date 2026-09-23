@@ -160,56 +160,11 @@ pub fn to_hex(value: &str, algo: Algo) -> Option<String> {
         return Some(v.to_ascii_lowercase());
     }
     // Otherwise base64.
-    let raw = b64_decode(v)?;
+    let raw = crate::base64::decode(v)?;
     if raw.len() != want_bytes {
         return None;
     }
     Some(raw.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Minimal standard base64 decoder (accepts unpadded input).
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a') as u32 + 26),
-            b'0'..=b'9' => Some((c - b'0') as u32 + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = s
-        .bytes()
-        .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
-        .collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let mut acc = 0u32;
-        let mut n = 0;
-        for &c in chunk {
-            acc = (acc << 6) | val(c)?;
-            n += 1;
-        }
-        match n {
-            4 => {
-                out.push((acc >> 16) as u8);
-                out.push((acc >> 8) as u8);
-                out.push(acc as u8);
-            }
-            3 => {
-                acc <<= 6;
-                out.push((acc >> 16) as u8);
-                out.push((acc >> 8) as u8);
-            }
-            2 => {
-                acc <<= 12;
-                out.push((acc >> 16) as u8);
-            }
-            _ => return None,
-        }
-    }
-    Some(out)
 }
 
 /// An ETag that is *probably* the content MD5, with that uncertainty preserved.
