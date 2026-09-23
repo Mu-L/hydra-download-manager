@@ -183,10 +183,15 @@ The asymmetry between the two configuration structs and everything else is the
 whole forward-compatibility mechanism. `hydra_engine_config_t` and
 `hydra_job_config_t` begin with a `size` field that the caller sets to
 `sizeof` *their* struct — which is what `HYDRA_ENGINE_CONFIG_INIT` and
-`HYDRA_JOB_CONFIG_INIT` do for you. The library reads and writes at most that
-many bytes and defaults everything past it. Every other struct is either
-allocated by the library and handed to you, or allocated by you and filled in
-by the library at a size it must not guess at; neither can grow.
+`HYDRA_JOB_CONFIG_INIT` do for you. The library reads at most that many bytes
+and defaults everything past it. The init calls write the fields this build
+knows and **zero the rest, up to `size`**: a program built against a *newer*
+header than the library has fields the library cannot name, and zero is the
+value every appended field is defined to default from, so those fields are
+initialised too rather than left holding the caller's stack. Every other
+struct is either allocated by the library and handed to you, or allocated by
+you and filled in by the library at a size it must not guess at; neither can
+grow.
 
 **New enumerators and old programs.** A new enumerator is only safe because the
 library never *sends* one to a caller who cannot know it. A new `hydra_event_type_t`
@@ -292,7 +297,8 @@ message, errno, HTTP status — is in a **thread-local** slot readable with
 never parse the message.
 
 `HYDRA_ERR_AGAIN` is not a failure. It means "nothing to report right now", and
-the non-blocking event calls return it constantly. Use `HYDRA_IS_ERROR()`
+the non-blocking event calls return it constantly — as does a
+`hydra_event_wait` that `hydra_event_wake` released. Use `HYDRA_IS_ERROR()`
 rather than a bare `!= HYDRA_OK` when you mean "something went wrong".
 
 ### Panics
@@ -308,9 +314,30 @@ No Rust panic crosses this boundary. An internal failure becomes
 | job operations | thread-safe |
 | event consumption | thread-safe, but intended for ONE consumer |
 | `hydra_engine_destroy` | synchronisation-sensitive: must not race with any other call on the same engine |
+| event callback | runs on an engine thread, outside every internal lock; must not block |
+| log callback | runs on an engine thread with the sink held; must not call back into the engine |
 
 Each function's own comment in the header states whether it blocks and whether
 it allocates.
+
+**Re-entrancy.** The event callback is invoked after the event has been
+queued and after every internal lock has been released, so it may read state
+(`hydra_job_get_progress`, `hydra_job_get_snapshot`) and issue job commands
+(`hydra_job_pause`, `hydra_job_cancel`). It must not call
+`hydra_engine_shutdown`, `hydra_engine_destroy` or a blocking
+`hydra_event_wait`: each of those waits for the engine thread the callback is
+occupying. The log callback is stricter — it runs with the sink held, which is
+what makes `hydra_engine_set_log_callback(engine, NULL, …)` synchronous (once
+it returns, no delivery is in flight and `user_data` may be freed), and so it
+must not call back into the engine at all.
+
+**Destroy while a callback is executing.** `hydra_engine_destroy` first stops
+every job and waits up to two seconds for transfers to stop (unless
+`hydra_engine_shutdown` already did), then gives the runtime half a second to
+wind down. A callback still executing past that is left to finish on its own
+thread: nothing the library owns is freed underneath it, because the engine's
+state is reference-counted and the thread holds a reference — but `user_data`
+is yours, and it must outlive the callback, not merely the destroy call.
 
 ### Runtime
 
@@ -474,6 +501,11 @@ was not paused. Any of them may follow JOB_STARTED directly — a bad URL fails
 before RESOLVED, a cancel can land at any point.
 ```
 
+"Last" is enforced, not hoped for: queueing PAUSED or a terminal event discards
+that job's pending progress sample, so a consumer never sees a PROGRESS for a
+job it has already seen finish. The event itself carries the final
+`progress`.
+
 There is **no** ordering guarantee between events belonging to different jobs.
 Two jobs run concurrently on threads hydra owns, so an application must treat
 each job's stream as independent — which is also what makes the queue easy to
@@ -485,6 +517,16 @@ Several threads may call the event functions safely, but every event is
 delivered **exactly once**. A thread draining the queue while waiting for job A
 will consume and discard job B's completion unless it keeps it. Drain in one
 place and dispatch from there.
+
+### Waking the consumer
+
+`hydra_event_wake()` releases every thread blocked in `hydra_event_wait()`,
+including one waiting with `HYDRA_WAIT_FOREVER`; the released calls return
+`HYDRA_ERR_AGAIN` and consume nothing. It is how a host tells its own consumer
+thread to look at a flag of its own without shutting the engine down. A wake
+is not remembered: one issued while nobody is waiting does nothing, so a
+consumer that must be stopped checks its flag *after* every return rather than
+relying on a single wake landing.
 
 ### Callback pointers
 
@@ -620,3 +662,92 @@ make ffi-test       # the Rust suite, the C/C++ conformance program, and
 
 See [bindings.md](bindings.md) for worked examples in Go, Python, C#, Dart, Zig
 and C++.
+
+---
+
+## 8. The exported symbols
+
+Every function `include/hydra.h` declares, in the order the header groups
+them. This is the index; the header comment on each is the contract, and
+[§6.1](#61-the-header-cannot-drift-from-the-implementation) is what keeps the
+two from disagreeing. "Blocking" here means the call may wait on something
+other than a lock held briefly by another hydra call.
+
+### Version and errors
+
+| Symbol | What it does | Notes |
+|---|---|---|
+| `hydra_ffi_abi_version` | The ABI version the library implements. | Check against `HYDRA_FFI_ABI_VERSION` first. |
+| `hydra_ffi_version_string` | The library version, as a static string. | Never freed. |
+| `hydra_error_name` | The stable spelling of an error code. | Static string; unknown codes give `HYDRA_ERR_UNKNOWN`. |
+| `hydra_last_error` | The detail behind this thread's last failure. | Thread-local; allocates `message`. |
+| `hydra_error_free` | Release an error's message. | NULL-safe; repeat-safe. |
+| `hydra_string_free` | Release a `hydra_string_t`. | NULL-safe. |
+| `hydra_succeeded`, `hydra_failed`, `hydra_is_error` | The classifiers behind `HYDRA_SUCCEEDED()`, `HYDRA_FAILED()`, `HYDRA_IS_ERROR()`. | `static inline` in the header, not in the library. |
+
+### Configuration
+
+| Symbol | What it does | Notes |
+|---|---|---|
+| `hydra_engine_config_init` | Defaults into a caller-sized `hydra_engine_config_t`. | Use `HYDRA_ENGINE_CONFIG_INIT`. |
+| `hydra_job_config_init` | Defaults into a caller-sized `hydra_job_config_t`. | Use `HYDRA_JOB_CONFIG_INIT`. |
+| `hydra_runtime_policy_init` | The permissive policy: any network, full power. | |
+
+### Engine
+
+| Symbol | What it does | Notes |
+|---|---|---|
+| `hydra_engine_create` | Create an engine and its threads. | NULL on failure; detail in `hydra_last_error`. |
+| `hydra_engine_shutdown` | Pause every job, persist, close the queue. | Blocking up to `timeout_ms`; idempotent. |
+| `hydra_engine_destroy` | Release everything the engine owns. | Must not race with any other call; see §4. |
+| `hydra_engine_set_policy`, `hydra_engine_get_policy` | Replace or read the platform policy. | Applies to jobs started afterwards. |
+| `hydra_engine_set_max_bytes_per_second` | The engine-wide rate ceiling. | Live; 0 = none. |
+| `hydra_engine_set_max_jobs` | How many jobs may execute at once. | Never preempts. |
+| `hydra_engine_get_metrics` | The engine's lifetime counters. | |
+| `hydra_engine_list_jobs` | Every job id, in creation order. | Allocates; `hydra_job_id_array_free`. |
+| `hydra_job_id_array_free` | Release a job-id array. | NULL-safe; repeat-safe. |
+| `hydra_engine_snapshot` | Write the state file now. | Blocking (file I/O); needs `state_path`. |
+| `hydra_engine_restore` | Load jobs from the state file, all paused. | Blocking (file I/O); credentials not restored. |
+| `hydra_engine_set_log_callback` | Install or clear the diagnostics sink. | Per engine; see the re-entrancy rule in §4. |
+
+### Jobs
+
+| Symbol | What it does | Notes |
+|---|---|---|
+| `hydra_job_create` | Create a job from a URL list. | Nothing runs unless `auto_start`. |
+| `hydra_job_start` | Start, or restart from the range map. | Legal from created, paused, failed, cancelled. |
+| `hydra_job_pause` | Stop, keeping everything needed to resume. | Asynchronous; `HYDRA_EVENT_PAUSED` when done. |
+| `hydra_job_resume` | Continue a paused job. | Paused only; `hydra_job_start` for the rest. |
+| `hydra_job_cancel` | End a job, keeping or removing the partial file. | Removes a file only if an attempt ever ran. |
+| `hydra_job_remove` | Forget a job and its persisted record. | Not while running; never touches the file. |
+| `hydra_job_set_credentials` | Set or clear the login. | Next attempt; for restored jobs. |
+| `hydra_job_set_output_path` | Re-aim the destination. | Not while active. |
+| `hydra_job_set_max_bytes_per_second` | The job's own rate ceiling. | Live; 0 = none. |
+| `hydra_job_get_state`, `hydra_job_get_progress` | Read state or progress. | Copies; nothing to free. |
+| `hydra_job_get_snapshot` | An owned, consistent picture of a job. | Allocates; `hydra_job_snapshot_free`. |
+| `hydra_job_snapshot_free` | Release a snapshot's strings. | NULL-safe; repeat-safe. |
+| `hydra_job_get_sources` | Per-source contribution. | **Experimental.** Allocates; `hydra_source_array_free`. |
+| `hydra_source_array_free` | Release a source array. | NULL-safe; repeat-safe. |
+
+### Events
+
+| Symbol | What it does | Notes |
+|---|---|---|
+| `hydra_event_next` | The next pending event, or `HYDRA_ERR_AGAIN`. | Non-blocking. |
+| `hydra_event_wait` | Wait up to `timeout_ms` for an event. | `HYDRA_WAIT_FOREVER` waits indefinitely. |
+| `hydra_event_wake` | Release every blocked `hydra_event_wait`. | Released calls return `HYDRA_ERR_AGAIN`. |
+| `hydra_event_set_callback` | Install or clear the convenience callback. | **Experimental.** Supplements the queue. |
+
+### Metalink
+
+| Symbol | What it does | Notes |
+|---|---|---|
+| `hydra_metalink_parse`, `hydra_metalink_open`, `hydra_metalink_fetch` | Read a document from memory, a file, or a URL. | `fetch` blocks; documents are capped at 4 MiB. |
+| `hydra_metalink_free` | Release a document. | NULL-safe; repeat-safe. |
+| `hydra_metalink_version` | Which dialect the document is. | |
+| `hydra_metalink_files` | Every file entry. | Allocates; `hydra_metalink_file_array_free`. |
+| `hydra_metalink_file_array_free` | Release a file array. | NULL-safe; repeat-safe. |
+| `hydra_metalink_mirrors` | One entry's mirrors, ranked. | Allocates; `hydra_metalink_url_array_free`. |
+| `hydra_metalink_url_array_free` | Release a mirror array. | NULL-safe; repeat-safe. |
+| `hydra_metalink_find_file` | An entry's index by name. | |
+| `hydra_job_create_from_metalink` | A job for one entry, with the document's attestation. | `urls` in the config are ignored. |
