@@ -447,7 +447,7 @@ fn decode_ext_value(v: &str) -> Option<String> {
     let (charset, rest) = v.split_once('\'')?;
     // The language tag is advisory for a filename; only its delimiter matters.
     let (_lang, encoded) = rest.split_once('\'')?;
-    let bytes = percent_decode(encoded);
+    let bytes = crate::url::percent_decode_bytes(encoded);
     let s = match charset.trim().to_ascii_lowercase().as_str() {
         // Latin-1 is the one legacy encoding that needs no table: every byte
         // is its own code point.
@@ -484,7 +484,7 @@ fn decode_legacy_filename(v: &str) -> String {
     if !raw.is_ascii() || !raw.contains('%') {
         return raw;
     }
-    match String::from_utf8(percent_decode(&raw)) {
+    match String::from_utf8(crate::url::percent_decode_bytes(&raw)) {
         Ok(d) if !d.is_ascii() && !d.trim().is_empty() => d,
         _ => raw,
     }
@@ -510,35 +510,6 @@ fn unquote(v: &str) -> String {
         }
     }
     out
-}
-
-/// Percent-decoding to BYTES: one escape can spell a byte that is only part
-/// of a character, so this cannot be done a `char` at a time.
-fn percent_decode(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex_nibble(b[i + 1]), hex_nibble(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    out
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// A server-supplied name reduced to a leaf that is safe to write: inside the
@@ -992,6 +963,32 @@ pub async fn fetch_object<C: Connector>(
             t.request_target().0
         )));
     }
+    // A caller that put a `Range:` in the headers wants that slice and nothing
+    // else: a 200 is the whole object, and a 206 from the wrong offset would be
+    // written as if it were the right one.
+    if let Some(lo) = t.extra_headers().find_map(range_header_start) {
+        if status != 206 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("server ignored the Range request and answered {status}"),
+            ));
+        }
+        let first = header_value(&h, "content-range")
+            .as_deref()
+            .and_then(parse_content_range_start)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "206 without a parsable Content-Range",
+                )
+            })?;
+        if first != lo {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("206 Content-Range starts at {first}, requested {lo}"),
+            ));
+        }
+    }
     let chunked = header_value(&h, "transfer-encoding")
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false);
@@ -1073,9 +1070,15 @@ pub async fn fetch_object<C: Connector>(
             pace.wait(n as u64).await;
             pending.extend_from_slice(&buf[..n]);
         }
+        if !saw_end {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("chunked body ended after {total} bytes, before its final chunk"),
+            ));
+        }
         // A trailer section may follow the zero chunk; leaving it unread
         // would poison the socket, so it is not offered back.
-        framed = saw_end && pending.is_empty();
+        framed = pending.is_empty();
     } else if let Some(len) = stated {
         // The common case, and the only one that makes reuse worthwhile:
         // read exactly as many bytes as were promised and stop there.
@@ -1455,20 +1458,8 @@ async fn probe_resilient_once<C: Connector>(c: &C, t: &Target) -> io::Result<Pro
     let answered = |p: &Probe| {
         p.status >= 200 && p.status < 400 && (p.size > 0 || p.stated_length().is_some())
     };
-    // A HEAD that is never answered must not hold the download forever.
-    //
-    // `s7.uplod.ir:182` accepts the connection, accepts the request, and then
-    // says nothing at all — no headers, no body, no close. The read loop in
-    // `probe` has no deadline of its own, so the probe never returned and the
-    // transfer sat in "Connecting..." indefinitely; the same URL answers
-    // `bytes=0-0` with `206`, its total length and range support. Silence is
-    // the strongest form of "no usable answer" this function already knows how
-    // to handle, so it is treated as one.
-    //
-    // The budget covers connect, TLS and one round trip together, because
-    // `probe` owns all three. Generous on purpose: exceeding it costs one extra
-    // request on a path that is already pathological, while a tight bound would
-    // spend that request on every slow-but-healthy link.
+    // An origin that accepts the request and then says nothing (`s7.uplod.ir`)
+    // has no usable answer; the budget covers connect, TLS and the round trip.
     const HEAD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
     let head = match tokio::time::timeout(HEAD_PATIENCE, probe(c, t)).await {
         Ok(r) => r,
@@ -2112,53 +2103,21 @@ pub(crate) async fn fetch_range<C: Connector>(
         });
         last = now;
     }
-    // The peer closing early is NOT success. A truncating origin advertises an
-    // honest-looking Content-Length and then closes mid-body; returning Ok here
-    // let the caller treat a short read as a delivered range, so the bytes that
-    // never arrived were never re-requested. `UnexpectedEof` is retryable, which
-    // is the correct disposition: the range may well arrive on a second attempt.
-    // ---- return the connection for reuse, if and only if it is safe ----------
-    //
-    // The test is not "did the transfer succeed" but "does the client know exactly
-    // where this response ended". Anything left unread in the socket becomes the
-    // first bytes of whatever request goes out next, which corrupts that response
-    // at the wrong file offsets while keeping a plausible length — the same failure
-    // shape as the positional-write and double-count defects before it.
-    //
-    // Three separate reasons to refuse, and the third is peculiar to this
-    // scheduler:
-    //   * the server said `Connection: close` — it will not serve another request
-    //     on this socket, so pooling it guarantees the next user a dead stream;
-    //   * the body did not reach the far end we asked for (`off < hi_final`), so
-    //     an unknown number of bytes is still arriving;
-    //   * the far end MOVED (`hi_final < hi_at_request`), meaning a repair took
-    //     this connection's tail. The loop stopped early by design and the server
-    //     is still sending toward the original end, so the socket has unread body
-    //     in it. Preemption remains free on the wire; the cost is that this one
-    //     connection cannot be reused. Pooling it here would trade a bounded,
-    //     already-paid cost for silent corruption.
     let hi_final = bound.get();
     let shrunk = hi_final < hi;
     let server_will_close = header_value(&head_str, "connection")
         .map(|v| v.to_ascii_lowercase().contains("close"))
         .unwrap_or(false);
-    // A fourth reason, and the one that needs no repair to go wrong: the response
-    // was not a `206`. A `200` to a request from offset 0 is accepted above,
-    // because the bytes are the object's and they belong where they land — but its
-    // body is the WHOLE object while this loop reads only as far as `hi`, so the
-    // remainder is still in the socket. `off >= hi_final` is satisfied and says
-    // nothing. Only a partial response is known to have ended where the client
-    // stopped reading.
-    let framed_exactly = status == 206 && !over_read;
     if let Some(p) = pool.as_ref() {
-        if framed_exactly && !shrunk && !server_will_close && off >= hi_final {
+        if may_pool(status, over_read, server_will_close, shrunk, off, hi_final) {
             p.put(&t, s);
         }
     }
 
-    // A shrink is not a truncation. If the bound moved below where the loop
-    // stopped, the remainder was deliberately handed to another connection and
-    // this range is complete as redefined; only a genuinely short body is an error.
+    // A shrink is not a truncation: the bound moved below where the loop
+    // stopped because the remainder was handed to another connection. The
+    // peer closing early IS a truncation, and `UnexpectedEof` is retryable:
+    // returning Ok here once let a short read pass as a delivered range.
     let hi = hi_final;
     if off < hi {
         return Err(io::Error::new(
@@ -2733,6 +2692,32 @@ pub(crate) fn header_value(head: &str, name: &str) -> Option<String> {
         .map(|l| l[name.len() + 1..].trim().to_string())
 }
 
+/// Whether a range connection can go back to the pool: only when the client
+/// knows exactly where the response ended, because anything left unread in
+/// the socket becomes the first bytes of the next response. `Connection:
+/// close`, a body that stopped short of the far end, a far end moved by a
+/// repair (the server is still sending toward the old one), or a `200`
+/// whose body is the whole object all leave bytes behind.
+fn may_pool(
+    status: u16,
+    over_read: bool,
+    server_will_close: bool,
+    shrunk: bool,
+    off: u64,
+    hi_final: u64,
+) -> bool {
+    status == 206 && !over_read && !server_will_close && !shrunk && off >= hi_final
+}
+
+/// First byte position of a verbatim `Range: bytes=<first>-<last>` header line.
+fn range_header_start(line: &str) -> Option<u64> {
+    if !crate::is_field(line, "range") {
+        return None;
+    }
+    let spec = line["range:".len()..].trim().strip_prefix("bytes=")?;
+    spec.split('-').next()?.trim().parse().ok()
+}
+
 /// First byte position of a `Content-Range: bytes <first>-<last>/<len>` header.
 fn parse_content_range_start(v: &str) -> Option<u64> {
     let rest = v.trim().strip_prefix("bytes")?.trim_start();
@@ -3015,6 +3000,132 @@ mod tests {
             .expect("a stale pooled socket must be retried, not surfaced");
             assert_eq!(n, 2);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scripted origin for `fetch_object`: one thread, one response per
+    /// request, chosen by the request line and the `Range` header it carried.
+    fn scripted_origin(
+        respond: impl Fn(&str, Option<(u64, u64)>) -> Vec<u8> + Send + 'static,
+    ) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let Ok(peek) = sock.try_clone() else { continue };
+                let mut r = BufReader::new(peek);
+                let mut line = String::new();
+                let _ = r.read_line(&mut line);
+                let mut range = None;
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = h.strip_prefix("Range: bytes=") {
+                        let (lo, hi) = v.trim().split_once('-').unwrap();
+                        range = Some((lo.parse::<u64>().unwrap(), hi.parse::<u64>().unwrap()));
+                    }
+                }
+                let _ = sock.write_all(&respond(&line, range));
+                let _ = sock.flush();
+            }
+        });
+        port
+    }
+
+    /// A chunked body that stops before its `0` chunk is a truncated
+    /// segment, and must not come back as a successful fetch of what arrived.
+    #[tokio::test]
+    async fn a_chunked_body_cut_before_its_final_chunk_is_an_error() {
+        let port = scripted_origin(|_, _| {
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3\r\nwor".to_vec()
+        });
+        let dir = std::env::temp_dir().join(format!("hya-net-cut-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("seg");
+        let t = Target::direct("127.0.0.1", port, "/seg");
+        let err = fetch_object(
+            &crate::TcpConnector,
+            &t,
+            out.to_str().unwrap(),
+            &AtomicU64::new(0),
+            None,
+            &Pace::unlimited(),
+            None,
+        )
+        .await
+        .expect_err("a body cut mid-chunk is not a delivered object");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A caller that asked for a byte range gets exactly that range: a 200 is
+    /// the whole object, and a 206 from another offset is the wrong bytes.
+    #[tokio::test]
+    async fn fetch_object_insists_on_206_at_the_requested_offset() {
+        let port = scripted_origin(|line, range| {
+            let object: Vec<u8> = (0..100u8).collect();
+            match range {
+                Some((lo, hi)) if line.starts_with("GET /ok") => {
+                    let body = &object[lo as usize..=hi as usize];
+                    let mut r = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {lo}-{hi}/100\r\nContent-Length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    r.extend_from_slice(body);
+                    r
+                }
+                Some((lo, hi)) if line.starts_with("GET /shifted") => {
+                    let mut r = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/100\r\nContent-Length: {}\r\n\r\n",
+                        hi - lo,
+                        hi - lo + 1
+                    )
+                    .into_bytes();
+                    r.extend_from_slice(&object[..(hi - lo + 1) as usize]);
+                    r
+                }
+                _ => {
+                    let mut r = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".to_vec();
+                    r.extend_from_slice(&object);
+                    r
+                }
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("hya-net-206-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("seg");
+        let fetch = |path: &str| {
+            let t = Target::direct("127.0.0.1", port, path)
+                .with_headers(vec!["Range: bytes=10-19".into()], None);
+            let out = out.clone();
+            async move {
+                fetch_object(
+                    &crate::TcpConnector,
+                    &t,
+                    out.to_str().unwrap(),
+                    &AtomicU64::new(0),
+                    None,
+                    &Pace::unlimited(),
+                    None,
+                )
+                .await
+            }
+        };
+        assert_eq!(fetch("/ok").await.unwrap(), 10);
+        assert_eq!(std::fs::read(&out).unwrap(), (10..20u8).collect::<Vec<_>>());
+
+        let err = fetch("/deaf").await.expect_err("a 200 is the whole object");
+        assert!(err.to_string().contains("ignored the Range"), "{err}");
+        let err = fetch("/shifted")
+            .await
+            .expect_err("bytes from offset 0 are not 10-19");
+        assert!(err.to_string().contains("starts at 0"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
