@@ -82,11 +82,8 @@ fn prepare_app_dir(dir: PathBuf) -> std::io::Result<PathBuf> {
 }
 
 fn main() -> iced::Result {
-    // `--config DIR` moves config.toml, the state db, logs and locales into
-    // DIR, so a portable install keeps its profile beside itself. It is
-    // resolved before anything else: the single-instance probe below already
-    // reads ipc.json out of the application directory, and two profiles are
-    // two independent instances.
+    // `--config DIR` is resolved before anything else: the single-instance
+    // probe below already reads ipc.json out of the application directory.
     match config_dir_arg(std::env::args_os()) {
         Ok(Some(dir)) => match prepare_app_dir(dir) {
             Ok(dir) => model::set_app_dir(dir),
@@ -102,36 +99,26 @@ fn main() -> iced::Result {
         }
     }
 
-    // From here on a panic lands in the session log rather than on a
-    // stdout nobody sees (the app dir is known now, so it goes to the right
-    // profile's log).
+    // From here on a panic lands in this profile's session log.
     log::catch_panics();
 
-    // Single instance: if a running instance answers on the extbus
-    // socket, hand it the spotlight (it opens its main window) and leave.
-    // Two instances would fight over state.redb, the tray, and ipc.json —
-    // the browser extension then talks to whichever wrote ipc.json last.
+    // Single instance: two would fight over state.redb, the tray and
+    // ipc.json, so a running one gets the spotlight and this one leaves.
     let minimized = std::env::args().any(|a| a == "--minimized");
     if extbus::signal_existing(minimized) {
         return Ok(());
     }
 
-    // Software rendering by default: this is a widget UI, not a shader
-    // workload, and the wgpu/Metal path costs a 100-300 MB baseline for
-    // swapchains and driver heaps where tiny-skia sits in the tens.
-    // `renderer = "gpu"` in config.toml opts back in.
+    // Software rendering by default: the wgpu/Metal path costs a 100-300 MB
+    // baseline where tiny-skia sits in the tens. `renderer = "gpu"` opts in.
     let pre = model::load_config();
     let want_gpu = pre.settings.gpu_render || pre.renderer.as_deref() == Some("gpu");
     if !want_gpu && std::env::var_os("ICED_BACKEND").is_none() {
         std::env::set_var("ICED_BACKEND", "tiny-skia");
     }
 
-    // The interface is drawn with the platform's own UI face, so a Hydra
-    // window looks like the windows beside it; Persian and Arabic keep the
-    // bundled Vazirmatn, because per-glyph fallback shaped some
-    // Arabic-script runs to nothing (blank button labels). Vazirmatn is
-    // loaded either way — it is the last resort when a machine has none of
-    // the faces its platform is supposed to have.
+    // The platform's own UI face, except Persian and Arabic, which keep the
+    // bundled Vazirmatn: per-glyph fallback shaped some runs to nothing.
     iced::daemon(boot, App::update, view)
         .title(title)
         .theme(theme_of)
@@ -236,19 +223,21 @@ fn boot() -> (App, Task<Message>) {
     // apps get no menu bar, and on macOS every Hydra menu lives there.
     #[cfg(target_os = "macos")]
     macos_dock::sync(app.cfg.settings.hide_from_taskbar, !start_hidden);
+    // Startup update check (Options > General), tray launch or not: a
+    // machine that boots Hydra into the tray every day is exactly the one
+    // that never sees a manual check. A dialog only ever opens on a positive
+    // answer; failures are silent — offline is normal.
+    let check = if app.cfg.settings.check_updates_on_startup {
+        let beta = app.cfg.settings.beta_channel;
+        Task::perform(update::check(beta), Message::UpdateChecked)
+    } else {
+        Task::none()
+    };
     if start_hidden {
-        (app, Task::none())
+        (app, check)
     } else {
         let open_main = app.open_window(WinKind::Main);
         let perm = app.check_folder_access();
-        // Startup update check (Options > General). A modal only ever opens
-        // on a positive answer; failures are silent — offline is normal.
-        let check = if app.cfg.settings.check_updates_on_startup {
-            let beta = app.cfg.settings.beta_channel;
-            Task::perform(update::check(beta), Message::UpdateChecked)
-        } else {
-            Task::none()
-        };
         (app, Task::batch([open_main, perm, check]))
     }
 }
@@ -358,17 +347,20 @@ fn subscription(app: &App) -> Subscription<Message> {
             }
             // Shortcuts fire only on events no widget consumed, so typing
             // Cmd+A inside a text field still selects text, not downloads.
-            // Every editable combo carries the command modifier; Escape (back
-            // out of an inline rename) and Alt+F4 (quit on Windows) are the
-            // two fixed conventions that do not, and nothing else is passed
-            // on — an unconsumed keystroke otherwise costs a full repaint.
+            // Every editable combo carries the command modifier; Escape (a
+            // dialog's Cancel), Enter (its default button) and Alt+F4 (quit
+            // on Windows) are the fixed conventions that do not, and nothing
+            // else is passed on — an unconsumed keystroke otherwise costs a
+            // full repaint.
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. })
                 if status == iced::event::Status::Ignored
                     && (modifiers.command()
                         || matches!(
                             key,
                             iced::keyboard::Key::Named(
-                                iced::keyboard::key::Named::Escape | iced::keyboard::key::Named::F4
+                                iced::keyboard::key::Named::Escape
+                                    | iced::keyboard::key::Named::Enter
+                                    | iced::keyboard::key::Named::F4
                             )
                         )) =>
             {
@@ -411,7 +403,14 @@ fn subscription(app: &App) -> Subscription<Message> {
     // then steps at the engine's event rate.
     // The marquee of a running virus scan needs the same tick even when no
     // transfer is left moving, so it is part of the condition.
-    if !power_save && (app.state.downloads.iter().any(|d| d.state.is_active()) || app.scanning()) {
+    let progress_open = app
+        .windows
+        .values()
+        .any(|k| matches!(k, WinKind::Progress(_)));
+    if !power_save
+        && ((progress_open && app.state.downloads.iter().any(|d| d.state.is_active()))
+            || app.scanning())
+    {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(80)).map(|_| Message::AnimTick),
         );
