@@ -21,6 +21,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::{cursor, execute, terminal};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Restores terminal state on drop, including during a panic.
@@ -270,19 +272,19 @@ impl Ui {
                     "━".repeat(filled),
                     "─".repeat(bar_w - filled),
                     frac * 100.0,
-                    crate::progress::human(done),
-                    crate::progress::human(sz)
+                    hya_core::fmt::bytes(done),
+                    hya_core::fmt::bytes(sz)
                 ));
             }
             _ => o.push_str(&format!(
                 "  {} downloaded (total size unknown)\r\n",
-                crate::progress::human(done)
+                hya_core::fmt::bytes(done)
             )),
         }
         if let Some(t) = live {
             o.push_str(&format!(
                 "  {}/s aggregate   {} request(s)   {} repair(s)\r\n",
-                crate::progress::human(t.rate as u64),
+                hya_core::fmt::bytes(t.rate as u64),
                 t.requests,
                 t.repairs
             ));
@@ -318,7 +320,7 @@ impl Ui {
                         "  #{i:<4} {host:<24} {mini} {:>9}-{:<9} {:>9}/s  {colour}{}\x1b[0m\r\n",
                         c.lo,
                         c.hi,
-                        crate::progress::human(c.rate as u64),
+                        hya_core::fmt::bytes(c.rate as u64),
                         c.health
                     ));
                 }
@@ -353,7 +355,7 @@ impl Ui {
                 queued,
                 done,
                 failed,
-                crate::progress::human(q.total_rate() as u64),
+                hya_core::fmt::bytes(q.total_rate() as u64),
                 q.max_active
             ),
             width = w.saturating_sub(24)
@@ -438,15 +440,15 @@ impl Ui {
                 .unwrap_or_else(|| "    ?".into());
             let size = it
                 .size
-                .map(crate::progress::human)
+                .map(hya_core::fmt::bytes)
                 .unwrap_or_else(|| "?".into());
             let _ = writeln!(
                 s,
                 "{marker} {colour}{tag}\x1b[0m {:<28} {bar} {pct} {:>10}/{:<10} {:>10}/s\x1b[0m\r",
                 trunc(&it.name(), 28),
-                crate::progress::human(it.done_bytes),
+                hya_core::fmt::bytes(it.done_bytes),
                 size,
-                crate::progress::human(it.rate as u64)
+                hya_core::fmt::bytes(it.rate as u64)
             );
             if let Some(e) = &it.error {
                 let _ = writeln!(
@@ -544,14 +546,17 @@ pub fn demo_screen() {
 ///
 /// `force_headless` exists because the detached worker must never try to take a terminal:
 /// it has none, and probing for one would make the decision depend on how it was spawned.
+///
+/// Returns how many items ended in failure, so a headless run can exit non-zero.
 pub async fn run_with(
     queue_path: PathBuf,
     initial: Vec<String>,
     max_active: usize,
     force_headless: bool,
-) -> io::Result<()> {
+    template: crate::download::Job,
+) -> io::Result<usize> {
     if force_headless {
-        return run_headless(queue_path, initial, max_active).await;
+        return run_headless(queue_path, initial, max_active, &template).await;
     }
     // Raw mode requires a terminal. Without this check the failure surfaces as
     // "Operation not permitted (os error 1)", which tells the user nothing about
@@ -559,16 +564,22 @@ pub async fn run_with(
     // script or a CI job is not locked out of the queue manager.
     use std::io::IsTerminal as _;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return run_headless(queue_path, initial, max_active).await;
+        return run_headless(queue_path, initial, max_active, &template).await;
     }
-    run_interactive(queue_path, initial, max_active).await
+    run_interactive(queue_path, initial, max_active, &template).await
 }
 
 /// Load the queue (or start a fresh one) and enqueue the URLs given on the
 /// command line. The shared entry step of both manager modes — headless and
 /// interactive must agree on how a queue resumes and how a bare URL is named.
-fn load_queue(queue_path: &std::path::Path, initial: Vec<String>, max_active: usize) -> Queue {
-    let mut q = Queue::load(queue_path).unwrap_or_else(|| Queue::new(max_active));
+fn load_queue(
+    queue_path: &std::path::Path,
+    initial: Vec<String>,
+    max_active: usize,
+) -> io::Result<Queue> {
+    let mut q = Queue::load(queue_path)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        .unwrap_or_else(|| Queue::new(max_active));
     q.max_active = max_active.max(1);
     for url in initial {
         let name = crate::url::Url::parse(&url)
@@ -576,7 +587,7 @@ fn load_queue(queue_path: &std::path::Path, initial: Vec<String>, max_active: us
             .unwrap_or_else(|| "download".into());
         q.add(vec![url], PathBuf::from(name));
     }
-    q
+    Ok(q)
 }
 
 /// Drive the queue to completion with no terminal, logging one line per event.
@@ -587,8 +598,9 @@ pub async fn run_headless(
     queue_path: PathBuf,
     initial: Vec<String>,
     max_active: usize,
-) -> io::Result<()> {
-    let mut q = load_queue(&queue_path, initial, max_active);
+    template: &crate::download::Job,
+) -> io::Result<usize> {
+    let mut q = load_queue(&queue_path, initial, max_active)?;
     eprintln!(
         "hydra: no terminal; running the queue headless ({} items)",
         q.items.len()
@@ -617,7 +629,12 @@ pub async fn run_headless(
             eprintln!("hydra: start #{id} {}", item.name());
             running.insert(
                 id,
-                tokio::spawn(crate::download::run(job_for(&item, Some(tick_tx.clone())))),
+                tokio::spawn(crate::download::run(job_for(
+                    &item,
+                    Some(tick_tx.clone()),
+                    template,
+                    None,
+                ))),
             );
         }
         let done: Vec<u64> = running
@@ -633,7 +650,7 @@ pub async fn run_headless(
                         q.finish(id, out.sha256.clone(), out.category.clone());
                         eprintln!(
                             "hydra: done #{id} {} {}",
-                            crate::progress::human(out.size),
+                            hya_core::fmt::bytes(out.size),
                             out.category.unwrap_or_default()
                         );
                         if let Some(c) = out.format_conflict {
@@ -674,9 +691,9 @@ pub async fn run_headless(
                     it.name(),
                     match (it.done_bytes, it.size) {
                         (d, Some(s)) if s > 0 => format!("{:.1}%", 100.0 * d as f64 / s as f64),
-                        (d, _) => crate::progress::human(d),
+                        (d, _) => hya_core::fmt::bytes(d),
                     },
-                    crate::progress::human(it.rate as u64) + "/s"
+                    hya_core::fmt::bytes(it.rate as u64) + "/s"
                 );
             }
         }
@@ -685,7 +702,7 @@ pub async fn run_headless(
     let (_, _, done, failed) = q.counts();
     eprintln!("hydra: queue finished — {done} done, {failed} failed");
     let _ = q.save(&queue_path);
-    Ok(())
+    Ok(failed)
 }
 
 /// Start a detached process that keeps working the queue after the UI exits.
@@ -734,13 +751,16 @@ fn spawn_worker(queue_path: &std::path::Path, max_active: usize) -> io::Result<u
 }
 
 /// The job the queue manager runs for one item, in either mode.
+///
+/// `template` carries the command line's download flags (headers, rate cap,
+/// proxy, cookies, connection count); the engine must stay quiet and
+/// progress-free because the manager owns the screen.
 fn job_for(
     item: &crate::queue::Item,
     ticks: Option<tokio::sync::mpsc::UnboundedSender<crate::download::Tick>>,
+    template: &crate::download::Job,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> crate::download::Job {
-    // Everything not named here is the engine default (`default_job` is already
-    // quiet and progress-free — the engine must not write to the screen while
-    // the manager owns it).
     crate::download::Job {
         ticks: ticks.map(|tx| (item.id, tx)),
         urls: item.urls.clone(),
@@ -748,7 +768,13 @@ fn job_for(
         resume: true,
         create_dirs: true,
         force: true, // queued items were already decided by the queue, not a prompt
-        ..crate::download::default_job()
+        quiet: true,
+        no_progress: true,
+        to_stdout: false,
+        no_save: false,
+        spider: false,
+        cancel: cancel.or_else(|| template.cancel.clone()),
+        ..template.clone()
     }
 }
 
@@ -756,8 +782,9 @@ async fn run_interactive(
     queue_path: PathBuf,
     initial: Vec<String>,
     max_active: usize,
-) -> io::Result<()> {
-    let mut q = load_queue(&queue_path, initial, max_active);
+    template: &crate::download::Job,
+) -> io::Result<usize> {
+    let mut q = load_queue(&queue_path, initial, max_active)?;
 
     let _guard = TerminalGuard::enter()?;
     let mut ui = Ui::new();
@@ -769,11 +796,16 @@ async fn run_interactive(
     let mut background_pid: Option<u32> = None;
     ui.log.push("ready");
 
-    // Running transfers, keyed by queue id.
+    // Running transfers, keyed by queue id, with the flag that stops each one.
+    // Setting the flag is what lets the engine end its range tasks and write
+    // the resume record; aborting the task alone left the sockets open until
+    // the runtime got round to dropping them.
     let mut running: std::collections::HashMap<
         u64,
         tokio::task::JoinHandle<crate::download::Outcome>,
     > = std::collections::HashMap::new();
+    let mut stops: std::collections::HashMap<u64, Arc<AtomicBool>> =
+        std::collections::HashMap::new();
 
     loop {
         // ---- start whatever may start ----
@@ -783,9 +815,16 @@ async fn run_interactive(
             };
             q.mark_running(id);
             ui.log.push(format!("start #{id} {}", item.name()));
+            let stop = Arc::new(AtomicBool::new(false));
+            stops.insert(id, stop.clone());
             running.insert(
                 id,
-                tokio::spawn(crate::download::run(job_for(&item, Some(tick_tx.clone())))),
+                tokio::spawn(crate::download::run(job_for(
+                    &item,
+                    Some(tick_tx.clone()),
+                    template,
+                    Some(stop),
+                ))),
             );
         }
 
@@ -796,6 +835,7 @@ async fn run_interactive(
             .map(|(id, _)| *id)
             .collect();
         for id in finished {
+            stops.remove(&id);
             if let Some(h) = running.remove(&id) {
                 match h.await {
                     Ok(out) if out.ok => {
@@ -803,7 +843,7 @@ async fn run_interactive(
                         q.finish(id, out.sha256.clone(), out.category.clone());
                         ui.log.push(format!(
                             "done #{id} {} {}",
-                            crate::progress::human(out.size),
+                            hya_core::fmt::bytes(out.size),
                             out.category.unwrap_or_default()
                         ));
                         if let Some(c) = out.format_conflict {
@@ -830,10 +870,13 @@ async fn run_interactive(
                     Command::Quit => break,
                     Command::Pause(id) => {
                         q.pause(id);
+                        if let Some(stop) = stops.remove(&id) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
                         if let Some(h) = running.remove(&id) {
-                            // Abort rather than waiting: the sidecar already records
-                            // what landed, so the bytes are not lost.
-                            h.abort();
+                            // The engine writes its resume record from what
+                            // it held on the way out; the join is short.
+                            let _ = h.await;
                         }
                         ui.log.push(format!("paused #{id}"));
                     }
@@ -843,8 +886,11 @@ async fn run_interactive(
                     }
                     Command::Cancel(id) => {
                         q.cancel(id);
+                        if let Some(stop) = stops.remove(&id) {
+                            stop.store(true, Ordering::Relaxed);
+                        }
                         if let Some(h) = running.remove(&id) {
-                            h.abort();
+                            let _ = h.await;
                         }
                         ui.log.push(format!("cancelled #{id}"));
                     }
@@ -952,21 +998,51 @@ async fn run_interactive(
             "       reattach with:  hydra interactive --queue-file {}",
             queue_path.display()
         );
-        return Ok(());
+        return Ok(0);
     }
 
     // Anything still running is recorded as paused, not lost: its bytes and
     // sidecar are on disk and `-c` or a later session picks them up.
+    for stop in stops.values() {
+        stop.store(true, Ordering::Relaxed);
+    }
     for (id, h) in running.drain() {
-        h.abort();
+        let _ = h.await;
         q.pause(id);
     }
     let _ = q.save(&queue_path);
-    Ok(())
+    let (_, _, _, failed) = q.counts();
+    Ok(failed)
 }
 
 #[cfg(test)]
 mod tests {
+    /// `--headless` exited 0 with failed items in the queue; a script driving
+    /// it had no way to know.
+    #[tokio::test]
+    async fn a_headless_run_reports_how_many_items_failed() {
+        let dir = std::env::temp_dir().join(format!("hydra_headless_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let queue = dir.join("queue.json");
+        // A port nobody listens on fails at once.
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let mut template = crate::download::default_job();
+        template.no_proxy = true;
+        template.output_dir = Some(dir.clone());
+        let failed = super::run_headless(
+            queue.clone(),
+            vec![format!("http://127.0.0.1:{port}/gone.bin")],
+            1,
+            &template,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     fn key(c: char) -> KeyEvent {

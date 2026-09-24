@@ -30,10 +30,7 @@ pub async fn run(url: &str, args: &crate::cli::Cli) -> Result<(), String> {
         .suggested_filename()
         .unwrap_or_else(|| url.suggested_filename());
 
-    let px = crate::download::proxy_for_public(&url, args.proxy.as_deref(), args.no_proxy);
-    let target = url
-        .to_target(px.as_ref().map(|(h, p)| (h.as_str(), *p)))?
-        .with_headers(args.headers.clone(), Some(args.user_agent.clone()))
+    let target = crate::download::target_for_public(&url, args)?
         .with_jar(&jar, hya_net::cookies::now_secs());
     let entries = match zipdir::fetch_listing(&conn, &target, total).await {
         Ok(e) => e,
@@ -55,7 +52,7 @@ fn print_table(name: &str, total: u64, entries: &[Entry]) {
     let files: Vec<&Entry> = entries.iter().filter(|e| !e.is_dir()).collect();
     println!(
         "{name}, {} ({total} bytes), {} file{}",
-        crate::stream::human(total),
+        hya_core::fmt::bytes(total),
         files.len(),
         if files.len() == 1 { "" } else { "s" }
     );
@@ -68,8 +65,8 @@ fn print_table(name: &str, total: u64, entries: &[Entry]) {
         let mark = if e.encrypted { "*" } else { "" };
         println!(
             "{:>10}  {:>10}  {:<16}  {}{mark}",
-            crate::stream::human(e.size),
-            crate::stream::human(e.packed),
+            hya_core::fmt::bytes(e.size),
+            hya_core::fmt::bytes(e.packed),
             e.modified.map(stamp).unwrap_or_default(),
             e.name,
         );

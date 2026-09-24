@@ -38,6 +38,7 @@ pub async fn run(json: bool, beta: bool) -> ExitCode {
         Some(_) => rel.appimage_asset(),
         None => rel.cli_asset(),
     };
+    let ownership = install_ownership();
 
     if json {
         let out = serde_json::json!({
@@ -54,11 +55,13 @@ pub async fn run(json: bool, beta: bool) -> ExitCode {
                 "size": a.size,
             })),
             // The deb/rpm for this machine, when a package manager owns it.
-            "package": package_managed().then(|| rel.package_asset()).flatten().map(|a| serde_json::json!({
+            "package": ownership.package_managed.then(|| rel.package_asset()).flatten().map(|a| serde_json::json!({
                 "name": a.name,
                 "url": a.browser_download_url,
                 "size": a.size,
             })),
+            // The command that updates a Homebrew install, when that is what this is.
+            "hint": ownership.hint,
             "notes": notes,
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
@@ -95,9 +98,12 @@ pub async fn run(json: bool, beta: bool) -> ExitCode {
     }
     // When a package manager owns this copy, the archive is not what the
     // user wants: the deb or rpm is, and only it may rewrite /usr/bin.
-    if package_managed() {
-        if let Some(pkg) = rel.package_asset() {
-            println!("Package: {}", pkg.browser_download_url);
+    if ownership.package_managed {
+        for line in package_lines(
+            ownership.hint,
+            rel.package_asset().map(|a| a.browser_download_url.as_str()),
+        ) {
+            println!("{line}");
         }
     }
     match asset {
@@ -123,12 +129,57 @@ fn platform(appimage: &Option<std::path::PathBuf>) -> String {
     }
 }
 
-/// Whether a package manager owns this binary — a deb or rpm in `/usr/bin`,
-/// a `.pkg` in `/Applications`. A tarball or Homebrew install is not one,
-/// even though `dpkg` exists on the same machine.
-fn package_managed() -> bool {
-    std::env::current_exe()
+/// Who may rewrite this binary, as far as the report is concerned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Ownership {
+    /// A package manager owns it — a deb or rpm in `/usr/bin`, a `.pkg` in
+    /// `/Applications`, a Homebrew formula or cask. A tarball install is not
+    /// one, even though `dpkg` exists on the same machine.
+    package_managed: bool,
+    /// The one command that updates it, when the package manager is Homebrew.
+    hint: Option<&'static str>,
+}
+
+fn install_ownership() -> Ownership {
+    let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-        .is_some_and(|dir| !hya_updater::update_method(&dir).is_self_update())
+    else {
+        return Ownership::default();
+    };
+    Ownership {
+        package_managed: !hya_updater::update_method(&dir).is_self_update(),
+        hint: hya_updater::package_manager_hint(&dir),
+    }
+}
+
+/// The lines a package-managed install is told: the manager's own command
+/// when there is one, else the package to fetch, else nothing.
+fn package_lines(hint: Option<&str>, package_url: Option<&str>) -> Vec<String> {
+    match (hint, package_url) {
+        (Some(cmd), _) => vec![format!("Update with: {cmd}")],
+        (None, Some(url)) => vec![format!("Package: {url}")],
+        (None, None) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_homebrew_install_is_told_its_upgrade_command_instead_of_a_package() {
+        assert_eq!(
+            package_lines(
+                Some("brew upgrade ja7ad/tap/hydra"),
+                Some("https://x/hydra.deb")
+            ),
+            vec!["Update with: brew upgrade ja7ad/tap/hydra".to_string()]
+        );
+        assert_eq!(
+            package_lines(None, Some("https://x/hydra.deb")),
+            vec!["Package: https://x/hydra.deb".to_string()]
+        );
+        assert!(package_lines(None, None).is_empty());
+    }
 }
