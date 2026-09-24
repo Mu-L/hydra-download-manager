@@ -358,6 +358,14 @@ fn downloads(app: &App) -> El<'_> {
             .style(theme::input)
             .width(Length::Fill),
         text(tr("User-Agent for manually added downloads:")).size(theme::FONT_SIZE),
+        pick_list(UA_PRESETS, ua_preset(&s.user_agent), |p| o(OptField::UserAgent(
+            p.value.to_string()
+        )))
+        .placeholder(tr("Custom"))
+        .text_size(theme::FONT_SIZE)
+        .style(theme::picker)
+        .padding([5, 8])
+        .width(Length::Fill),
         text_input("", &s.user_agent)
             .on_input(|v| o(OptField::UserAgent(v)))
             .size(theme::FONT_SIZE)
@@ -366,6 +374,50 @@ fn downloads(app: &App) -> El<'_> {
     ]
     .spacing(8)
     .into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UaPreset {
+    label: &'static str,
+    value: &'static str,
+}
+
+impl std::fmt::Display for UaPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label)
+    }
+}
+
+const UA_PRESETS: &[UaPreset] = &[
+    UaPreset {
+        label: "Default (Mozilla/5.0)",
+        value: crate::model::DEFAULT_USER_AGENT,
+    },
+    UaPreset {
+        label: "Chrome",
+        value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+    },
+    UaPreset {
+        label: "Firefox",
+        value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:156.0) Gecko/20100101 Firefox/156.0",
+    },
+    UaPreset {
+        label: "Safari",
+        value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 \
+                (KHTML, like Gecko) Version/27.0 Safari/605.1.15",
+    },
+    UaPreset {
+        label: "Edge",
+        value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0",
+    },
+];
+
+/// The preset the agent box currently holds, or `None` — shown as Custom —
+/// once it has been edited into anything else.
+fn ua_preset(agent: &str) -> Option<UaPreset> {
+    UA_PRESETS.iter().copied().find(|p| p.value == agent)
 }
 
 /// One-line readout of the live window beneath the limit controls: what the
@@ -1724,5 +1776,33 @@ mod tests {
         let p = Path::new("C:\\Program Files\\ffmpeg\\bin\\ffmpeg-with-a-long-name.exe");
         let out = elide_path(p, 10);
         assert_eq!(out, "C:\\\u{2026}\\ffmpeg-with-a-long-name.exe");
+    }
+
+    #[test]
+    fn the_picker_shows_the_preset_the_box_holds() {
+        let chrome = UA_PRESETS.iter().find(|p| p.label == "Chrome").unwrap();
+        assert_eq!(ua_preset(chrome.value), Some(*chrome));
+        assert_eq!(
+            ua_preset(crate::model::DEFAULT_USER_AGENT).map(|p| p.label),
+            Some("Default (Mozilla/5.0)")
+        );
+    }
+
+    #[test]
+    fn an_edited_agent_reads_as_custom() {
+        assert_eq!(ua_preset("Mozilla/5.0 (X11)"), None);
+        assert_eq!(ua_preset(""), None);
+    }
+
+    #[test]
+    fn every_preset_is_one_distinct_line_without_hydra() {
+        for (i, p) in UA_PRESETS.iter().enumerate() {
+            assert!(!p.value.to_ascii_lowercase().contains("hydra"), "{p}");
+            assert!(!p.value.contains('\n') && !p.value.contains("  "), "{p}");
+            assert!(
+                !UA_PRESETS[i + 1..].iter().any(|q| q.value == p.value),
+                "{p}"
+            );
+        }
     }
 }

@@ -1097,6 +1097,13 @@ pub struct Settings {
     pub window_pos: Option<(f32, f32)>,
 }
 
+/// The User-Agent a download added by hand sends unless Options picks another.
+///
+/// Deliberately not a `hydra` token: WAF scanner lists match that name, since
+/// it is also a password cracker's, and NCBI answers 403 to any agent
+/// containing it.
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0";
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -1138,7 +1145,7 @@ impl Default for Settings {
             show_conn_details: true,
             show_complete_dialog: true,
             remove_completed: false,
-            user_agent: format!("hydra-gui/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: DEFAULT_USER_AGENT.into(),
             cookies_from_browser: String::new(),
             virus_scanner: String::new(),
             virus_args: String::new(),
@@ -1517,6 +1524,7 @@ pub fn load_config() -> ConfigFile {
     migrate_ui_scale(&mut cfg.settings);
     migrate_theme_mode(&mut cfg.settings);
     migrate_columns(&mut cfg.settings);
+    migrate_user_agent(&mut cfg.settings);
     seed_ai_formats(&mut cfg);
     cfg
 }
@@ -1623,6 +1631,15 @@ fn migrate_theme_mode(s: &mut Settings) {
         });
     }
     s.dark_mode = None;
+}
+
+/// Move a config off the old `hydra-gui/<version>` default, which every save
+/// wrote out in full and which the servers described at
+/// [`DEFAULT_USER_AGENT`] refuse. Any other value is the user's own choice.
+fn migrate_user_agent(s: &mut Settings) {
+    if s.user_agent.starts_with("hydra-gui/") {
+        s.user_agent = DEFAULT_USER_AGENT.into();
+    }
 }
 
 /// Bring [`Settings::columns`] to the shape the table relies on: every
@@ -2143,6 +2160,33 @@ mod tests {
                 builtin: true,
             },
         ]
+    }
+
+    #[test]
+    fn a_saved_hydra_gui_agent_moves_to_the_new_default() {
+        let mut old: Settings = toml::from_str(r#"user_agent = "hydra-gui/0.9.3""#).unwrap();
+        migrate_user_agent(&mut old);
+        assert_eq!(old.user_agent, DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn a_user_chosen_agent_survives_the_migration() {
+        for mine in ["curl/8.7.1", "my-hydra-mirror/1", ""] {
+            let mut s = Settings {
+                user_agent: mine.into(),
+                ..Settings::default()
+            };
+            migrate_user_agent(&mut s);
+            assert_eq!(s.user_agent, mine);
+        }
+    }
+
+    #[test]
+    fn the_default_agent_does_not_name_hydra() {
+        assert!(!Settings::default()
+            .user_agent
+            .to_ascii_lowercase()
+            .contains("hydra"));
     }
 
     #[test]
