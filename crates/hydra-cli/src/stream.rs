@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use hya_net::cookies::CookieJar;
 use hya_net::{Target, TlsCapableConnector};
 use hya_stream::{dash, hls};
 
@@ -34,6 +35,10 @@ pub struct Job {
     pub container: String,
     pub headers: Vec<String>,
     pub user_agent: String,
+    /// The cookie flags' jar, read-only: a manifest, its segments and its keys
+    /// commonly sit on different hosts, and each request takes only what the
+    /// jar holds for its own.
+    pub jar: Arc<CookieJar>,
     pub limit_rate: u64,
     pub quiet: bool,
     pub no_progress: bool,
@@ -82,7 +87,9 @@ fn target(seg: &hls::Segment, job: &Job) -> Result<Target, String> {
     if let Some(range) = seg.range_header() {
         headers.push(format!("Range: {range}"));
     }
-    Ok(base.with_headers(headers, Some(job.user_agent.clone())))
+    Ok(base
+        .with_headers(headers, Some(job.user_agent.clone()))
+        .with_jar(&job.jar, hya_net::cookies::now_secs()))
 }
 
 /// A segment redirected elsewhere: the same segment at the address the
@@ -199,6 +206,20 @@ fn describe(v: &hls::Variant) -> String {
         .cloned()
         .collect::<Vec<_>>()
         .join("  ")
+}
+
+/// The jar the cookie flags describe, opened for the host `url` names: the
+/// one a `-b` literal and a browser import are scoped to.
+pub async fn open_jar(args: &crate::cli::Cli, url: &str) -> Result<Arc<CookieJar>, String> {
+    let jar = match crate::url::Url::parse(url) {
+        Some(u) => {
+            crate::download::open_jar_for(args, &u.host, hya_net::cookies::now_secs()).await?
+        }
+        // Not fetchable as a stream either; that failure is reported where it
+        // happens, with the URL in it.
+        None => CookieJar::new(),
+    };
+    Ok(Arc::new(jar))
 }
 
 /// Whether `url` is worth trying as a manifest at all.
@@ -1331,14 +1352,23 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
 
+    /// Each request an origin saw: its path, and the `Cookie:` it carried.
+    type Seen = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
     /// An HTTP/1.1 origin serving a fixed route table and recording what it
     /// was asked for. A stream is hundreds of small objects, and the only way
     /// to show that a track was fetched is to watch an origin be asked for
-    /// it.
-    fn serve(routes: Vec<(String, Vec<u8>)>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    /// it. A route whose body is already a response (`HTTP/1.1 ...`) is sent
+    /// as it is, which is how a test serves a redirect.
+    fn serve(routes: Vec<(String, Vec<u8>)>) -> (String, Seen) {
+        serve_on(TcpListener::bind(("127.0.0.1", 0)).expect("bind"), routes)
+    }
+
+    /// [`serve`] on a listener the caller bound, for routes that must name
+    /// its port.
+    fn serve_on(listener: TcpListener, routes: Vec<(String, Vec<u8>)>) -> (String, Seen) {
         let port = listener.local_addr().unwrap().port();
-        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen: Seen = Arc::default();
         let (log, routes) = (seen.clone(), Arc::new(routes));
         std::thread::spawn(move || {
             for conn in listener.incoming() {
@@ -1354,16 +1384,23 @@ mod tests {
                         return;
                     }
                     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let mut cookie = None;
                     loop {
                         let mut h = String::new();
                         if r.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" || h == "\n" {
                             break;
                         }
+                        if let Some((name, value)) = h.split_once(':') {
+                            if name.eq_ignore_ascii_case("cookie") {
+                                cookie = Some(value.trim().to_string());
+                            }
+                        }
                     }
                     if let Ok(mut g) = log.lock() {
-                        g.push(path.clone());
+                        g.push((path.clone(), cookie));
                     }
                     let resp = match routes.iter().find(|(p, _)| *p == path) {
+                        Some((_, b)) if b.starts_with(b"HTTP/1.1 ") => b.clone(),
                         Some((_, b)) => {
                             let mut out = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1431,7 +1468,7 @@ mod tests {
         let reqs = seen.lock().unwrap().clone();
         for want in ["/a/en.m3u8", "/a/a0.ts", "/v/v0.ts"] {
             assert!(
-                reqs.iter().any(|r| r == want),
+                reqs.iter().any(|(path, _)| path == want),
                 "the audio rendition was skipped: {reqs:?}"
             );
         }
@@ -1477,6 +1514,126 @@ mod tests {
                 assert_eq!(std::fs::read(&path).unwrap(), b"VVVV");
             }
             other => panic!("a missing audio rendition should not fail the video: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn cli(flags: &[&str], url: &str) -> crate::cli::Cli {
+        use clap::Parser as _;
+        let mut argv = vec!["hydra", "-q"];
+        argv.extend_from_slice(flags);
+        argv.push(url);
+        crate::cli::Cli::parse_from(argv)
+    }
+
+    async fn jar_from_flags(flags: &[&str], url: &str) -> Arc<CookieJar> {
+        open_jar(&cli(flags, url), url).await.unwrap()
+    }
+
+    fn cookies_sent(seen: &Seen, path: &str) -> Vec<Option<String>> {
+        let reqs = seen.lock().unwrap();
+        reqs.iter()
+            .filter(|(p, _)| p == path)
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_jar_file_that_cannot_be_read_stops_the_stream_before_it_starts() {
+        let url = "http://127.0.0.1:9/x.m3u8";
+        let missing = std::env::temp_dir().join("hydra-no-such-jar/jar.txt");
+        let flags = ["--load-cookies", missing.to_str().unwrap()];
+        let e = open_jar(&cli(&flags, url), url).await.unwrap_err();
+        assert!(e.contains("jar.txt"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_url_with_no_host_opens_an_empty_jar() {
+        let jar = open_jar(&cli(&["-b", "a=1"], "x.m3u8"), "x.m3u8").await;
+        assert!(jar.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inspect_sends_the_cookie_flag_to_the_object_it_describes() {
+        let (base, seen) = serve(vec![("/x.rar".into(), b"RAR!".to_vec())]);
+        let url = format!("{base}/x.rar");
+        let job = Job {
+            jar: jar_from_flags(&["-b", "a=1"], &url).await,
+            ..job_for(url.clone(), PathBuf::new())
+        };
+        inspect_file(&job).await.unwrap();
+
+        let sent = cookies_sent(&seen, "/x.rar");
+        assert!(!sent.is_empty(), "the object was never asked for");
+        assert!(
+            sent.iter().all(|c| c.as_deref() == Some("a=1")),
+            "a probe went out without the cookie: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_without_a_cookie_flag_sends_no_cookie() {
+        let (base, seen) = serve(vec![("/x.rar".into(), b"RAR!".to_vec())]);
+        let job = job_for(format!("{base}/x.rar"), PathBuf::new());
+        inspect_file(&job).await.unwrap();
+
+        let sent = cookies_sent(&seen, "/x.rar");
+        assert!(
+            !sent.is_empty() && sent.iter().all(Option::is_none),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_requests_carry_the_cookies_their_own_host_is_owed() {
+        // The manifest is published on one host and redirects to an edge on
+        // another, where the segments live too. `-b` is scoped to the host the
+        // user named, and a jar file's cookie to the host it names: each hop
+        // must carry its own, and neither may leak to the other.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let edge = format!("localhost:{}", listener.local_addr().unwrap().port());
+        let (base, seen) = serve_on(
+            listener,
+            vec![
+                (
+                    "/master.m3u8".into(),
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{edge}/m/index.m3u8\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                (
+                    "/m/index.m3u8".into(),
+                    "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\ns0.ts\n#EXT-X-ENDLIST\n"
+                        .into(),
+                ),
+                ("/m/s0.ts".into(), b"SSSS".to_vec()),
+            ],
+        );
+        let dir =
+            std::env::temp_dir().join(format!("hydra-cli-hls-cookies-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jar_file = dir.join("jar.txt");
+        std::fs::write(&jar_file, "localhost\tFALSE\t/\tFALSE\t0\tedge\t2\n").unwrap();
+        let url = format!("{base}/master.m3u8");
+        let flags = ["-b", "a=1", "--load-cookies", jar_file.to_str().unwrap()];
+        let job = Job {
+            container: "ts".into(),
+            jar: jar_from_flags(&flags, &url).await,
+            ..job_for(url, dir.join("out.ts"))
+        };
+
+        let verdict = run(job).await;
+        assert!(matches!(verdict, Verdict::Done { .. }), "{verdict:?}");
+        assert_eq!(cookies_sent(&seen, "/master.m3u8"), [Some("a=1".into())]);
+        for hop in ["/m/index.m3u8", "/m/s0.ts"] {
+            let sent = cookies_sent(&seen, hop);
+            assert!(!sent.is_empty(), "{hop} was never asked for");
+            assert!(
+                sent.iter().all(|c| c.as_deref() == Some("edge=2")),
+                "{hop} carried the wrong cookies: {sent:?}"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

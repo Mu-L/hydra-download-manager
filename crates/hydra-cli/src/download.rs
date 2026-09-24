@@ -1000,12 +1000,14 @@ fn proxy_for(u: &Url) -> Option<(String, u16)> {
 /// the same recovery the transfer path uses — CDNs that mishandle HEAD
 /// (unclean TLS close, `Content-Length: 0`) answer the GET correctly.
 ///
-/// Returns the final probe and the URL it came from.
+/// Returns the final probe, the URL it came from, and the jar as the chain
+/// left it, for a follow-up request to the object that must carry the same
+/// cookies the probe did.
 pub async fn probe_public<C: hya_net::Connector>(
     c: &C,
     u: &Url,
     args: &crate::cli::Cli,
-) -> Result<(hya_net::Probe, Url), String> {
+) -> Result<(hya_net::Probe, Url, CookieJar), String> {
     let mut cur = u.clone();
     let mut chain = hya_net::polite::RedirectChain::new(&cur.to_string());
     let mut hops = 0u32;
@@ -1064,7 +1066,7 @@ pub async fn probe_public<C: hya_net::Connector>(
                 continue;
             }
         }
-        return Ok((pr, cur));
+        return Ok((pr, cur, jar));
     }
 }
 
@@ -1074,7 +1076,11 @@ pub async fn probe_public<C: hya_net::Connector>(
 /// a header value, a JSON document — and the consent line must not end up
 /// inside it, but a browser store read without a word is exactly what the line
 /// exists to prevent.
-async fn open_jar_for(args: &crate::cli::Cli, host: &str, now: u64) -> Result<CookieJar, String> {
+pub(crate) async fn open_jar_for(
+    args: &crate::cli::Cli,
+    host: &str,
+    now: u64,
+) -> Result<CookieJar, String> {
     let Some(spec) = crate::cookies::CookieSpec::from_cli(args)? else {
         return Ok(CookieJar::new());
     };
@@ -4754,7 +4760,7 @@ mod tests {
         ])
         .unwrap();
         let u = Url::parse(&args.urls[0]).unwrap();
-        let (pr, final_url) = probe_public(&net, &u, &args)
+        let (pr, final_url, _) = probe_public(&net, &u, &args)
             .await
             .expect("probe through the redirect");
         assert_eq!(pr.size, 64 * 1024, "size must come from the object");
@@ -4820,7 +4826,7 @@ mod tests {
             &format!("http://127.0.0.1:{port}/obj"),
         ])
         .unwrap();
-        let (pr, _) = probe_public(&net, &u, &args).await.expect("a probe");
+        let (pr, _, _) = probe_public(&net, &u, &args).await.expect("a probe");
         assert!(pr.maybe_redirector(), "the page itself is what is left");
     }
 
@@ -4839,7 +4845,7 @@ mod tests {
         ])
         .unwrap();
         let u = Url::parse(&args.urls[0]).unwrap();
-        let (pr, _) = probe_public(&net, &u, &args).await.expect("a probe");
+        let (pr, _, _) = probe_public(&net, &u, &args).await.expect("a probe");
         assert!(pr.is_redirect(), "the loop's own response is what is left");
         assert_eq!(ctl.requests.load(std::sync::atomic::Ordering::Relaxed), 1);
     }

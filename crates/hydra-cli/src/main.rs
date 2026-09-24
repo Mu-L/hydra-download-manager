@@ -721,6 +721,29 @@ async fn async_main() -> std::process::ExitCode {
         }
     }
 
+    // Validated before anything is opened: a browser name that does not exist
+    // is a typo in the command line, and reporting it after a probe has already
+    // gone out is reporting it in the wrong place.
+    let cookie_spec = match cookies::CookieSpec::from_cli(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("hydra: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if cookie_spec.is_some()
+        && args.headers.iter().any(|h| {
+            h.get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("cookie:"))
+        })
+        && !args.quiet
+    {
+        eprintln!(
+            "hydra: both a cookie flag and -H 'Cookie: ...' were given; wherever the \
+             jar has a cookie for the host, it replaces the header"
+        );
+    }
+
     // An archive listing asks one question about one object; like the two
     // flags above it owes an answer and never a download.
     if args.preview {
@@ -754,6 +777,13 @@ async fn async_main() -> std::process::ExitCode {
         && !urls.is_empty()
         && (args.list_streams || args.inspect || stream::looks_like_manifest(&urls[0]))
     {
+        let jar = match stream::open_jar(&args, &urls[0]).await {
+            Ok(jar) => jar,
+            Err(e) => {
+                eprintln!("hydra: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
         let sjob = stream::Job {
             url: urls[0].clone(),
             output: args.output.clone(),
@@ -762,6 +792,7 @@ async fn async_main() -> std::process::ExitCode {
             container: args.container.clone(),
             headers: args.headers.clone(),
             user_agent: args.user_agent.clone(),
+            jar,
             limit_rate,
             quiet: args.quiet || args.json,
             no_progress: args.no_progress,
@@ -806,29 +837,6 @@ async fn async_main() -> std::process::ExitCode {
                 return std::process::ExitCode::FAILURE;
             }
         }
-    }
-
-    // Validated before anything is opened: a browser name that does not exist
-    // is a typo in the command line, and reporting it after a probe has already
-    // gone out is reporting it in the wrong place.
-    let cookie_spec = match cookies::CookieSpec::from_cli(&args) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("hydra: {e}");
-            return std::process::ExitCode::from(2);
-        }
-    };
-    if cookie_spec.is_some()
-        && args.headers.iter().any(|h| {
-            h.get(..7)
-                .is_some_and(|p| p.eq_ignore_ascii_case("cookie:"))
-        })
-        && !args.quiet
-    {
-        eprintln!(
-            "hydra: both a cookie flag and -H 'Cookie: ...' were given; wherever the \
-             jar has a cookie for the host, it replaces the header"
-        );
     }
 
     match no_save_digest_notice(&args) {
@@ -1306,13 +1314,13 @@ async fn checksum_report(
         match crate::download::probe_public(conn.as_ref(), &parsed, args).await {
             // An error status describes the URL, not the object: a `400` with a
             // 24-byte JSON body is not a 24-byte file with no digest.
-            Ok((pr, final_url)) if pr.refusal().is_some() => {
+            Ok((pr, final_url, _)) if pr.refusal().is_some() => {
                 if let Some(why) = pr.refusal() {
                     eprintln!("hydra: {why} for {}", final_url.host);
                 }
                 all_ok = false;
             }
-            Ok((pr, _final_url)) => {
+            Ok((pr, _final_url, _)) => {
                 size = Some(pr.size).filter(|s| *s > 0);
                 validator = pr.validator.clone();
                 found.extend(digest::from_headers(&pr.raw_head));
@@ -2044,7 +2052,7 @@ async fn report_header_values(urls: &[String], args: &cli::Cli) -> std::process:
         // apply — the value a server returns can depend on what it was asked
         // (Vary, auth, conditional GETs) — and `probe_public` carries them.
         let pr = match crate::download::probe_public(conn.as_ref(), &parsed, args).await {
-            Ok((p, _final_url)) => p,
+            Ok((p, _final_url, _)) => p,
             Err(e) => {
                 eprintln!("hydra: {u}: {e}");
                 all_found = false;
