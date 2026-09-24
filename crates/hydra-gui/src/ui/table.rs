@@ -329,10 +329,8 @@ pub fn view(app: &App) -> El<'_> {
     // made painting quadratic once a sweep had selected the whole list.
     let sel: HashSet<DlId> = app.selected.iter().copied().collect();
 
-    // Rows the viewport can show. `table_vh` comes from the scrollable itself
-    // and is 0 until it first reports one (a list shorter than the viewport
-    // never scrolls, and then nothing is virtualised anyway), so fall back to
-    // the window height — an over-estimate only ever builds spare rows.
+    // `table_vh` is 0 until the scrollable first reports one; the window
+    // height over-estimates, which only ever builds spare rows.
     let vh = if app.table_vh > 1.0 {
         app.table_vh
     } else {

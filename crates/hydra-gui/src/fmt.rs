@@ -4,7 +4,12 @@
 //! Human formatting: `121.66 MB`, `1.027 MB/sec`,
 //! `3 min 32 sec`, `Aug 17 15:48:32 2026`.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use chrono::{DateTime, Local, TimeZone};
+use hya_core::fmt::DurationUnits;
+
+use crate::i18n::tr;
 
 /// `121.66 MB` (two decimals — the download-list spelling).
 pub fn size2(bytes: u64) -> String {
@@ -17,32 +22,12 @@ pub fn size3(bytes: u64) -> String {
 }
 
 fn size_n(bytes: u64, prec: usize) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{:.prec$} GB", b / GB)
-    } else if b >= MB {
-        format!("{:.prec$} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.prec$} KB", b / KB)
-    } else {
-        format!("{bytes} B")
-    }
+    hya_core::fmt::bytes_fixed(bytes, prec)
 }
 
 /// `1.027 MB/sec`, `200.666 KB/sec`.
 pub fn rate(bytes_per_sec: f64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    if bytes_per_sec >= MB {
-        format!("{:.3} MB/sec", bytes_per_sec / MB)
-    } else if bytes_per_sec >= 1.0 {
-        format!("{:.3} KB/sec", bytes_per_sec / KB)
-    } else {
-        String::new()
-    }
+    hya_core::fmt::rate_fixed(bytes_per_sec, 3)
 }
 
 /// The transfer rate as the reading a capped transfer should show.
@@ -89,11 +74,7 @@ pub fn rate_capped(bytes_per_sec: f64, cap: Option<u64>) -> String {
     if bytes_per_sec < 1.0 {
         return String::new();
     }
-    format!(
-        "{} {}",
-        rate(at_cap(bytes_per_sec, cap)),
-        crate::i18n::tr("(Limited)")
-    )
+    format!("{} {}", rate(at_cap(bytes_per_sec, cap)), tr("(Limited)"))
 }
 
 /// `500 KB/s`, `1.5 MB/s`, `Unlimited` — the Speed Limiter's spelling.
@@ -105,7 +86,7 @@ pub fn limit(cap: Option<u64>) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
     let Some(b) = cap.filter(|c| *c > 0) else {
-        return crate::i18n::tr("Unlimited");
+        return tr("Unlimited");
     };
     let b = b as f64;
     let (v, unit) = if b >= MB {
@@ -120,15 +101,17 @@ pub fn limit(cap: Option<u64>) -> String {
     }
 }
 
-/// `3 min 32 sec`, `1 hr 12 min`, `45 sec`.
+/// `3 min 32 sec`, `1 hr 12 min`, `45 sec`, in the catalogue's unit labels.
 pub fn eta(secs: u64) -> String {
-    if secs >= 3600 {
-        format!("{} hr {} min", secs / 3600, (secs % 3600) / 60)
-    } else if secs >= 60 {
-        format!("{} min {} sec", secs / 60, secs % 60)
-    } else {
-        format!("{secs} sec")
-    }
+    let (hour, minute, second) = (tr("hr"), tr("min"), tr("sec"));
+    hya_core::fmt::duration_long_with(
+        secs,
+        DurationUnits {
+            hour: &hour,
+            minute: &minute,
+            second: &second,
+        },
+    )
 }
 
 /// `5.80%` — the Status column while a transfer runs.
@@ -149,7 +132,14 @@ pub fn date(unix: i64) -> String {
 
 /// Current unix time, seconds.
 pub fn now_unix() -> i64 {
-    Local::now().timestamp()
+    since_epoch().as_secs() as i64
+}
+
+/// Wall-clock time since the unix epoch; zero if the clock is set before it.
+pub fn since_epoch() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
 }
 
 /// `15:48` for scheduler time fields.
@@ -160,6 +150,27 @@ pub fn hhmm(t: &DateTime<Local>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_rates_and_etas_keep_the_download_list_spelling() {
+        assert_eq!(size2(127_571_657), "121.66 MB");
+        assert_eq!(size3(127_571_657), "121.662 MB");
+        assert_eq!(size2(512), "512 B");
+        assert_eq!(size2(3 * 1024 * 1024 * 1024), "3.00 GB");
+        assert_eq!(rate(1_076_887.0), "1.027 MB/sec");
+        assert_eq!(rate(205_482.0), "200.666 KB/sec");
+        assert_eq!(rate(0.5), "");
+        assert_eq!(eta(45), "45 sec");
+        assert_eq!(eta(212), "3 min 32 sec");
+        assert_eq!(eta(4320), "1 hr 12 min");
+    }
+
+    #[test]
+    fn now_unix_is_the_clock_in_seconds() {
+        let secs = now_unix();
+        assert_eq!(secs, since_epoch().as_secs() as i64);
+        assert!(secs > 1_700_000_000);
+    }
 
     /// A transfer sitting at its cap must read as the cap, not as the ripple
     /// around it — and a transfer that cannot reach the cap must read as itself.
