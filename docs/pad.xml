@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<XML_DIZ_INFO>
+  <MASTER_PAD_VERSION_INFO>
+    <MASTER_PAD_VERSION>4.0</MASTER_PAD_VERSION>
+    <MASTER_PAD_EDITOR>Hand-written</MASTER_PAD_EDITOR>
+    <MASTER_PAD_INFO>Portable Application Description, or PAD for short, is a data set that is used by software authors to disseminate information to anyone interested in their software products. To find out more go to https://padspec.org</MASTER_PAD_INFO>
+  </MASTER_PAD_VERSION_INFO>
+  <Company_Info>
+    <Company_Name>Javad Rajabzadeh</Company_Name>
+    <Address_1></Address_1>
+    <Address_2></Address_2>
+    <City_Town></City_Town>
+    <State_Province></State_Province>
+    <Zip_Postal_Code></Zip_Postal_Code>
+    <Country></Country>
+    <Company_WebSite_URL>https://hydra.javad.dev</Company_WebSite_URL>
+    <Contact_Info>
+      <Author_First_Name>Javad</Author_First_Name>
+      <Author_Last_Name>Rajabzadeh</Author_Last_Name>
+      <Author_Email>ja7ad@live.com</Author_Email>
+      <Contact_First_Name>Javad</Contact_First_Name>
+      <Contact_Last_Name>Rajabzadeh</Contact_Last_Name>
+      <Contact_Email>ja7ad@live.com</Contact_Email>
+    </Contact_Info>
+    <Support_Info>
+      <Sales_Email>ja7ad@live.com</Sales_Email>
+      <Support_Email>ja7ad@live.com</Support_Email>
+      <General_Email>ja7ad@live.com</General_Email>
+      <Sales_Phone></Sales_Phone>
+      <Support_Phone></Support_Phone>
+      <General_Phone></General_Phone>
+      <Fax_Phone></Fax_Phone>
+    </Support_Info>
+  </Company_Info>
+  <Program_Info>
+    <Program_Name>Hydra Download Manager</Program_Name>
+    <Program_Version>0.6.1</Program_Version>
+    <Program_Release_Month>09</Program_Release_Month>
+    <Program_Release_Day>22</Program_Release_Day>
+    <Program_Release_Year>2026</Program_Release_Year>
+    <Program_Cost_Dollars>0</Program_Cost_Dollars>
+    <Program_Cost_Other_Code>USD</Program_Cost_Other_Code>
+    <Program_Cost_Other>0</Program_Cost_Other>
+    <Program_Type>Freeware</Program_Type>
+    <Program_Release_Status>Minor Update</Program_Release_Status>
+    <Program_Install_Support>Install and Uninstall</Program_Install_Support>
+    <Program_OS_Support>Windows 10,Windows 11,Mac OS X,Linux,Linux Console,Linux Gnome,Linux Open Source</Program_OS_Support>
+    <Program_Language>English,Arabic,Chinese,ChineseTrad,Czech,Danish,Dutch,Finnish,French,German,Greek,Hebrew,Hindi,Hungarian,Indonesian,Italian,Japanese,Korean,Persian,Polish,Portuguese,Romanian,Russian,Spanish,Swedish,Thai,Turkish,Ukrainian,Vietnamese</Program_Language>
+    <Program_Change_Info>Imports browser cookies for authenticated downloads (Firefox, Chromium-based browsers, Safari), regroups the Options dialog into four sections, and adds a portable Windows bundle.</Program_Change_Info>
+    <Program_Specific_Category>Download Manager</Program_Specific_Category>
+    <Program_Category_Class>Internet::Download Managers</Program_Category_Class>
+    <Program_System_Requirements>Windows 10 or 11 (x64 or ARM64); macOS 11 or later (Intel or Apple Silicon); Linux with glibc 2.35 or later for the desktop app, any distribution for the CLI</Program_System_Requirements>
+    <File_Info>
+      <File_Size_Bytes>9793111</File_Size_Bytes>
+      <File_Size_K>9564</File_Size_K>
+      <File_Size_MB>9.34</File_Size_MB>
+    </File_Info>
+    <Expire_Info>
+      <Has_Expire_Info>N</Has_Expire_Info>
+      <Expire_Count></Expire_Count>
+      <Expire_Based_On>Days</Expire_Based_On>
+      <Expire_Other_Info></Expire_Other_Info>
+      <Expire_Month></Expire_Month>
+      <Expire_Day></Expire_Day>
+      <Expire_Year></Expire_Year>
+    </Expire_Info>
+  </Program_Info>
+  <Program_Descriptions>
+    <English>
+      <Keywords>download manager,download accelerator,multi-connection,segmented download,mirror,resume,browser integration,wget,curl,open source</Keywords>
+      <Char_Desc_45>Fast, open-source multi-connection downloader</Char_Desc_45>
+      <Char_Desc_80>Open-source download manager that splits files across connections and mirrors</Char_Desc_80>
+      <Char_Desc_250>Hydra is an open-source download manager and accelerator. It splits each file across many connections and mirrors, moves work from slow connections to fast ones, and resumes interrupted downloads. Includes a desktop app, a CLI and browser add-ons.</Char_Desc_250>
+      <Char_Desc_450>Hydra is an open-source download manager and accelerator for Windows, macOS and Linux. It splits each file across many connections and independent mirrors, hands unfinished ranges from slow connections to fast ones, and detects stalled connections within seconds. The desktop app has a queue, a scheduler and browser integration for Chrome, Edge, Firefox and Safari; the command-line tool understands wget and curl options.</Char_Desc_450>
+      <Char_Desc_2000>Hydra Download Manager (HDM) is a free, open-source download manager and accelerator for Windows, macOS and Linux.
+
+Hydra splits every file into ranges and fetches them over many connections at once, from one server or from several independent mirrors of the same file. It keeps rebalancing while the transfer runs: when one connection falls behind, a faster one takes over the rest of its range, so a single slow peer never holds up the finish. Degraded connections are spotted statistically within seconds, long before a socket timeout would fire.
+
+Supported protocols are HTTP, HTTPS and FTP, through HTTP CONNECT and SOCKS4, SOCKS4a or SOCKS5 proxies. Data is written straight to its place in the file, so memory use stays flat whether the download is 10 MB or 10 TB. Downloads can be verified against server-advertised checksums, and optional Reed-Solomon parity protects finished files against bit rot.
+
+The desktop app manages a download queue with categories, a start and stop scheduler, retry tracking, a tray icon and launch at startup. Its interface is translated into 30 languages. Browser extensions for Chrome, Edge, Firefox and Safari hand downloads over to Hydra, including the cookies a site needs for authenticated links.
+
+The hydra command-line tool accepts wget and curl style options, reads Metalink files, and includes an interactive terminal queue manager. The engine is also available as libhydra, a C library for embedding in other applications.
+
+Hydra has no ads, no telemetry and no accounts. The applications are licensed under GPL-3.0-or-later and the engine libraries under MIT or Apache-2.0.</Char_Desc_2000>
+    </English>
+  </Program_Descriptions>
+  <Web_Info>
+    <Application_URLs>
+      <Application_Info_URL>https://hydra.javad.dev/</Application_Info_URL>
+      <Application_Order_URL></Application_Order_URL>
+      <Application_Screenshot_URL>https://hydra.javad.dev/img/screenshot.jpg</Application_Screenshot_URL>
+      <Application_Icon_URL>https://hydra.javad.dev/logo.png</Application_Icon_URL>
+      <Application_XML_File_URL>https://hydra.javad.dev/pad.xml</Application_XML_File_URL>
+    </Application_URLs>
+    <Download_URLs>
+      <Primary_Download_URL>https://github.com/ja7ad/hydra/releases/download/v0.6.1/hydra-0.6.1-windows-x64-setup.exe</Primary_Download_URL>
+      <Secondary_Download_URL>https://github.com/ja7ad/hydra/releases/download/v0.6.1/Hydra-0.6.1-arm64.dmg</Secondary_Download_URL>
+      <Additional_Download_URL_1>https://github.com/ja7ad/hydra/releases/download/v0.6.1/hydra-download-manager_0.6.1_amd64.deb</Additional_Download_URL_1>
+      <Additional_Download_URL_2>https://github.com/ja7ad/hydra/releases/tag/v0.6.1</Additional_Download_URL_2>
+    </Download_URLs>
+  </Web_Info>
+  <Permissions>
+    <Distribution_Permissions>Hydra Download Manager may be freely redistributed, including on download sites and software collections, under the terms of GPL-3.0-or-later; see https://github.com/ja7ad/hydra/blob/main/LICENSING.md</Distribution_Permissions>
+    <EULA>Hydra Download Manager is free software, licensed under the GNU General Public License version 3 or later (GPL-3.0-or-later). The full license text is at https://github.com/ja7ad/hydra/blob/main/LICENSE. The engine libraries (libhydra, hya-core, hya-net) are licensed under MIT OR Apache-2.0.</EULA>
+  </Permissions>
+</XML_DIZ_INFO>
