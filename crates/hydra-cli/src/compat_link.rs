@@ -227,7 +227,7 @@ mod tests {
             let p = crate::compat::detect(n, &[]);
             assert_ne!(
                 p,
-                crate::compat::Personality::Native,
+                Ok(crate::compat::Personality::Native),
                 "{n} must select a dialect, otherwise linking it is pointless"
             );
         }

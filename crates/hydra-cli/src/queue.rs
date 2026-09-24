@@ -317,9 +317,32 @@ impl Queue {
         base.join("hydra").join("queue.json")
     }
 
-    pub fn load(path: &std::path::Path) -> Option<Self> {
-        let raw = std::fs::read_to_string(path).ok()?;
-        let mut q: Queue = serde_json::from_str(&raw).ok()?;
+    /// `Ok(None)` when there is no queue file yet. A file that exists and does
+    /// not parse is an error: replacing it with an empty queue would silently
+    /// discard every item, so it is moved aside and named.
+    pub fn load(path: &std::path::Path) -> Result<Option<Self>, String> {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Ok(None);
+        };
+        let mut q: Queue = match serde_json::from_str(&raw) {
+            Ok(q) => q,
+            Err(e) => {
+                let aside = path.with_extension(format!(
+                    "json.corrupt-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
+                let _ = std::fs::rename(path, &aside);
+                return Err(format!(
+                    "{} is not a queue file ({e}); moved it to {} and stopped rather than \
+                     start with an empty queue",
+                    path.display(),
+                    aside.display()
+                ));
+            }
+        };
         // A job recorded as Running belonged to a process that is gone. Treating
         // it as still running would leave a permanent phantom occupying a slot.
         for i in &mut q.items {
@@ -337,7 +360,7 @@ impl Queue {
                 }
             }
         }
-        Some(q)
+        Ok(Some(q))
     }
 
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -628,6 +651,33 @@ mod tests {
         assert_eq!(q.total_rate(), 2.5e6, "a paused item contributes nothing");
     }
 
+    /// A queue file that does not parse used to be silently replaced by an
+    /// empty queue, losing every item in it.
+    #[test]
+    fn a_corrupt_queue_file_is_moved_aside_and_reported_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("hydra_q_corrupt_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("queue.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        let e = Queue::load(&path).unwrap_err();
+        assert!(e.contains("queue.json") && e.contains("corrupt"), "{e}");
+        assert!(
+            !path.exists(),
+            "the corrupt file must be moved, not left to fail again"
+        );
+        let aside: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the original bytes are kept beside it");
+        assert!(
+            Queue::load(&dir.join("absent.json")).unwrap().is_none(),
+            "no file at all is simply a fresh start"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_reloaded_queue_demotes_running_items_only_when_the_owner_is_dead() {
         // Two cases that must NOT be conflated. A crash leaves Running items whose owner
@@ -644,7 +694,7 @@ mod tests {
         q.progress(1, 4096, Some(8192), 1.0e6);
         assert_eq!(q.get(1).unwrap().owner_pid, Some(std::process::id()));
         q.save(&live).unwrap();
-        let back = Queue::load(&live).unwrap();
+        let back = Queue::load(&live).unwrap().unwrap();
         assert_eq!(
             back.get(1).unwrap().state,
             State::Running,
@@ -661,7 +711,8 @@ mod tests {
             i.owner_pid = Some(0);
         }
         q2.save(&dead).unwrap();
-        let back2 = Queue::load(&dead).unwrap();
+        let back2 = Queue::load(&dead).unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             back2.get(1).unwrap().state,
             State::Queued,
