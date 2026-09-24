@@ -415,7 +415,7 @@ The scripts remove binaries, extensions, manifests, desktop shortcuts, and start
 hydra https://example.com/archive.tar.gz
 
 # Specify output destination
-hydra https://example.com/archive.tar.gz -o output.tar.gz
+hydra https://example.com/archive.tar.gz -O output.tar.gz
 ```
 
 > **`hya` works everywhere `hydra` does.** Every install channel — the install
@@ -433,7 +433,7 @@ hydra https://example.com/archive.tar.gz -o output.tar.gz
 hydra -x 8 https://example.com/largefile.iso
 
 # Fetch across multiple mirror origins serving identical files
-hydra https://mirror1.example.org/file.iso https://mirror2.example.org/file.iso
+hydra --mirrors https://mirror1.example.org/file.iso https://mirror2.example.org/file.iso
 ```
 
 ### Metalink
