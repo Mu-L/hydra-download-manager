@@ -2538,7 +2538,11 @@ impl App {
         let scale = self.ui_scale();
         let (os_w, os_h) = (size.0 * scale, size.1 * scale);
         let position = match (kind, self.main_pos) {
-            (WinKind::Main, _) | (_, None) => window::Position::Centered,
+            (WinKind::Main, _) => {
+                main_open_position(self.cfg.settings.window_pos, os_w, &display_bounds())
+                    .map_or(window::Position::Centered, window::Position::Specific)
+            }
+            (_, None) => window::Position::Centered,
             (_, Some(origin)) => window::Position::Specific(Point::new(
                 origin.x + (self.main_size.width - os_w) / 2.0,
                 origin.y + (self.main_size.height - os_h) / 2.0,
@@ -4141,9 +4145,15 @@ impl App {
             // is what the remembered main-window size has to be for the
             // window to come back the same size at another font.
             Message::WinMoved(id, p) => {
-                if self.main_id == Some(id) {
-                    let s = self.ui_scale();
-                    self.main_pos = Some(Point::new(p.x * s, p.y * s));
+                let s = self.ui_scale();
+                let origin = Point::new(p.x * s, p.y * s);
+                if self.main_id == Some(id) && !is_parked(origin) {
+                    self.main_pos = Some(origin);
+                    let moved = Some((origin.x, origin.y));
+                    if self.cfg.settings.window_pos != moved {
+                        self.cfg.settings.window_pos = moved;
+                        self.save_config();
+                    }
                 }
                 Task::none()
             }
@@ -7126,17 +7136,15 @@ impl App {
                         window::resize(*id, iced::Size::new(w, h))
                     })
                     .collect();
-                // The main window keeps its size but not its floor: that is
-                // fixed at creation, in OS points, and carries the ratio
-                // (see `open_window`). Leaving it behind is what would make
-                // scaling down fail to do the one thing it is for — a
-                // window that still cannot be dragged narrower than the
-                // toolbar needed at the old scale.
+                // The main window keeps its size but not its floor, which was
+                // fixed at creation for the old ratio. Unlike `min_size` there,
+                // `set_min_size` is converted by iced through the new ratio
+                // itself, so it takes interface units: scaling it here too
+                // squared the ratio and forced the window past the screen.
                 if let Some(id) = self.main_id {
-                    let scale = self.ui_scale();
                     tasks.push(window::set_min_size(
                         id,
-                        Some(iced::Size::new(main_min_w() * scale, MAIN_MIN_H * scale)),
+                        Some(iced::Size::new(main_min_w(), MAIN_MIN_H)),
                     ));
                 }
                 Task::batch(tasks)
@@ -7696,23 +7704,42 @@ pub fn display_points() -> Option<iced::Size> {
         .iter()
         .find(|d| d.is_primary)
         .or(displays.first())?;
-    Some(display_normalized(
-        d.width as f32,
-        d.height as f32,
-        d.scale_factor,
-    ))
+    Some(display_rect(d).size())
 }
 
-/// One display's reported size in OS points. Some backends answer in
+/// Every connected display's bounds in OS points, empty when the platform
+/// will not say.
+fn display_bounds() -> Vec<iced::Rectangle> {
+    display_info::DisplayInfo::all()
+        .map(|displays| displays.iter().map(display_rect).collect())
+        .unwrap_or_default()
+}
+
+fn display_rect(d: &display_info::DisplayInfo) -> iced::Rectangle {
+    display_normalized(
+        iced::Rectangle::new(
+            Point::new(d.x as f32, d.y as f32),
+            iced::Size::new(d.width as f32, d.height as f32),
+        ),
+        d.scale_factor,
+    )
+}
+
+/// One display's reported bounds in OS points. Some backends answer in
 /// physical pixels and some already in points, and nothing in the reply
 /// says which: a reported width that is still a desktop's worth of points
 /// after dividing is the physical one, and a screen under 1000 points wide
 /// either way is left alone rather than halved into a phone.
-fn display_normalized(w: f32, h: f32, scale: f32) -> iced::Size {
-    if scale > 1.0 && w / scale >= 1000.0 {
-        iced::Size::new(w / scale, h / scale)
+fn display_normalized(r: iced::Rectangle, scale: f32) -> iced::Rectangle {
+    if scale > 1.0 && r.width / scale >= 1000.0 {
+        iced::Rectangle {
+            x: r.x / scale,
+            y: r.y / scale,
+            width: r.width / scale,
+            height: r.height / scale,
+        }
     } else {
-        iced::Size::new(w, h)
+        r
     }
 }
 
@@ -7741,14 +7768,6 @@ pub fn main_window_size() -> iced::Size {
     )
 }
 
-/// The size the main window opens at, in interface units, from the size a
-/// resize remembered in OS points.
-///
-/// A saved size that no longer describes a screen — a monitor that is gone,
-/// a hand-edited config — derives from the display instead. The range only
-/// rejects nonsense: `min_size` holds the window to a full toolbar row
-/// whatever the saved size says, and that floor moves with the scale
-/// while this range does not.
 /// The main window in interface units, from what a resize last reported.
 /// `main_size` is in OS points, so it converts back through the View > Scale
 /// ratio; before the first resize event it is zero and `opened_at` — the
@@ -7761,12 +7780,52 @@ fn main_viewport(main_size: iced::Size, opened_at: (f32, f32), scale: f32) -> ic
     iced::Size::new(opened_at.0, opened_at.1)
 }
 
+/// The size the main window opens at, in interface units, from the size a
+/// resize remembered in OS points.
+///
+/// A saved size that no longer describes a screen — a monitor that is gone,
+/// a hand-edited config — derives from the display instead. The range only
+/// rejects nonsense: `min_size` holds the window to a full toolbar row
+/// whatever the saved size says, and that floor moves with the scale
+/// while this range does not.
 fn main_open_size(saved: Option<(f32, f32)>, scale: f32) -> (f32, f32) {
     let os = saved
         .filter(|(w, h)| (400.0..=4000.0).contains(w) && (300.0..=2500.0).contains(h))
         .map(|(w, h)| iced::Size::new(w, h))
         .unwrap_or_else(main_window_size);
     (os.width / scale, os.height / scale)
+}
+
+/// Where the main window opens: where it was left, while the middle of its
+/// title bar still lands on a connected display, and `None` (centred)
+/// otherwise — an unplugged monitor must not strand the window off-screen.
+/// `saved` and `displays` are in OS points, and so is `width`.
+fn main_open_position(
+    saved: Option<(f32, f32)>,
+    width: f32,
+    displays: &[iced::Rectangle],
+) -> Option<Point> {
+    // Below the top edge, so a window maximized or snapped on Windows —
+    // whose outer frame starts a few points off the screen — still counts.
+    const TITLE_BAR_GRIP: f32 = 16.0;
+    match saved {
+        Some((x, y))
+            if displays
+                .iter()
+                .any(|d| d.contains(Point::new(x + width / 2.0, y + TITLE_BAR_GRIP))) =>
+        {
+            Some(Point::new(x, y))
+        }
+        _ => None,
+    }
+}
+
+/// Windows parks a minimized window at (-32000, -32000) pixels, and reports
+/// that as a move. No display arrangement puts a real window that far up
+/// and to the left, even divided by the largest display scale.
+fn is_parked(origin: Point) -> bool {
+    const PARKED: f32 = -6000.0;
+    origin.x <= PARKED && origin.y <= PARKED
 }
 
 /// Hold a dialog inside the screen. `size` and the answer are in interface
@@ -9421,20 +9480,103 @@ mod tests {
     #[test]
     fn a_display_is_measured_in_points_whichever_unit_it_reports() {
         use super::display_normalized;
+        let rect = |x, y, w, h| iced::Rectangle::new(Point::new(x, y), iced::Size::new(w, h));
 
         // A 1080p laptop at 125%, reported in physical pixels: 1536x864.
-        let scaled = display_normalized(1920.0, 1080.0, 1.25);
-        assert_eq!((scaled.width, scaled.height), (1536.0, 864.0));
+        let scaled = display_normalized(rect(0.0, 0.0, 1920.0, 1080.0), 1.25);
+        assert_eq!(scaled, rect(0.0, 0.0, 1536.0, 864.0));
 
         // The same display reported in points already stays as it is: a
         // second division would leave 1229x691 and shrink every dialog.
-        let points = display_normalized(1536.0, 864.0, 1.0);
-        assert_eq!((points.width, points.height), (1536.0, 864.0));
+        let points = display_normalized(rect(0.0, 0.0, 1536.0, 864.0), 1.0);
+        assert_eq!(points, rect(0.0, 0.0, 1536.0, 864.0));
 
         // A small screen at 2x is a genuinely small screen, not a 2560 one
         // reported in pixels.
-        let small = display_normalized(1280.0, 800.0, 2.0);
-        assert_eq!((small.width, small.height), (1280.0, 800.0));
+        let small = display_normalized(rect(0.0, 0.0, 1280.0, 800.0), 2.0);
+        assert_eq!(small, rect(0.0, 0.0, 1280.0, 800.0));
+
+        // A second monitor's origin is in the same unit as its size, so it
+        // converts with it — or a window left on it reads as off every screen.
+        let right = display_normalized(rect(1920.0, 0.0, 1920.0, 1080.0), 1.25);
+        assert_eq!(right, rect(1536.0, 0.0, 1536.0, 864.0));
+    }
+
+    #[test]
+    fn the_main_window_reopens_where_it_was_left_while_that_is_on_a_screen() {
+        use super::main_open_position;
+        let rect = |x, y, w, h| iced::Rectangle::new(Point::new(x, y), iced::Size::new(w, h));
+        let laptop = rect(0.0, 0.0, 1512.0, 982.0);
+        let external = rect(1512.0, -200.0, 2560.0, 1440.0);
+
+        assert_eq!(
+            main_open_position(Some((300.0, 120.0)), 1000.0, &[laptop]),
+            Some(Point::new(300.0, 120.0))
+        );
+        assert_eq!(
+            main_open_position(Some((2000.0, -150.0)), 1000.0, &[laptop, external]),
+            Some(Point::new(2000.0, -150.0))
+        );
+        // Maximized on Windows: the outer frame starts just off the screen.
+        assert_eq!(
+            main_open_position(Some((-8.0, -8.0)), 1528.0, &[laptop]),
+            Some(Point::new(-8.0, -8.0))
+        );
+        // Mostly off the left edge but the title bar still reachable.
+        assert_eq!(
+            main_open_position(Some((-400.0, 100.0)), 1000.0, &[laptop]),
+            Some(Point::new(-400.0, 100.0))
+        );
+
+        // Left on the external monitor, which is gone now.
+        assert_eq!(
+            main_open_position(Some((2000.0, -150.0)), 1000.0, &[laptop]),
+            None
+        );
+        // Title bar above the top edge: nothing left to drag it back by.
+        assert_eq!(
+            main_open_position(Some((300.0, -40.0)), 1000.0, &[laptop]),
+            None
+        );
+        assert_eq!(main_open_position(None, 1000.0, &[laptop]), None);
+        // The platform would not list its displays: nothing to check against.
+        assert_eq!(main_open_position(Some((300.0, 120.0)), 1000.0, &[]), None);
+    }
+
+    #[test]
+    fn moving_the_main_window_is_remembered_in_os_points() {
+        let mut app = App::default();
+        app.cfg.settings.ui_scale_pct = 150;
+        let main = window::Id::unique();
+        let dialog = window::Id::unique();
+        app.main_id = Some(main);
+
+        // iced reports the move in interface units, divided by the scale.
+        let _ = app.update(Message::WinMoved(main, Point::new(200.0, 60.0)));
+        assert_eq!(app.cfg.settings.window_pos, Some((300.0, 90.0)));
+        assert!(app.cfg_dirty, "the position has to outlive the session");
+
+        let _ = app.update(Message::WinMoved(dialog, Point::new(10.0, 10.0)));
+        assert_eq!(app.cfg.settings.window_pos, Some((300.0, 90.0)));
+
+        // Minimizing on Windows: the spot it was left at is what reopens.
+        let _ = app.update(Message::WinMoved(main, Point::new(-21333.0, -21333.0)));
+        assert_eq!(app.cfg.settings.window_pos, Some((300.0, 90.0)));
+        assert_eq!(app.main_pos, Some(Point::new(300.0, 90.0)));
+    }
+
+    #[test]
+    fn minimizing_on_windows_is_not_remembered_as_a_move() {
+        use super::is_parked;
+
+        // (-32000, -32000) pixels, at 100% and at the largest Windows scale.
+        assert!(is_parked(Point::new(-32000.0, -32000.0)));
+        assert!(is_parked(Point::new(-6400.0, -6400.0)));
+
+        assert!(!is_parked(Point::new(0.0, 0.0)));
+        assert!(!is_parked(Point::new(-8.0, -8.0)));
+        // Three 2560-point monitors to the left of the primary one.
+        assert!(!is_parked(Point::new(-7680.0, 40.0)));
     }
 
     #[test]
