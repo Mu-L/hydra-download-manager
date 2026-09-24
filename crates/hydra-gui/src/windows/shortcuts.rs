@@ -6,7 +6,7 @@
 //! configuration immediately.
 
 use crate::app::{App, El, Message, WinKind};
-use crate::model::SHORTCUT_ACTIONS;
+use crate::model::{normalize_combo, SHORTCUT_ACTIONS};
 use crate::windows::dlg_btn_primary;
 use crate::{i18n::tr, theme};
 use iced::widget::{column, container, row, text, text_input};
@@ -19,20 +19,49 @@ pub fn view(app: &App) -> El<'_> {
             .size(theme::FONT_SIZE - 1.0)
             .color(theme::dim_text(&iced::Theme::Light)),
     );
-    for (id, _default, label) in SHORTCUT_ACTIONS {
-        let value = app.cfg.shortcuts.get(id).cloned().unwrap_or_default();
+    // What each row's combo normalizes to, so a conflict can be shown: two
+    // actions on one combo means the later one silently never fires.
+    let combos: Vec<Option<String>> = SHORTCUT_ACTIONS
+        .iter()
+        .map(|(id, _, _)| app.cfg.shortcuts.get(*id).and_then(|c| normalize_combo(c)))
+        .collect();
+    for (n, (id, _default, label)) in SHORTCUT_ACTIONS.iter().enumerate() {
+        let value = app.cfg.shortcuts.get(*id).cloned().unwrap_or_default();
         let action = id.to_string();
+        let conflict = combos[n].is_some()
+            && combos
+                .iter()
+                .enumerate()
+                .any(|(m, c)| m != n && *c == combos[n]);
+        let usable = combos[n].is_some() && !conflict;
         list = list.push(
             row![
                 text(tr(label)).size(theme::FONT_SIZE).width(Length::Fill),
                 text_input("", &value)
                     .on_input(move |v| Message::ShortcutEdit(action.clone(), v))
                     .size(theme::FONT_SIZE)
-                    .style(theme::input)
+                    .style(if usable {
+                        theme::input
+                    } else {
+                        theme::input_invalid
+                    })
                     .width(150.0),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
+        );
+    }
+    let problems = combos.iter().filter(|c| c.is_none()).count()
+        + combos
+            .iter()
+            .enumerate()
+            .filter(|(n, c)| c.is_some() && combos.iter().take(*n).any(|d| d == *c))
+            .count();
+    if problems > 0 {
+        list = list.push(
+            text(tr("A red combo is not one a key press can produce, or is taken by another action; it goes back to its default when this window closes."))
+                .size(theme::FONT_SIZE - 1.0)
+                .color(theme::error_text()),
         );
     }
     container(

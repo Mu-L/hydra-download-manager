@@ -87,7 +87,7 @@ pub fn view(app: &App) -> El<'_> {
             ),
             false,
         ),
-        Some(ConfirmKind::Duplicate { existing, file }) => {
+        Some(ConfirmKind::Duplicate { existing, file, .. }) => {
             let msg = match (existing, file) {
                 (Some(_), _) => tr("This address is already in the download list. What do you want to do?"),
                 // Name the file it found. The collision is checked in the
@@ -146,17 +146,33 @@ pub fn view(app: &App) -> El<'_> {
         .style(theme::window)
         .into();
     }
-    if let Some(ConfirmKind::Duplicate { existing, file }) = &app.confirm {
+    if let Some(ConfirmKind::Duplicate { existing, file, .. }) = &app.confirm {
         // Label-sized buttons, centred: fixed widths wrapped the longer
         // captions onto two lines.
         let mut r = row![].spacing(10);
-        if existing.is_some() {
-            r = r.push(dlg_btn_auto_primary(
-                tr("Resume existing"),
-                Some(Message::DupResume),
-            ));
-        } else if file.is_some() {
-            r = r.push(dlg_btn_auto_primary(
+        // A finished entry cannot be resumed, only shown; a still-running
+        // or paused one can be picked up. A file on disk beside either is
+        // its own offer — unless it IS the finished entry's file.
+        let finished = existing
+            .and_then(|id| app.item(id))
+            .is_some_and(|d| d.state == crate::model::DlState::Complete);
+        match (existing.is_some(), finished) {
+            (true, false) => {
+                r = r.push(dlg_btn_auto_primary(
+                    tr("Resume existing"),
+                    Some(Message::DupResume),
+                ));
+            }
+            (true, true) => {
+                r = r.push(dlg_btn_auto_primary(
+                    tr("Open existing"),
+                    Some(Message::DupOpen),
+                ));
+            }
+            (false, _) => {}
+        }
+        if file.is_some() && !finished {
+            r = r.push(dlg_btn_auto(
                 tr("Open existing file"),
                 Some(Message::DupOpen),
             ));
