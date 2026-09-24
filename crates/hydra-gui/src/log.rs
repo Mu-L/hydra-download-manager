@@ -7,9 +7,22 @@
 //! from `log_level` in config.toml (`debug`/`info`/`warn`/`error`, default
 //! `info`) or the `HYDRA_LOG` environment variable, which wins. Failure to
 //! log must never fail the operation being logged.
+//!
+//! The file rolls daily: the first write of a day moves an older `gui.log`
+//! aside as `gui-YYYY-MM-DD.log`, named for the day it was last written, and
+//! only [`KEEP_DAYS`] days of log are kept on disk.
 
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, PoisonError};
+
+use chrono::NaiveDate;
+
+/// Days of log on disk, counting today's `gui.log`.
+const KEEP_DAYS: usize = 3;
+const FILE_NAME: &str = "gui.log";
+const ARCHIVE_DATE: &str = "gui-%Y-%m-%d.log";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub enum Level {
@@ -44,31 +57,71 @@ pub fn init(config_level: Option<&str>) {
 /// Where the session log lives. Exposed so Help > Logs can open exactly the
 /// file this module writes, rather than a path spelled twice.
 pub fn path() -> std::path::PathBuf {
-    crate::model::app_dir().join("logs").join("gui.log")
+    crate::model::app_dir().join("logs").join(FILE_NAME)
 }
 
 fn write(level: Level, tag: &str, line: &str) {
     if (level as u8) < FILTER.load(Ordering::Relaxed) {
         return;
     }
-    let file = path();
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let now = chrono::Local::now();
+    let ts = now.format("%Y-%m-%d %H:%M:%S%.3f");
+    // One formatted string, one write_all: `writeln!` with arguments emits a
+    // write per fragment, and the extbus socket threads log concurrently
+    // with the UI thread — that interleaves mid-line.
+    let record = format!("[{ts}] [{tag}] {line}\n");
+    // The day the file was last rolled for. Held across the append too, so no
+    // thread writes into a file another one is moving aside.
+    static ROLLED: Mutex<Option<NaiveDate>> = Mutex::new(None);
+    let mut rolled = ROLLED.lock().unwrap_or_else(PoisonError::into_inner);
+    append(&path(), now.date_naive(), &mut rolled, &record);
+}
+
+fn append(file: &Path, today: NaiveDate, rolled: &mut Option<NaiveDate>, record: &str) {
+    if *rolled != Some(today) {
+        if let Some(dir) = file.parent() {
+            let _ = std::fs::create_dir_all(dir);
+            roll(dir, today);
+        }
+        *rolled = Some(today);
     }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&file)
+        .open(file)
     {
-        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-        // One formatted string, one write_all: `writeln!` with arguments
-        // emits a write per fragment, and the extbus socket threads log
-        // concurrently with the UI thread — that interleaves mid-line.
-        let record = format!("[{ts}] [{tag}] {line}\n");
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = LOCK.lock();
         let _ = f.write_all(record.as_bytes());
     }
+}
+
+/// Move a `gui.log` last written before `today` aside under that day, then
+/// delete the oldest archives past [`KEEP_DAYS`]. Only files named exactly
+/// like an archive are ever deleted.
+fn roll(dir: &Path, today: NaiveDate) {
+    let live = dir.join(FILE_NAME);
+    if let Some(day) = modified_day(&live).filter(|day| *day < today) {
+        let _ = std::fs::rename(&live, dir.join(day.format(ARCHIVE_DATE).to_string()));
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut archives: Vec<(NaiveDate, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let day = NaiveDate::parse_from_str(name.to_str()?, ARCHIVE_DATE).ok()?;
+            Some((day, e.path()))
+        })
+        .collect();
+    archives.sort_unstable_by_key(|(day, _)| std::cmp::Reverse(*day));
+    for (_, stale) in archives.iter().skip(KEEP_DAYS - 1) {
+        let _ = std::fs::remove_file(stale);
+    }
+}
+
+fn modified_day(file: &Path) -> Option<NaiveDate> {
+    let modified = std::fs::metadata(file).ok()?.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Local>::from(modified).date_naive())
 }
 
 pub fn debug(line: &str) {
@@ -218,7 +271,9 @@ mod tests {
     // runs where the release is discoverable.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::os_release;
-    use super::redact;
+    use super::{append, redact, roll, ARCHIVE_DATE, FILE_NAME};
+    use chrono::NaiveDate;
+    use std::path::Path;
 
     /// The banner's whole value is being specific, so a platform that
     /// silently reports "unknown release" is worth catching here rather
@@ -250,6 +305,120 @@ mod tests {
     fn a_plain_url_is_left_alone() {
         let plain = "https://cdn.example/hls/seg1.ts";
         assert_eq!(redact(plain), plain);
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hydra-log-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn day(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn written_on(file: &Path, on: NaiveDate) {
+        let noon = on.and_hms_opt(12, 0, 0).unwrap();
+        let at = noon.and_local_timezone(chrono::Local).unwrap();
+        let f = std::fs::File::options().write(true).open(file).unwrap();
+        f.set_modified(at.into()).unwrap();
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_log_from_an_earlier_day_is_moved_aside_under_the_day_it_was_written() {
+        let dir = scratch("earlier");
+        let live = dir.join(FILE_NAME);
+        std::fs::write(&live, "last week\n").unwrap();
+        written_on(&live, day("2026-09-17"));
+
+        roll(&dir, day("2026-09-24"));
+
+        assert_eq!(names(&dir), ["gui-2026-09-17.log"]);
+        let archived = std::fs::read_to_string(dir.join("gui-2026-09-17.log")).unwrap();
+        assert_eq!(archived, "last week\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn todays_log_stays_where_help_logs_opens_it() {
+        let dir = scratch("today");
+        let live = dir.join(FILE_NAME);
+        std::fs::write(&live, "this morning\n").unwrap();
+        written_on(&live, day("2026-09-24"));
+
+        roll(&dir, day("2026-09-24"));
+
+        assert_eq!(names(&dir), [FILE_NAME]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_last_three_days_are_kept_and_nothing_else_is_deleted() {
+        let dir = scratch("prune");
+        for d in ["2026-09-18", "2026-09-20", "2026-09-21", "2026-09-22"] {
+            std::fs::write(dir.join(format!("gui-{d}.log")), d).unwrap();
+        }
+        let live = dir.join(FILE_NAME);
+        std::fs::write(&live, "yesterday\n").unwrap();
+        written_on(&live, day("2026-09-23"));
+        // Not archives, whatever they look like.
+        for other in ["gui-notes.log", "gui-2026-09-01.log.bak", "host.log"] {
+            std::fs::write(dir.join(other), "keep").unwrap();
+        }
+
+        roll(&dir, day("2026-09-24"));
+
+        assert_eq!(
+            names(&dir),
+            [
+                "gui-2026-09-01.log.bak",
+                "gui-2026-09-22.log",
+                "gui-2026-09-23.log",
+                "gui-notes.log",
+                "host.log",
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_first_write_after_midnight_starts_a_new_file() {
+        let dir = scratch("midnight");
+        let live = dir.join(FILE_NAME);
+        let today = chrono::Local::now().date_naive();
+        let tomorrow = today.succ_opt().unwrap();
+        let mut rolled = None;
+
+        append(&live, today, &mut rolled, "one\n");
+        append(&live, today, &mut rolled, "two\n");
+        append(&live, tomorrow, &mut rolled, "three\n");
+
+        let archive = dir.join(today.format(ARCHIVE_DATE).to_string());
+        assert_eq!(std::fs::read_to_string(archive).unwrap(), "one\ntwo\n");
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "three\n");
+        assert_eq!(rolled, Some(tomorrow));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_logs_folder_is_created_on_the_first_write() {
+        let dir = scratch("fresh").join("logs");
+        let live = dir.join(FILE_NAME);
+
+        append(&live, day("2026-09-24"), &mut None, "first\n");
+
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "first\n");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]
