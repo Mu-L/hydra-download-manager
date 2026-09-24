@@ -65,6 +65,13 @@ pub fn view(app: &App) -> El<'_> {
         .color(theme::dim_text(&iced::Theme::Light))
     };
     let status: El<'_> = match &app.updater.phase {
+        // Newer, but built for other machines: the version is the news and
+        // the release page is the whole offer.
+        UpdatePhase::Idle if !info.has_bundle => text(tr(
+            "This release has no build for this system yet. The release page lists what it ships.",
+        ))
+        .size(theme::FONT_SIZE)
+        .into(),
         UpdatePhase::Idle if !info.in_place => {
             let mut col = column![text(tr(
                 "This copy of Hydra cannot update itself in place. Download the new installer and install it the way you installed this one."
@@ -72,6 +79,13 @@ pub fn view(app: &App) -> El<'_> {
             .size(theme::FONT_SIZE - 1.0)
             .color(iced::Color::from_rgb8(0x9A, 0x6A, 0x00))]
             .spacing(4);
+            if let Some(hint) = info.package_hint {
+                col = col.push(
+                    text(format!("{} {hint}", tr("Installed with Homebrew; update it with:")))
+                        .size(theme::FONT_SIZE - 1.0)
+                        .color(theme::dim_text(&iced::Theme::Light)),
+                );
+            }
             if let Some((name, _, size)) = &info.package {
                 col = col.push(download_line(name, *size));
             }
@@ -144,6 +158,14 @@ pub fn view(app: &App) -> El<'_> {
     .into();
 
     let buttons: El<'_> = match &app.updater.phase {
+        UpdatePhase::Idle if !info.has_bundle => row![
+            page_btn,
+            iced::widget::space::horizontal(),
+            dlg_btn(tr("Close"), Some(Message::UpdateCancel)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .into(),
         // Nothing to run in place: the package is downloaded in a browser
         // and installed by the package manager, which is the only thing that
         // may write /usr/bin. Without a package for this machine the release

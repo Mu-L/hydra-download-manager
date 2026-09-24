@@ -11,9 +11,11 @@
 //! mock server (`cargo run -p hya-updater --example mock_server`) exercises
 //! this whole path without touching real releases.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use hya_updater::{UpdateMethod, Verification};
 
 /// What the dialog needs to know about the newer release.
 #[derive(Clone, Debug)]
@@ -39,6 +41,13 @@ pub struct UpdateInfo {
     /// The `.deb`/`.rpm` for this machine, when the install is packaged and
     /// the release ships one: (file name, download URL, size).
     pub package: Option<(String, String, u64)>,
+    /// The release ships a bundle for this OS and architecture. Without one
+    /// there is nothing to download: the dialog names the version and
+    /// offers the release page, and that is the whole offer.
+    pub has_bundle: bool,
+    /// The command that updates a package-managed install (Homebrew), when
+    /// the package manager is known.
+    pub package_hint: Option<&'static str>,
 }
 
 /// Progress of a running update, streamed into the dialog.
@@ -61,8 +70,9 @@ fn user_agent() -> String {
 /// `beta` (Options > General > "Download Beta channel") also considers `-rc`
 /// pre-releases when one is ahead of the stable release.
 ///
-/// `Ok(None)` covers both "up to date" and "newer release exists but has no
-/// asset for this OS/arch" — the dialog can only offer what it can install.
+/// `Ok(None)` is "up to date". A newer release with no asset for this
+/// OS/arch comes back with `has_bundle == false`: the version is still news,
+/// even when the dialog can only point at the release page.
 pub async fn check(beta: bool) -> Result<Option<UpdateInfo>, String> {
     let rel = hya_updater::check_channel(&user_agent(), beta)
         .await
@@ -87,22 +97,30 @@ pub async fn check(beta: bool) -> Result<Option<UpdateInfo>, String> {
                 None => format!("{}-{}", hya_updater::os_tag(), hya_updater::arch_tag()),
             }
         ));
-        return Ok(None);
+        return Ok(Some(UpdateInfo {
+            version: rel.version().to_string(),
+            notes: hya_updater::clean_notes(&rel.body),
+            html_url: rel.html_url.clone(),
+            asset_name: String::new(),
+            asset_url: String::new(),
+            size: 0,
+            sums_url: None,
+            in_place: false,
+            needs_auth: false,
+            package: None,
+            has_bundle: false,
+            package_hint: None,
+        }));
     };
-    // Can the finisher actually rewrite this install? Everything Hydra put
-    // there itself — an unpacked archive, a macOS `.app`, a per-user
-    // Windows install — it can replace; a root-owned copy takes an
-    // authorisation prompt; only a package manager's files (`/usr/bin` from
-    // a deb or rpm, a `.pkg` receipt in `/Applications`) are off limits,
-    // because dpkg's database has to keep describing what is on disk.
-    // Better to say so now than to download 11 MB first.
+    // Decided before the download, not after: a package-managed install
+    // cannot be rewritten by this process however many megabytes arrive.
     let install_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(PathBuf::from));
     let method = install_dir
         .as_deref()
         .map(hya_updater::update_method)
-        .unwrap_or(hya_updater::UpdateMethod::Package);
+        .unwrap_or(UpdateMethod::Package);
     let in_place = method.is_self_update();
     // For an AppImage the install is the image file, not the mount
     // `current_exe()` reports — say so in the log, that is the path the
@@ -123,8 +141,8 @@ pub async fn check(beta: bool) -> Result<Option<UpdateInfo>, String> {
             "update {} available; {where_} updates {}",
             rel.version(),
             match method {
-                hya_updater::UpdateMethod::Elevated => "in place, after authorisation",
-                hya_updater::UpdateMethod::AppImage => "by replacing the image file",
+                UpdateMethod::Elevated => "in place, after authorisation",
+                UpdateMethod::AppImage => "by replacing the image file",
                 _ => "in place",
             }
         ));
@@ -145,14 +163,40 @@ pub async fn check(beta: bool) -> Result<Option<UpdateInfo>, String> {
             .map(|a| a.browser_download_url.clone()),
         in_place,
         needs_auth: match method {
-            hya_updater::UpdateMethod::Elevated => true,
+            UpdateMethod::Elevated => true,
             // The image may sit in /opt or /usr/local/bin; the finisher
             // elevates on its own, but the dialog should warn first.
-            hya_updater::UpdateMethod::AppImage => hya_updater::appimage_needs_auth(),
+            UpdateMethod::AppImage => hya_updater::appimage_needs_auth(),
             _ => false,
         },
         package,
+        has_bundle: true,
+        package_hint: package_hint(method, install_dir.as_deref()),
     }))
+}
+
+/// The package manager's own update command, for an install only it may
+/// rewrite.
+fn package_hint(method: UpdateMethod, install_dir: Option<&Path>) -> Option<&'static str> {
+    match method {
+        UpdateMethod::Package => install_dir.and_then(hya_updater::package_manager_hint),
+        _ => None,
+    }
+}
+
+/// The archive against the release's `SHA256SUMS.txt`: a mismatch or a
+/// missing entry is refused (and the archive removed), and a release that
+/// publishes no sums at all is accepted on transport security alone, with
+/// the log saying so.
+fn verify_download(archive: &Path, asset_name: &str, sums: Option<&str>) -> std::io::Result<()> {
+    match hya_updater::verify_archive(archive, asset_name, sums)? {
+        Verification::Verified => {}
+        Verification::Unpublished => crate::log::warn(&format!(
+            "update {asset_name}: the release publishes no SHA256SUMS.txt; \
+             accepted on transport security alone"
+        )),
+    }
+    Ok(())
 }
 
 /// Run the full update as an event stream: download the archive into the OS
@@ -199,21 +243,15 @@ async fn drive(
         .await?;
     }
 
-    // Verify against the release's published checksums when it has any.
-    if let Some(sums_url) = &info.sums_url {
-        let _ = tx.send(UpdateEvent::Verifying).await;
-        let sums = hya_updater::http::get_bytes(sums_url, &ua, 1024 * 1024).await?;
-        let sums = String::from_utf8_lossy(&sums).into_owned();
-        if let Some(want) = hya_updater::sum_for(&sums, &info.asset_name) {
-            let got = hya_updater::file_sha256(&archive)?;
-            if got != want {
-                let _ = std::fs::remove_file(&archive);
-                return Err(std::io::Error::other(
-                    "checksum mismatch — the downloaded archive was discarded",
-                ));
-            }
+    let _ = tx.send(UpdateEvent::Verifying).await;
+    let sums = match &info.sums_url {
+        Some(url) => {
+            let body = hya_updater::http::get_bytes(url, &ua, 1024 * 1024).await?;
+            Some(String::from_utf8_lossy(&body).into_owned())
         }
-    }
+        None => None,
+    };
+    verify_download(&archive, &info.asset_name, sums.as_deref())?;
 
     let _ = tx.send(UpdateEvent::Preparing).await;
     // An AppImage download is the finished article: one executable file that
@@ -229,12 +267,10 @@ async fn drive(
         }
     };
 
-    // The finisher: prefer the NEW release's copy (version-matched to what it
-    // installs), fall back to the one shipped next to the running app. Either
-    // way it runs from the staging dir so the swap never overwrites it. An
-    // AppImage has only the second option — the download is a squashfs image,
-    // not a directory, and mounting it to fish one binary out would buy
-    // nothing the shipped finisher cannot already do.
+    // The finisher: the new release's copy first (version-matched to what it
+    // installs), else the one beside the running app; either way run from the
+    // staging dir so the swap cannot overwrite it. An AppImage is a squashfs
+    // image, not a directory, so it only has the second option.
     let updater_name = if cfg!(target_os = "windows") {
         "hydra-updater.exe"
     } else {
@@ -308,6 +344,12 @@ async fn drive(
         // finisher outlives this process cleanly.
         cmd.creation_flags(0x0800_0000 | 0x0000_0008);
     }
+    // Last look before the point of no return: a finisher, once started,
+    // waits for this process to exit and then swaps the files whatever the
+    // user clicked meanwhile.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+    }
     cmd.spawn()?;
     crate::log::info(&format!(
         "update {} downloaded; finisher started, exiting to let it swap files",
@@ -330,5 +372,61 @@ pub fn sweep_leftovers() {
         if let Some(dir) = exe.parent() {
             hya_updater::sweep_old_files(dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn archive_named(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("hydra-gui-verify-{}-{name}", std::process::id()));
+        std::fs::write(&path, b"release bytes").unwrap();
+        path
+    }
+
+    #[test]
+    fn a_matching_published_sum_passes_and_keeps_the_archive() {
+        let archive = archive_named("ok.tar.gz");
+        let sums = format!(
+            "{} *ok.tar.gz\n",
+            hya_updater::file_sha256(&archive).unwrap()
+        );
+        verify_download(&archive, "ok.tar.gz", Some(&sums)).unwrap();
+        assert!(archive.is_file());
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn a_wrong_or_missing_sum_refuses_and_discards_the_archive() {
+        let archive = archive_named("bad.tar.gz");
+        let wrong = format!("{} bad.tar.gz\n", "0".repeat(64));
+        assert!(verify_download(&archive, "bad.tar.gz", Some(&wrong)).is_err());
+        assert!(!archive.exists(), "a mismatch leaves nothing to retry over");
+
+        let archive = archive_named("unlisted.tar.gz");
+        let other = format!("{} other.tar.gz\n", "0".repeat(64));
+        assert!(verify_download(&archive, "unlisted.tar.gz", Some(&other)).is_err());
+        assert!(!archive.exists());
+    }
+
+    #[test]
+    fn a_release_without_sums_is_accepted_on_transport_alone() {
+        let archive = archive_named("nosums.tar.gz");
+        verify_download(&archive, "nosums.tar.gz", None).unwrap();
+        assert!(archive.is_file());
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    #[test]
+    fn the_package_hint_only_names_a_manager_for_a_packaged_install() {
+        let dir = std::env::temp_dir();
+        assert_eq!(package_hint(UpdateMethod::InPlace, Some(&dir)), None);
+        assert_eq!(package_hint(UpdateMethod::Elevated, Some(&dir)), None);
+        assert_eq!(package_hint(UpdateMethod::AppImage, Some(&dir)), None);
+        // A packaged install nothing Homebrew owns has no command to offer.
+        assert_eq!(package_hint(UpdateMethod::Package, Some(&dir)), None);
+        assert_eq!(package_hint(UpdateMethod::Package, None), None);
     }
 }
