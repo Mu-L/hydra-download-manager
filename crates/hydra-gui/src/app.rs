@@ -1341,6 +1341,7 @@ pub enum Message {
     // complete dialog
     OpenFile(DlId),
     OpenFolder(DlId),
+    MoveRename(DlId),
     // options
     OptTabSet(OptTab),
     /// Extensions page: open a browser's add-on store in the default browser.
@@ -1969,7 +1970,7 @@ impl App {
         }
     }
 
-    /// Move the selected download's finished file, or give it another name,
+    /// Move a download's finished file, or give it another name,
     /// and keep the row pointing at where it went.
     ///
     /// Only a finished file moves. A transfer still running owns its `.part`
@@ -1978,12 +1979,14 @@ impl App {
     /// nothing at the destination yet to move. The new name is pinned
     /// (`name_locked`), or a later probe would hand the server's name back
     /// and undo the rename.
-    fn move_rename_selected(&mut self) -> Task<Message> {
-        let Some(d) = self.selected_item() else {
+    ///
+    /// `owner` is the window that asked: the complete dialog is often up while
+    /// the main window is hidden in the tray, and a sheet cannot hang off that.
+    fn move_rename(&mut self, id: DlId, owner: Option<window::Id>) -> Task<Message> {
+        let Some(d) = self.item(id) else {
             return Task::none();
         };
-        let (id, from) = (d.id, d.full_path());
-        if d.state != DlState::Complete || !from.is_file() {
+        if d.state != DlState::Complete || !d.full_path().is_file() {
             return Task::none();
         }
         // The native panel asks about overwriting on its own, which is why
@@ -1993,8 +1996,7 @@ impl App {
             file_name: Some(d.file_name.clone()),
             ..Ask::in_dir(&d.save_dir)
         };
-        picker::save(self.win_of(WinKind::Main), ask)
-            .and_then(move |to| Task::done(Message::MoveRenameTo(id, to)))
+        picker::save(owner, ask).and_then(move |to| Task::done(Message::MoveRenameTo(id, to)))
     }
 
     /// Carry out the move the "Move/Rename..." panel asked for.
@@ -2470,7 +2472,7 @@ impl App {
                     .unwrap_or(self.cfg.settings.show_conn_details);
                 (680.0, if details { 582.0 } else { 352.0 })
             }
-            WinKind::Complete(_) => (600.0, 180.0),
+            WinKind::Complete(_) => (crate::windows::complete::width(), 180.0),
             WinKind::Options => (760.0, 700.0),
             WinKind::Scheduler => (950.0, 660.0),
             WinKind::Batch => (950.0, 700.0),
@@ -5795,6 +5797,9 @@ impl App {
                 self.complete_dismissed(id);
                 task
             }
+            // Unlike Open, the dialog stays up: it redraws with the new path,
+            // and Open / Open folder then act on the file where it now is.
+            Message::MoveRename(id) => self.move_rename(id, self.win_of(WinKind::Complete(id))),
 
             // ------------------------------------------------------ options
             Message::OptTabSet(t) => {
@@ -7267,7 +7272,10 @@ impl App {
                 Some(d) => crate::files::open_with(self.win_of(WinKind::Main), &d.full_path()),
                 None => Task::none(),
             },
-            MenuAction::MoveRenameSel => self.move_rename_selected(),
+            MenuAction::MoveRenameSel => match self.selected_item().map(|d| d.id) {
+                Some(id) => self.move_rename(id, self.win_of(WinKind::Main)),
+                None => Task::none(),
+            },
             MenuAction::Properties => {
                 let fi = self.selected_item().map(|d| FileInfoState {
                     dl: d.id,
@@ -9140,6 +9148,113 @@ mod tests {
         };
         assert_eq!(adopt_dialog_edits(&mut d2, &fi2).unwrap(), None);
         assert_eq!(d2.file_name, "keep.zip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complete dialog's Move/Rename lands the file where the panel said
+    /// and leaves the row pointing there, so the dialog's Open / Open folder
+    /// and the list both follow it.
+    #[test]
+    fn a_file_moved_from_the_complete_dialog_is_followed_by_its_row() {
+        let dir = std::env::temp_dir().join(format!("hydra-mv-dlg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let d = item(
+            4,
+            &dir.to_string_lossy(),
+            "setup.exe",
+            None,
+            DlState::Complete,
+        );
+        std::fs::write(d.full_path(), b"bytes").expect("finished file");
+        let mut app = App::default();
+        app.state.downloads.push(d);
+        let to = dir.join("installers").join("app-setup.exe");
+
+        let _ = app.update(Message::MoveRenameTo(4, to.clone()));
+
+        assert!(to.is_file());
+        assert!(
+            !dir.join("setup.exe").exists(),
+            "a move leaves no copy behind"
+        );
+        let d = app.item(4).expect("still listed");
+        assert_eq!(d.full_path(), to);
+        assert!(d.name_locked, "a later probe must not rename it back");
+        assert!(app.state_dirty, "the new place has to outlive the session");
+        assert!(app.confirm.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that went missing between the dialog and the panel is reported,
+    /// and the row keeps the path it had rather than claiming the new one.
+    #[test]
+    fn a_failed_move_is_reported_and_the_row_keeps_its_path() {
+        let dir = std::env::temp_dir().join(format!("hydra-mv-fail-{}", std::process::id()));
+        let d = item(
+            5,
+            &dir.to_string_lossy(),
+            "gone.zip",
+            None,
+            DlState::Complete,
+        );
+        let before = d.full_path();
+        let mut app = App::default();
+        app.state.downloads.push(d);
+
+        let _ = app.update(Message::MoveRenameTo(5, dir.join("elsewhere.zip")));
+
+        assert!(matches!(app.confirm, Some(ConfirmKind::MoveFailed(_))));
+        assert_eq!(app.item(5).expect("still listed").full_path(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a finished file on disk may be moved: the panel is not even
+    /// offered for a transfer that still owns its `.part`, or for a file that
+    /// is no longer where the row says.
+    #[test]
+    fn move_rename_is_not_offered_for_a_file_that_is_not_finished_on_disk() {
+        let dir = std::env::temp_dir().join(format!("hydra-mv-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir_s = dir.to_string_lossy().into_owned();
+        let running = item(6, &dir_s, "live.iso", None, DlState::Receiving);
+        std::fs::write(running.full_path(), b"bytes").expect("file on disk");
+        let missing = item(7, &dir_s, "deleted.iso", None, DlState::Complete);
+        let finished = item(8, &dir_s, "done.iso", None, DlState::Complete);
+        std::fs::write(finished.full_path(), b"bytes").expect("file on disk");
+        let mut app = App::default();
+        app.state.downloads.extend([running, missing, finished]);
+
+        assert_eq!(app.update(Message::MoveRename(6)).units(), 0);
+        assert_eq!(app.update(Message::MoveRename(7)).units(), 0);
+        assert_eq!(app.update(Message::MoveRename(99)).units(), 0);
+        assert!(
+            app.update(Message::MoveRename(8)).units() > 0,
+            "the panel opens"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The list's menu entry moves the row the user picked, and with nothing
+    /// picked it has nothing to ask about.
+    #[test]
+    fn the_menu_entry_moves_the_selected_row() {
+        let dir = std::env::temp_dir().join(format!("hydra-mv-menu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let d = item(
+            9,
+            &dir.to_string_lossy(),
+            "notes.pdf",
+            None,
+            DlState::Complete,
+        );
+        std::fs::write(d.full_path(), b"bytes").expect("finished file");
+        let mut app = App::default();
+        app.state.downloads.push(d);
+        let move_rename = |app: &mut App| app.update(Message::Menu(MenuAction::MoveRenameSel));
+
+        assert_eq!(move_rename(&mut app).units(), 0);
+        app.selected = vec![9];
+        assert!(move_rename(&mut app).units() > 0, "the panel opens");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
