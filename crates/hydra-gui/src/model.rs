@@ -1092,6 +1092,9 @@ pub struct Settings {
     pub column_widths: Vec<f32>,
     /// Last main-window size; restored on start when still sensible.
     pub window_size: Option<(f32, f32)>,
+    /// Last main-window top-left corner in OS points; restored on start
+    /// while it still lands on a connected display.
+    pub window_pos: Option<(f32, f32)>,
 }
 
 impl Default for Settings {
@@ -1182,6 +1185,7 @@ impl Default for Settings {
             columns: vec![],
             column_widths: vec![],
             window_size: None,
+            window_pos: None,
         }
     }
 }
