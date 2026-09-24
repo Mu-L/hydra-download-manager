@@ -13,8 +13,8 @@
 //! reporting an error nobody can act on.
 //!
 //! The commands are built by their own functions and spawned by the callers,
-//! which is what lets the argument shapes that actually go wrong (a
-//! `/select,` with a space in it, an unencoded `file://` URI) be checked
+//! which is what lets the argument shapes that actually go wrong (an
+//! unencoded `file://` URI, a file name spliced into a script) be checked
 //! without a file-manager window opening on a test runner.
 
 use iced::window;
@@ -36,44 +36,44 @@ fn spawn(mut cmd: Command) -> bool {
         .is_ok()
 }
 
-/// Open the folder holding `path`, with `path` itself selected when
-/// `select`.
+/// Open the folder holding `path` with `path` itself selected.
 ///
-/// Highlighting the file is what makes this useful in a folder with nine
-/// hundred downloads in it, but selecting an item names one file manager —
-/// Explorer, Finder — where opening a folder goes through the shell. So a
-/// user running a replacement turns `select` off and gets their own window
-/// without the highlight: Directory Opus and friends hook the folder call
-/// and nothing `explorer /select,` takes. The folder is the fallback too,
-/// for a path with nothing to select and a command that would not start.
-pub fn reveal(path: &Path, select: bool) {
-    if let Some(cmd) = reveal_command(path, select) {
-        if spawn(cmd) {
+/// "Open folder" on a download that landed in `~/Downloads` next to nine
+/// hundred other files is only useful if the file is the one highlighted
+/// when the window comes up. A path with nothing to select, or a platform
+/// that cannot select it, gets its containing folder instead.
+///
+/// On a thread of its own: the file check and the Windows shell call can
+/// each stall for seconds on a network share, and the caller is the UI.
+pub fn reveal(path: &Path) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        if path.is_file() && select_in_folder(&path) {
             return;
         }
-    }
-    if let Some(dir) = path.parent() {
-        let _ = open::that_detached(dir);
-    }
+        if let Some(dir) = path.parent() {
+            let _ = open::that_detached(dir);
+        }
+    });
 }
 
-/// The platform's "select this item in its folder", or `None` when the user
-/// asked for the folder alone, there is no file to point at, or the
-/// platform has no such thing to run.
-fn reveal_command(path: &Path, select: bool) -> Option<Command> {
-    if !select || !path.is_file() {
-        return None;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // explorer.exe exits non-zero even when it did open the window, so
-        // its status says nothing — spawning is the only signal there is.
-        // The comma is part of the verb and the path must follow it with no
-        // space, so this is ONE argument, not two.
-        let mut cmd = Command::new("explorer");
-        cmd.arg(format!("/select,{}", path.display()));
-        Some(cmd)
-    }
+/// Windows selects through the shell API rather than `explorer /select,`:
+/// a replacement file manager (Directory Opus, XYplorer) takes over that
+/// call, but never a command line that runs explorer.exe by name.
+#[cfg(target_os = "windows")]
+fn select_in_folder(path: &Path) -> bool {
+    shell::open_folder_and_select(path)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn select_in_folder(path: &Path) -> bool {
+    reveal_command(path).is_some_and(spawn)
+}
+
+/// The platform's "select this item in its folder", or `None` where there is
+/// no such thing to run.
+#[cfg(not(target_os = "windows"))]
+fn reveal_command(path: &Path) -> Option<Command> {
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("open");
@@ -99,9 +99,117 @@ fn reveal_command(path: &Path, select: bool) -> Option<Command> {
         .arg("string:");
         Some(cmd)
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
+        let _ = path;
         None
+    }
+}
+
+/// `SHOpenFolderAndSelectItems` and the COM and item-ID-list lifetimes it
+/// needs around it.
+#[cfg(target_os = "windows")]
+mod shell {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows_sys::Win32::UI::Shell::{ILFree, SHOpenFolderAndSelectItems, SHParseDisplayName};
+
+    /// `true` once the shell has shown `path` selected in its folder.
+    pub(super) fn open_folder_and_select(path: &Path) -> bool {
+        let Some(_com) = Apartment::enter() else {
+            return false;
+        };
+        let Some(item) = ItemIdList::parse(path) else {
+            return false;
+        };
+        // SAFETY: `item` is a live absolute ID list. With no children given,
+        // the shell opens the item's parent and selects the item itself.
+        unsafe { SHOpenFolderAndSelectItems(item.0, 0, ptr::null(), 0) >= 0 }
+    }
+
+    /// COM initialised on this thread for as long as the value lives, which
+    /// the shell requires of anyone calling `SHOpenFolderAndSelectItems`.
+    struct Apartment;
+
+    impl Apartment {
+        fn enter() -> Option<Self> {
+            let mode = (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32;
+            // SAFETY: no reserved pointer; a thread that already has an
+            // apartment of the same kind gets S_FALSE, which still needs the
+            // CoUninitialize that Drop makes.
+            (unsafe { CoInitializeEx(ptr::null(), mode) } >= 0).then_some(Apartment)
+        }
+    }
+
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            // SAFETY: balances the successful CoInitializeEx in `enter`.
+            unsafe { CoUninitialize() }
+        }
+    }
+
+    /// An absolute shell item ID list, freed on drop.
+    struct ItemIdList(*mut ITEMIDLIST);
+
+    impl ItemIdList {
+        /// `None` for a path the shell cannot resolve — one that no longer
+        /// exists among them.
+        fn parse(path: &Path) -> Option<Self> {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+            let mut item = ptr::null_mut();
+            // SAFETY: `wide` is NUL-terminated and outlives the call; the
+            // bind context and attribute query are optional and left null.
+            let hr = unsafe {
+                SHParseDisplayName(
+                    wide.as_ptr(),
+                    ptr::null_mut(),
+                    &mut item,
+                    0,
+                    ptr::null_mut(),
+                )
+            };
+            (hr >= 0 && !item.is_null()).then_some(ItemIdList(item))
+        }
+    }
+
+    impl Drop for ItemIdList {
+        fn drop(&mut self) {
+            // SAFETY: allocated by SHParseDisplayName and freed exactly once.
+            unsafe { ILFree(self.0) }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_download_with_a_space_and_non_ascii_name_resolves_to_a_shell_item() {
+            let dir = std::env::temp_dir().join(format!("hydra-shell-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("test dir");
+            let file = dir.join("naïve (1) файл.zip");
+            std::fs::write(&file, b"payload").expect("downloaded file");
+
+            let _com = Apartment::enter().expect("an apartment on a fresh test thread");
+            assert!(ItemIdList::parse(&file).is_some());
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A deleted download has no item to select, which is what sends
+        /// `reveal` to its open-the-folder fallback.
+        #[test]
+        fn a_deleted_download_resolves_to_nothing() {
+            let _com = Apartment::enter().expect("an apartment on a fresh test thread");
+            let gone = std::env::temp_dir().join("hydra-shell-nothing-here.bin");
+            assert!(ItemIdList::parse(&gone).is_none());
+        }
     }
 }
 
@@ -234,6 +342,7 @@ mod tests {
 
     /// Program and arguments of a built command, for the shape assertions
     /// below — what a file manager is handed is the whole contract here.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn spelling(cmd: &Command) -> (String, Vec<String>) {
         (
             cmd.get_program().to_string_lossy().into_owned(),
@@ -241,17 +350,6 @@ mod tests {
                 .map(|a| a.to_string_lossy().into_owned())
                 .collect(),
         )
-    }
-
-    /// A real downloaded file, since a reveal command is only built for a
-    /// path that is one. Its own directory per test, so the cleanups do not
-    /// race each other.
-    fn a_downloaded_file(test: &str, name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("hydra-reveal-{}-{test}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("test dir");
-        let file = dir.join(name);
-        std::fs::write(&file, b"payload").expect("downloaded file");
-        file
     }
 
     #[test]
@@ -277,39 +375,14 @@ mod tests {
         assert!(!to.exists(), "and nothing is created for it");
     }
 
-    /// Explorer takes the item to select as part of the `/select,` verb.
-    /// Split into two arguments — or given the comma with a space after it —
-    /// it silently opens the user's Documents folder instead.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_selects_the_item_in_one_argument() {
-        let file = a_downloaded_file("win-select", "My File.zip");
-        let cmd = reveal_command(&file, true).expect("a command");
-        let (program, args) = spelling(&cmd);
-        assert_eq!(program, "explorer");
-        let [arg] = args.as_slice() else {
-            panic!("the item travels as ONE argument, not two: {args:?}");
-        };
-        assert!(
-            arg.starts_with("/select,"),
-            "no space after the comma: {arg}"
-        );
-        assert!(arg.ends_with("My File.zip"), "lost the item: {arg}");
-
-        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
-    }
-
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_reveals_rather_than_opening() {
-        let file = a_downloaded_file("mac-reveal", "My File.zip");
-        let cmd = reveal_command(&file, true).expect("a command");
+        let cmd = reveal_command(Path::new("/Users/a/Downloads/My File.zip")).expect("a command");
         let (program, args) = spelling(&cmd);
         assert_eq!(program, "open");
         // -R selects the file in Finder; without it `open` would RUN it.
-        assert_eq!(args, ["-R", &file.to_string_lossy()]);
-
-        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
+        assert_eq!(args, ["-R", "/Users/a/Downloads/My File.zip"]);
     }
 
     /// The chooser has to be handed the file as an argument, never spliced
@@ -333,18 +406,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_asks_the_file_manager_for_a_uri_it_can_read() {
-        let file = a_downloaded_file("linux-showitems", "naïve (1).zip");
-        let cmd = reveal_command(&file, true).expect("cmd");
+        let cmd = reveal_command(Path::new("/home/a/My Downloads/naïve (1).zip")).expect("cmd");
         let (program, args) = spelling(&cmd);
         assert_eq!(program, "dbus-send");
         assert!(args.contains(&"org.freedesktop.FileManager1.ShowItems".to_string()));
-        assert!(args.contains(&format!("array:string:{}", file_uri(&file))));
-        assert!(args.iter().any(|a| a.contains("na%C3%AFve%20%281%29.zip")));
+        assert!(args.contains(
+            &"array:string:file:///home/a/My%20Downloads/na%C3%AFve%20%281%29.zip".to_string()
+        ));
         // ShowItems takes a startup id as its second argument; an empty one
         // is still an argument, and omitting it fails the call.
         assert_eq!(args.last().map(String::as_str), Some("string:"));
-
-        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
     }
 
     #[cfg(target_os = "linux")]
@@ -376,24 +447,5 @@ mod tests {
         let (program, args) = spelling(&open_with_command(file, Path::new("/usr/bin/xpdf")));
         assert_eq!(program, "/usr/bin/xpdf");
         assert_eq!(args, ["/home/a/Downloads/x.pdf"]);
-    }
-
-    /// The bug this setting exists for: with it off nothing is asked of a
-    /// named file manager, so the folder goes to the shell — the call a
-    /// replacement for Explorer has hooked.
-    #[test]
-    fn the_folder_alone_names_no_file_manager() {
-        let file = a_downloaded_file("folder-only", "My File.zip");
-        assert!(reveal_command(&file, false).is_none());
-
-        std::fs::remove_dir_all(file.parent().expect("dir")).ok();
-    }
-
-    /// A file that is not there has nothing to highlight, whatever the
-    /// setting says — a moved or deleted download still opens its folder.
-    #[test]
-    fn a_missing_download_has_nothing_to_select() {
-        let gone = std::env::temp_dir().join("hydra-reveal-nothing-here.bin");
-        assert!(reveal_command(&gone, true).is_none());
     }
 }

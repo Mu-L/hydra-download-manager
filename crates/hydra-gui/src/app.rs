@@ -1466,7 +1466,6 @@ pub enum OptField {
     ConnDetails(bool),
     CompleteDialog(bool),
     RemoveCompleted(bool),
-    SelectInFileManager(bool),
     UserAgent(String),
     VirusScanner(String),
     VirusArgs(String),
@@ -5787,7 +5786,7 @@ impl App {
             }
             Message::OpenFolder(id) => {
                 if let Some(d) = self.item(id) {
-                    crate::files::reveal(&d.full_path(), self.cfg.settings.select_in_file_manager);
+                    crate::files::reveal(&d.full_path());
                 }
                 // Same as Open: the dialog has done its job once the user
                 // has acted on the finished file, so it dismisses itself
@@ -7260,7 +7259,7 @@ impl App {
             }
             MenuAction::OpenFolderSel => {
                 if let Some(d) = self.selected_item() {
-                    crate::files::reveal(&d.full_path(), self.cfg.settings.select_in_file_manager);
+                    crate::files::reveal(&d.full_path());
                 }
                 Task::none()
             }
@@ -7413,7 +7412,6 @@ impl App {
             OptField::ConnDetails(b) => s.show_conn_details = b,
             OptField::CompleteDialog(b) => s.show_complete_dialog = b,
             OptField::RemoveCompleted(b) => s.remove_completed = b,
-            OptField::SelectInFileManager(b) => s.select_in_file_manager = b,
             OptField::UserAgent(v) => s.user_agent = v,
             OptField::VirusScanner(v) => s.virus_scanner = v,
             OptField::VirusArgs(v) => s.virus_args = v,
@@ -8662,19 +8660,6 @@ mod tests {
         let _ = app.update(Message::Menu(MenuAction::HideToolbarText));
         assert!(app.cfg.settings.show_toolbar_labels);
         assert!(!ticked(&app));
-    }
-
-    /// The Open folder box has to reach the draft the OK button saves:
-    /// [`crate::files::reveal`] reads that setting, and while it is on the
-    /// window is asked of Explorer by name, which is what a replacement for
-    /// it never gets to see.
-    #[test]
-    fn unticking_the_open_folder_box_turns_the_highlight_off() {
-        let mut app = App::default();
-        assert!(app.options.draft.select_in_file_manager, "on by default");
-
-        let _ = app.update(Message::OptDraft(OptField::SelectInFileManager(false)));
-        assert!(!app.options.draft.select_in_file_manager);
     }
 
     /// Removing the row the user picked must leave the others alone — and must
