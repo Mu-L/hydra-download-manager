@@ -83,6 +83,18 @@ pub fn view(app: &App) -> El<'_> {
     ];
 
     let cats: Vec<String> = app.cfg.categories.iter().map(|c| c.name.clone()).collect();
+    // "All files to one directory" with the directory blank: OK refuses,
+    // and the box says why rather than filing the batch in the working
+    // directory of the process.
+    let dir_missing = st.to_dir && st.dir.trim().is_empty();
+    let dir_note: El<'_> = if dir_missing {
+        text(tr("Choose the folder the files go to."))
+            .size(theme::FONT_SIZE - 1.0)
+            .color(theme::error_text())
+            .into()
+    } else {
+        iced::widget::space::horizontal().height(0.0).into()
+    };
     let mode = if st.to_category {
         1u8
     } else if st.to_dir {
@@ -152,12 +164,17 @@ pub fn view(app: &App) -> El<'_> {
             text_input("", &st.dir)
                 .on_input(Message::BatchDir)
                 .size(theme::FONT_SIZE)
-                .style(theme::input)
+                .style(if dir_missing {
+                    theme::input_invalid
+                } else {
+                    theme::input
+                })
                 .width(Length::Fill),
             dlg_btn(tr("Browse"), Some(Message::BatchBrowseDir)),
         ]
         .spacing(12)
         .align_y(iced::Alignment::Center),
+        dir_note,
     ]
     .spacing(8)
     .width(Length::Fill);
