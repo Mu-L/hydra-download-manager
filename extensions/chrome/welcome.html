@@ -503,11 +503,11 @@
           <h3 id="fix-title">Hydra is not reachable</h3>
           <ol>
             <li id="fix-install">
-              Install the native messaging host, which is what lets the browser
-              talk to the app:
+              Start Hydra once so it registers the native messaging host, which is
+              what lets the browser talk to the app. Hydra does this on every launch.
+              Running from a source checkout instead? Register the host with
               <code class="cmd" id="fix-cmd">scripts/install-native-host.sh</code>
             </li>
-            <li>Make sure the Hydra desktop app is installed and has been opened once.</li>
             <li id="fix-sandboxed" hidden>
               <strong>On Ubuntu and other Linux distributions</strong>, Firefox and
               Chromium are often installed as a <em>snap</em> or <em>Flatpak</em>, which
