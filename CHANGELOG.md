@@ -5,6 +5,131 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.0.0] - 2026-09-25
+
+### Added
+
+- **Move/Rename From the Download Complete Dialog (`hydra-gui`)**:
+  - Added a *Move/Rename...* button between *Open folder* and *Close* that opens the native save panel, moves the file and keeps the list row pointing at it, so a finished download can be filed away without going back to the main window.
+  - Locked the new name so a later probe cannot rename it back, and made the button work while the main window is hidden in the tray.
+- **Main Window Position Remembered & Daily Log Rotation (`hydra-gui`)**:
+  - Added `window_pos` to `config.toml`: the main window reopens where it was last placed, or centred when the middle of its title bar would land on a display that is no longer connected.
+  - Added daily rotation of `gui.log`: on the first write of a new day the old log becomes `gui-YYYY-MM-DD.log`, and three days are kept instead of one file growing without limit.
+- **User-Agent Presets (`hydra-gui`)**:
+  - Added a dropdown under *Options → Downloads → User-Agent for manually added downloads* with *Default (Mozilla/5.0)*, *Chrome*, *Firefox*, *Safari* and *Edge*; editing the text switches it to *Custom*.
+- **Authentication Flags & URL Credentials (`hydra-cli`, `hydra-net`)**:
+  - Added `-u/--user USER[:PASSWORD]` and `--password` for HTTP Basic auth, with the wget spellings `--user`, `--password`, `--http-user`, `--http-password` and curl's `-u` mapped onto them.
+  - Started sending the credentials in `http://user:pass@host/`, which used to be parsed and dropped; they are withheld on a redirect to another host and restored if the chain comes back.
+- **Stream Format Coverage (`hydra-stream`)**:
+  - Added HLS `EXT-X-DEFINE` variables (`NAME`/`VALUE`, `IMPORT` from the master playlist, `QUERYPARAM`), `EXT-X-GAP` segments, mid-stream `EXT-X-MAP` changes and inline `data:` AES-128 keys.
+  - Added packed-audio HLS (`.aac`, `.mp3`, `.ac3`, `.eac3`), saved under its own extension instead of as an unplayable `.mp4`/`.ts`.
+  - Added DASH `SegmentList`, `SegmentBase` and single-file `BaseURL` Representations, and multi-Period manifests joined into one track per Representation.
+- **Update Dialog Knows About Package Managers (`hydra-gui`, `hydra-cli`, `hydra-updater`)**:
+  - Added a Homebrew hint (`brew upgrade ja7ad/tap/hydra`, or `--cask`) in place of the in-app installer on Homebrew installs, in the GUI and in `hydra update` (with a `hint` field under `--json`).
+  - Added a notice for a newer release that has no build for this system, with a link to its release page, instead of ignoring it.
+- **Browser Extensions 0.3.7 (browser extensions)**:
+  - Added body sniffing for small XHR/fetch responses with a generic content type, so HLS/DASH manifests behind extensionless URLs or served as `application/xml` are detected; `.m3u` counts as HLS too.
+  - Added CHIPS partitioned cookies to captures, and media inside an iframe now sends the frame's own URL as the Referer.
+  - Added a 5-second heartbeat so a dead socket falls back to native messaging at once instead of after an 8-second capture wait, and a capture made while Hydra is still starting is held for up to 60 seconds and handed over when it comes up.
+  - Added Opera to the native-host install scripts.
+- **libhydra 1.0.0 (`hydra-ffi`)**:
+  - Bumped the C library to 1.0.0 (`HYDRA_FFI_VERSION "1.0.0"`, `HYDRA_FFI_VERSION_NUMBER 1000000`). The ABI stays `HYDRA_FFI_ABI_VERSION 1`: no symbol, struct layout or constant changed, so existing bindings keep linking.
+  - Documented the ABI 1 behavior guarantees in `include/hydra.h` and `docs/ffi/ABI.md`: init zeroing up to `struct_size`, `hydra_event_wake` semantics, which calls a callback may make, and that a job's terminal event is its last.
+
+### Changed
+
+- **Stricter Command-Line Validation (`hydra-cli`)**:
+  - Changed zero, negative or out-of-range values for `-x`, `-s`, `--max-total-connections` (above 4096), `--parallel-max`, `--chunk-size`, `--tries`, `--limit-rate`, `--timeout`, `--wait` and `--connect-timeout` into usage errors (exit 2) instead of silent fallbacks, along with an unknown `--container` or `--compat`, `--json` with `--stdout`, and `-O` with several URLs unless `--mirrors` is given.
+  - Removed `--retry-delay` and `hydra checksum --sidecars`; sidecar lookups stay on by default and `--no-sidecars` turns them off.
+  - Made a repeated valued flag take its last value, as curl and wget do, instead of failing to parse.
+  - Made Ctrl-C save the resume record from the ranges actually held, print how to continue with `-c`, and exit 130; a second Ctrl-C exits at once.
+- **No Overwrites Without a Terminal (`hydra-cli`)**:
+  - Changed runs with no terminal to write beside an existing file (`name.1`) instead of overwriting it or reading an answer from a pipe; multi-URL runs skip the file and say so. `--force` still replaces and `-c` still continues, and streams now honour `--no-clobber` and `--force` too.
+- **Proxy Environment Read Per Scheme (`hydra-cli`, `hydra-net`)**:
+  - Changed proxy discovery to read `https_proxy`, `http_proxy` and `ftp_proxy` by scheme and then `all_proxy`, lower case first, and to honour `no_proxy`; only `http_proxy` used to be read, for every scheme. An unparsable proxy variable is now an error.
+- **Default User-Agent (`hydra-gui`, `hydra-cli`, `hydra-ffi`)**:
+  - Changed the desktop app's default for manually added downloads from `hydra-gui/<version>` to `Mozilla/5.0`, because some web firewalls and NCBI refuse the `hydra` token; saved configs still holding the old default are migrated.
+  - Changed the CLI and libhydra default from `hydra/0.1` to `hydra/<version>`.
+- **IEC Size Units in Stream Output (`hydra-cli`)**:
+  - Changed stream, `--inspect` and `--preview` sizes to IEC units (`1.50 KiB`, `5.00 MiB`), matching the rest of the output. The progress rate now shows the real rate from the first frame and counts only this run's bytes after a resume.
+- **Open Folder Goes Through the Windows Shell (`hydra-gui`)**:
+  - Changed *Open folder* on Windows to `SHOpenFolderAndSelectItems`, so a replacement file manager such as Directory Opus or XYplorer gets the window with the file highlighted. The 0.6.1 workaround checkbox *Select the downloaded file in the file manager* is gone; an old `select_in_file_manager` key is ignored.
+  - Moved *Open folder* off the UI thread on every platform, so a slow network share no longer freezes the window, and made it open the folder when the file itself is missing.
+- **Keyboard Handling in Dialogs (`hydra-gui`)**:
+  - Bound Escape to a dialog's Cancel and Enter to its default button; the duplicate prompt, whose three choices are equal, ignores Enter.
+  - Queued a second confirmation raised while one is showing, instead of letting it replace the first and lose the capture that one held.
+- **Extension WebSocket Requires the IPC Token (`hydra-gui`, `hydra-host`, browser extensions)**:
+  - Changed the local WebSocket to require the token from `ipc.json` as the first frame from any extension other than the two pinned Chromium ids; any web extension could previously connect by origin alone. hydra-host hands the token to a running app through a new `ws-token` request.
+  - Moved Firefox extensions older than 0.3.7 onto native messaging, which works but is slower, because the WebSocket now refuses them; updating the extension restores the fast path. Extension 0.3.7 still works with older Hydra releases.
+  - Allow-listed the Chrome Web Store id in the native-host manifest, which the app rewrites on every launch.
+- **Leaner Idle Redraws (`hydra-gui`)**:
+  - Changed the 80 ms animation tick to run only while a progress window is open on an active download, and progress polling to every 250 ms when no progress window is open, cutting idle CPU use.
+- **Removed Settings That Did Nothing (`hydra-gui`)**:
+  - Removed *Use FTP in PASV mode* and *Show the dialog to add an address to the list of exceptions for a twice-cancelled download*; their `config.toml` keys are ignored.
+
+### Fixed
+
+- **Command-Line Flags Ignored on Some Paths (`hydra-cli`)**:
+  - Fixed `--content-disposition`, `--connect-timeout`, `--show-progress`, `--no-verbose`, `--parallel-max` and `--wait` being parsed and never applied, and `-P` failing on a directory that did not exist yet.
+  - Fixed `-T/--timeout` not covering the probe, so a server or proxy that accepted the connection and never answered hung forever.
+  - Fixed downloads of unknown size (chunked, no `Content-Length`) and FTP skipping every post-transfer flag: a wrong `--checksum` now fails the run instead of exiting 0, and `--no-save`, `--stdout`, `--max-filesize`, `--remote-time`, `--etag-save`, `--sort-by-type` and `--limit-rate` apply.
+  - Fixed `--proxy` not being used for redirect hops, FTP and `hydra checksum` sidecar fetches, and `hydra interactive` ignoring the command line's headers, rate cap, proxy, cookies and connection count.
+  - Fixed cookie flags (`-b`, `--cookie-jar`, `--load-cookies`, `--cookies-from-browser`) not reaching HLS/DASH manifests, segments and keys, `--list-streams`, `--inspect` or `--preview`.
+  - Fixed `--stdout` staging under the URL's name in the working directory, which overwrote and then deleted any file already there, and a failed write to stdout exiting 0.
+  - Fixed the resume record storing one prefix instead of the exact ranges held, which could make `-c` treat missing bytes as downloaded.
+  - Fixed a corrupt `queue.json` being replaced by an empty queue; it is now kept as `queue.json.corrupt-<time>` and the run stops with an error.
+  - Fixed IPv6 literal URLs (`http://[::1]:8080/`) and `hydra interactive --headless` exiting 0 when an item failed.
+- **Proxy Logins Over HTTPS (`hydra-net`, `hydra-ffi`)**:
+  - Fixed HTTPS through an authenticated HTTP proxy failing with 407: the `CONNECT` now carries `Proxy-Authorization`, and a refusal says the proxy wants a login.
+  - Fixed the proxy login being forwarded inside the tunnel to the HTTPS origin.
+- **Truncated or Mismatched Stream Segments (`hydra-net`, `hydra-stream`)**:
+  - Fixed a chunked segment or playlist cut off before its final chunk being written as complete; it is now retried.
+  - Fixed a server answering a byte-range segment (HLS `EXT-X-BYTERANGE`, DASH `mediaRange`) with `200` or the wrong `Content-Range` having the whole object written in place of the slice.
+- **HLS and DASH Parsing (`hydra-stream`, `hydra-gui`, `hydra-cli`)**:
+  - Fixed an unknown encryption method or an unfetchable key URI (`skd://`) writing ciphertext as the output; both are now refused with the reason, and a malformed IV is no longer reported as DRM.
+  - Fixed live recordings dropping a slow segment that was still downloading: a segment is now abandoned only after 60 seconds without a byte, or after 4 hours in total.
+  - Fixed DASH `startNumber="0"` producing wrong segment URLs, a negative `SegmentTimeline` repeat producing a single segment, `presentationTimeOffset` being ignored in `$Time$`, and XML entities in `BaseURL`.
+  - Fixed playlists starting with a byte-order mark being rejected, remuxing MP3 or AC-3 audio to MP4 failing, and `--list-streams` reporting "not an HLS or DASH manifest" for what was really a 404.
+  - Fixed signed or rotating segment URLs defeating a stream resume. A partial stream download started by an earlier release restarts rather than resumes.
+  - Fixed the desktop app sending a stream's session cookies to every host it touched; segments, keys and variants on a CDN now get only that host's cookies.
+- **libhydra Behavior (`hydra-ffi`)**:
+  - Fixed `hydra_event_wake` not releasing a waiter, so `hydra_event_wait(HYDRA_WAIT_FOREVER)` blocked forever; released calls now return `HYDRA_ERR_AGAIN`.
+  - Fixed a stale `PROGRESS` event arriving after a job's `COMPLETED`, `FAILED`, `PAUSED` or `CANCELLED`.
+  - Fixed `hydra_job_create` reading past a smaller struct declared by an older header, init functions leaving bytes past this build's struct uninitialised, and `hydra_job_create_from_metalink` accepting NULL.
+  - Fixed `network_policy` and `power_mode` in `hydra_engine_config_t` being validated and then ignored.
+  - Fixed a resume splicing bytes from two versions of an object: the strong `ETag` is now persisted and a changed ETag or size discards the held ranges.
+  - Fixed `hydra_job_cancel` on a job that never ran deleting whatever file was already at `output_path`.
+  - Fixed the job's login being re-sent on a redirect to another host or from https to http, and protocol-relative, query-only and IPv6 redirect targets resolving wrongly.
+  - Fixed a percent-encoded `/`, `\` or NUL in a URL naming a file outside the output directory.
+  - Fixed `stall_count` in `hydra_engine_get_metrics` being overwritten per job instead of summed, and restored jobs being stuck in a running state they could not leave.
+- **Updater Safety (`hydra-updater`, `hydra-gui`)**:
+  - Fixed a stalled update download hanging forever: connects now time out after 15 seconds, a body read after 30 seconds without a byte, and Cancel is honoured within 250 ms.
+  - Fixed a failure part-way through the swap leaving some files new and some old; every file is renamed aside first and all are restored on failure.
+  - Fixed an archive missing from the release's `SHA256SUMS.txt` being installed unverified; it is now refused and deleted.
+  - Fixed cancelling during *Verifying* or *Preparing* still restarting into the update, and staging moved out of the shared `/tmp` into an owner-only directory.
+  - Made the updater honour `HTTPS_PROXY`/`HTTP_PROXY`, say when a GitHub rate limit clears, and strip the macOS quarantine flag from the updated bundle.
+- **Dialogs and Options (`hydra-gui`)**:
+  - Fixed *Options → OK* overwriting settings changed elsewhere while the dialog was open (window position, hidden columns, the toolbar speed limiter); only the fields edited in the dialog are saved now.
+  - Fixed a download limit of 0 MB blocking every download for good, and made *Options* refuse OK on the tab with the problem (no speed entered, an unevaluated PAC script, a proxy with no address or a bad port) with the reason beside the buttons.
+  - Fixed *Properties → OK* stopping and queuing a running transfer.
+  - Fixed a Scheduler start time typed as `9:00` never firing, and the Scheduler losing track of a queue renamed or deleted from the sidebar.
+  - Fixed *Resume existing* on a finished duplicate restarting it from zero; the prompt now offers *Open existing*.
+  - Fixed *Show download complete dialog* in the progress window's *Options on completion* tab doing nothing, and *Change folder for "<category>" category on last selected* being saved but never used.
+  - Fixed *Add URL* adding a stream manifest or mirror list as a plain file when OK was pressed while it was still being checked.
+  - Fixed a browser capture that arrived after the browser had kept its own download also being downloaded by Hydra.
+  - Fixed *Tasks → Import* adding the same address twice, the progress window's speed limit box hiding the limit in force, and a dialog closed before it finished opening being left orphaned.
+  - Fixed the startup update check being skipped when Hydra started in the tray.
+- **Window Scaling and Layout (`hydra-gui`)**:
+  - Fixed *View → Scale* applying the scale twice to the main window's minimum size, which above 100% forced the window larger than the screen.
+  - Fixed the progress window's connections table and scanner log staying 8 rows tall when the window was enlarged.
+  - Fixed the *Download complete* dialog pushing *Close* off its edge in longer translations such as Russian.
+- **Small Files Split Too Finely (`hydra-cli`, `hydra-gui`, `hydra-ffi`)**:
+  - Fixed small objects being split across every connection; each connection now gets at least 256 KiB, so a 50 KB file is one request.
+- **Portable Windows Launcher (`scripts/windows/portable`)**:
+  - Fixed the 0.6.1 portable bundle failing to start through `HydraPortable.exe` by dropping `RunAsAdmin=none` from the launcher configuration.
+
+---
+
 ## [0.6.1] - 2026-09-22
 
 ### Added
