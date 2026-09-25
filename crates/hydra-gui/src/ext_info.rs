@@ -112,7 +112,7 @@ fn describe(ext: &str) -> Option<&'static str> {
 fn url_ext(url: &str) -> Option<String> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let seg = path.rsplit('/').next().unwrap_or(path);
-    let seg = percent_decode(seg).to_ascii_lowercase();
+    let seg = hya_net::url::percent_decode(seg).to_ascii_lowercase();
     let (stem, last) = seg.rsplit_once('.')?;
     if last.is_empty() || last.len() > 8 || !last.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
@@ -124,28 +124,6 @@ fn url_ext(url: &str) -> Option<String> {
         }
     }
     Some(last.to_owned())
-}
-
-/// `%20` → space, etc. Invalid escapes pass through unchanged.
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match (b[i], b.get(i + 1), b.get(i + 2)) {
-            (b'%', Some(&h), Some(&l)) if h.is_ascii_hexdigit() && l.is_ascii_hexdigit() => {
-                let hex = [h, l];
-                let v = u8::from_str_radix(std::str::from_utf8(&hex).unwrap(), 16).unwrap();
-                out.push(v);
-                i += 3;
-            }
-            (c, _, _) => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `DMG — Apple Disk Image (macOS)` when the URL's extension is known,
