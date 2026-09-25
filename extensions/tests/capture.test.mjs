@@ -18,9 +18,10 @@ const check = (label, cond, extra = "") => {
 };
 const tick = (n = 3) => new Promise((r) => { let i = 0; const f = () => (++i >= n ? r() : setImmediate(f)); setImmediate(f); });
 
-function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = null, proxy, proxyStyle = "callback" } = {}) {
+function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = null, proxy, proxyStyle = "callback", cookieJar = null, frames = null } = {}) {
   const sent = [];          // messages that reached "Hydra"
   const calls = [];         // downloads API calls
+  const cookieQueries = []; // every cookies.getAll details object
   const listeners = {};
   const ev = () => { const l = []; return { addListener: (f) => l.push(f), fire: (...a) => l.map((f) => f(...a)), l }; };
 
@@ -69,7 +70,17 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
       sendMessage: async () => ({ urls: ["https://a.example/1.zip", "https://b.example/2.zip"] }),
       create: () => {}, onRemoved: ev(), onUpdated: ev(),
     },
-    cookies: { getAll: async () => [{ name: "sid", value: "abc" }] },
+    cookies: {
+      getAll: async (details) => {
+        cookieQueries.push(details);
+        if (cookieJar) return cookieJar(details);
+        // A browser that predates CHIPS rejects the property outright.
+        if ("partitionKey" in details) throw new Error("Unexpected property: 'partitionKey'.");
+        return [{ name: "sid", value: "abc" }];
+      },
+    },
+    // `webNavigation` is only there when its permission is held.
+    ...(frames ? { webNavigation: { getFrame: async ({ frameId }) => frames[frameId] ?? null } } : {}),
     // `proxy` is an OPTIONAL permission, and an ungranted one leaves the API
     // undefined — which is also every Safari build. `undefined` here is that
     // state, and the tests below depend on the difference.
@@ -139,12 +150,15 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
   // registered `types` filter, exactly as the browser gates it. Calling the
   // listener directly would let a test pass against a filter that never
   // delivers the response in the first place.
-  const respond = ({ url, mime, size = 4e6, type = "media", tabId = 7 }) =>
+  const respond = ({ url, mime, size = 4e6, type = "media", tabId = 7, frameId = 0, initiator, documentUrl }) =>
     (listeners.sniffFilter?.types || []).includes(type) &&
     listeners.sniff?.({
       tabId,
       url,
       type,
+      frameId,
+      initiator,
+      documentUrl,
       responseHeaders: [
         { name: "Content-Type", value: mime },
         { name: "Content-Length", value: String(size) },
@@ -166,7 +180,7 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
 
   return {
     sent, calls, onCreated, onDetermining, onMenu, send, store, respond,
-    headResponse, redirected,
+    headResponse, redirected, cookieQueries,
     sniffFilter: () => listeners.sniffFilter,
     headersSpec: () => listeners.headersSpec,
   };
@@ -882,6 +896,67 @@ function build({ hydraReply = { ok: true }, store = {}, gecko = false, tab = nul
     /\bscript-src 'self'/.test(csp) && !/upgrade-insecure-requests/.test(csp), JSON.stringify(csp));
   check("firefox manifest: the header stage may block",
     manifest.permissions.includes("webRequestBlocking"));
+}
+
+// ------------------------------------ 8. the Referer of an embedded player
+//
+// A player in an iframe is served by a CDN that checks the Referer against
+// the PLAYER's host. The tab's URL is the blog around it, which the CDN
+// refuses — so what the file was loaded from has to be the frame, and the
+// frame's URL comes from webNavigation when that permission is held.
+{
+  const frames = { 3: { url: "https://player.example/embed/42", frameId: 3 } };
+  const h = build({ frames });
+  await tick(4);
+  h.respond({ url: "https://cdn.example/v/42.mp4", mime: "video/mp4", size: 9e7, frameId: 3, initiator: "https://player.example" });
+  await tick(8);
+  await h.send({ type: "download-url", url: "https://cdn.example/v/42.mp4", referer: "https://page.example/watch" });
+  const dl = h.sent.filter((m) => m.type === "download").at(-1);
+  check("referer: an iframed player's file names the frame, not the tab", dl?.referer === "https://player.example/embed/42", JSON.stringify(dl));
+
+  // Without the permission there is no getFrame; the frame's origin (what
+  // Chromium reports as `initiator`) still beats the tab.
+  const h2 = build();
+  await tick(4);
+  h2.respond({ url: "https://cdn.example/v/43.mp4", mime: "video/mp4", size: 9e7, frameId: 3, initiator: "https://player.example" });
+  await tick(8);
+  await h2.send({ type: "download-url", url: "https://cdn.example/v/43.mp4", referer: "https://page.example/watch" });
+  check("referer: without webNavigation the frame's origin is used", h2.sent.filter((m) => m.type === "download").at(-1)?.referer === "https://player.example");
+
+  // A top-level request keeps the tab as before.
+  const h3 = build({ frames });
+  await tick(4);
+  h3.respond({ url: "https://cdn.example/v/44.mp4", mime: "video/mp4", size: 9e7, frameId: 0 });
+  await tick(8);
+  await h3.send({ type: "download-url", url: "https://cdn.example/v/44.mp4", referer: "https://page.example/watch" });
+  check("referer: a top-level file keeps the tab's URL", h3.sent.filter((m) => m.type === "download").at(-1)?.referer === "https://page.example/watch");
+}
+
+// ------------------------------------------- 9. partitioned (CHIPS) cookies
+//
+// A cookie set with `Partitioned` is keyed on the top-level site and never
+// comes back from a plain `getAll({url})`. A CDN that answers only with such
+// a cookie used to reach Hydra with no cookie at all.
+{
+  const jar = ({ url, partitionKey }) => {
+    if (!partitionKey) return [{ name: "sid", value: "abc" }];
+    if (partitionKey.topLevelSite === "https://page.example") return [{ name: "__Host-cdn", value: "p4rt" }];
+    return [];
+  };
+  const h = build({ cookieJar: jar });
+  await tick(4);
+  const item = { id: 90, url: "https://cdn.example/pack.zip", filename: "pack.zip", mime: "application/zip", totalBytes: 5e6, referrer: "https://page.example/dl" };
+  h.onDetermining.fire(item, () => {}); await tick(8);
+  const dl = h.sent.find((m) => m.type === "download" && m.url.endsWith("pack.zip"));
+  check("chips: the partition of the page the download came from is asked", h.cookieQueries.some((q) => q.partitionKey?.topLevelSite === "https://page.example"), JSON.stringify(h.cookieQueries));
+  check("chips: partitioned cookies ride along with the plain ones", dl?.cookies === "sid=abc; __Host-cdn=p4rt", JSON.stringify(dl?.cookies));
+
+  // A browser without the attribute rejects the property; the plain
+  // cookies still go, and nothing fails.
+  const h2 = build();
+  await tick(4);
+  h2.onDetermining.fire({ ...item, id: 91 }, () => {}); await tick(8);
+  check("chips: an older browser still sends its plain cookies", h2.sent.find((m) => m.type === "download" && m.url.endsWith("pack.zip"))?.cookies === "sid=abc");
 }
 
 console.log(fails ? `\n${fails} FAILED` : "\nall passed");
