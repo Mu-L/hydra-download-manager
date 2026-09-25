@@ -266,6 +266,7 @@ fn from_env() -> Option<Proxy> {
 /// Failure is a log line rather than an error: nothing the user typed in this
 /// app is wrong, so the honest report is that the system's own value could not
 /// be used.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 fn parse_system(raw: &str) -> Option<Proxy> {
     let raw = raw.trim();
     if raw.is_empty() {

@@ -35,6 +35,7 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_BUDGET: Duration = Duration::from_secs(20);
 
 /// Product name the macOS bundle is registered under with LaunchServices.
+#[cfg(any(target_os = "macos", test))]
 const MACOS_APP_NAME: &str = "Hydra Download Manager";
 
 /// Pointer file a portable (`--config DIR`) instance writes next to this
@@ -211,6 +212,7 @@ fn gui_sibling() -> Option<PathBuf> {
 
 /// The `.app` bundle `path` sits inside, if any: the nearest enclosing
 /// directory named `*.app`.
+#[cfg(any(target_os = "macos", test))]
 fn app_bundle_of(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")))
@@ -224,6 +226,7 @@ fn app_bundle_of(path: &Path) -> Option<PathBuf> {
 /// name can start the wrong one, which then publishes no socket on the
 /// profile this host is watching. `-g` keeps the launch in the background
 /// either way: the capture dialog is the only surface that should appear.
+#[cfg(any(target_os = "macos", test))]
 fn open_args(bundle: Option<&Path>, profile: Option<&Path>) -> Vec<OsString> {
     let mut args: Vec<OsString> = match bundle {
         Some(b) => vec!["-g".into(), b.into()],
