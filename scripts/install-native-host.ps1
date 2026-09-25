@@ -9,7 +9,8 @@
 # Windows has no NativeMessagingHosts directory: each browser reads a
 # registry value that points at the manifest file. Chromium browsers key it
 # by extension origin, Firefox by add-on id, so two manifest files are
-# written under %LOCALAPPDATA%\Hydra.
+# written under %APPDATA%\hydra — the same files, in the same place, that
+# the packaged app writes on every launch, so the two never disagree.
 #
 # The host is only the FALLBACK transport (and the only thing that can start
 # Hydra when it is not running) — day to day the extension talks to the app
@@ -50,7 +51,7 @@ $FfId = (Get-Content (Join-Path $Repo "extensions\firefox\manifest.json") -Raw |
 Write-Host "chromium extension id: $ExtId"
 Write-Host "firefox add-on id:     $FfId"
 
-$OutDir = Join-Path $env:LOCALAPPDATA "Hydra"
+$OutDir = Join-Path $env:APPDATA "hydra"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 # JSON needs the path escaped for Windows separators.
@@ -84,6 +85,7 @@ $targets = @(
   @{ Name = "Brave";    Path = "HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\$HostName"; Manifest = $chromeManifest },
   @{ Name = "Chromium"; Path = "HKCU:\Software\Chromium\NativeMessagingHosts\$HostName";             Manifest = $chromeManifest },
   @{ Name = "Vivaldi";  Path = "HKCU:\Software\Vivaldi\NativeMessagingHosts\$HostName";              Manifest = $chromeManifest },
+  @{ Name = "Opera";    Path = "HKCU:\Software\Opera Software\NativeMessagingHosts\$HostName";       Manifest = $chromeManifest },
   @{ Name = "Firefox";  Path = "HKCU:\Software\Mozilla\NativeMessagingHosts\$HostName";              Manifest = $firefoxManifest }
 )
 foreach ($t in $targets) {
