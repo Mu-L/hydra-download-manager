@@ -6,10 +6,12 @@
 use crate::abi::{hydra_error_code_t as E, hydra_event_type_t as EV, hydra_job_state_t as S};
 use crate::engine::{now_ms, Creds, Engine, Job, SourceStat, Stop};
 use crate::err::{self, Detail};
-use crate::url::{basic_auth, Url};
-use hya_core::{Capability, Scheduler, Source};
+use crate::url::Url;
+use hya_core::{Capability, RateMeter, Scheduler, Source};
 use hya_net::polite::Pace;
-use hya_net::{probe_resilient, Probe, SparseSink, Target, TlsCapableConnector};
+use hya_net::{
+    basic_auth, probe_resilient, Probe, SparseSink, Target, TlsCapableConnector, PROBE_FANOUT,
+};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,7 +22,27 @@ const MAX_REDIRECTS: usize = 10;
 /// Polling interval for cooperative cancellation checks on streaming paths.
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 
-// --------------------------------------------------------------- entry point
+/// Do not split an object finer than this: a range request costs a round trip,
+/// and below a quarter megabyte per connection the setup outweighs the bytes
+/// it could carry. The same rule the CLI and the GUI apply.
+const MIN_BYTES_PER_CONNECTION: u64 = 256 * 1024;
+
+/// Connections worth opening for an object of `size` bytes, at most `wanted`.
+fn connections_for_size(wanted: usize, size: u64) -> usize {
+    let by_size = usize::try_from(size / MIN_BYTES_PER_CONNECTION).unwrap_or(usize::MAX);
+    wanted.min(by_size).max(1)
+}
+
+/// Add what `now` says on top of what was already credited to `counter`.
+///
+/// The scheduler reports a running total per transfer; the engine's counter is
+/// a total over every transfer, so only the increase since the last call may be
+/// added — storing the per-transfer figure would make two jobs overwrite each
+/// other.
+fn credit_increase(counter: &AtomicU64, credited: &mut u64, now: u64) {
+    counter.fetch_add(now.saturating_sub(*credited), Ordering::Relaxed);
+    *credited = now;
+}
 
 /// Spawns a job execution task on the engine's async runtime.
 pub(crate) fn spawn(engine: &Arc<Engine>, job: &Arc<Job>) -> Result<(), Detail> {
@@ -186,8 +208,6 @@ async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
     }
 }
 
-// -------------------------------------------------------------- terminations
-
 fn settle_stopped(engine: &Arc<Engine>, job: &Arc<Job>, generation: u64) {
     let stop = {
         let mut g = job.lock();
@@ -297,8 +317,6 @@ async fn settle_completed(engine: &Arc<Engine>, job: &Arc<Job>, generation: u64)
     crate::persist::autosave(engine);
 }
 
-// ----------------------------------------------------------------- one attempt
-
 /// What a probe established about one source.
 struct Resolved {
     url: Url,
@@ -323,6 +341,19 @@ fn cancelled() -> Detail {
     }
 }
 
+/// The `Proxy-Authorization` line an HTTP forward proxy with a login is owed.
+///
+/// The transport reads it off the headers for the CONNECT tunnel too, and
+/// never forwards it to the origin through the tunnel.
+fn proxy_auth_line(job: &Job) -> Option<String> {
+    let p = job.cfg.proxy.as_ref().filter(|p| !p.kind.is_socks())?;
+    let user = p.username.as_deref()?;
+    Some(format!(
+        "Proxy-Authorization: Basic {}",
+        basic_auth(user, p.password.as_deref().unwrap_or(""))
+    ))
+}
+
 /// Build the request target for one URL under this job's proxy and auth.
 fn target_for(engine: &Engine, job: &Job, creds: &Creds, u: &Url) -> Target {
     let mut headers: Vec<String> = job
@@ -335,6 +366,28 @@ fn target_for(engine: &Engine, job: &Job, creds: &Creds, u: &Url) -> Target {
         let pass = creds.password.clone().unwrap_or_default();
         headers.push(format!("Authorization: Basic {}", basic_auth(user, &pass)));
     }
+    headers.extend(proxy_auth_line(job));
+    bare_target(job, u).with_headers(headers, Some(engine.cfg.user_agent.clone()))
+}
+
+/// The target a redirect chain reached at `u`, carrying `first`'s headers.
+///
+/// Through `Target::with_headers_from`, so a credential typed for the origin
+/// the job named does not follow a redirect off it — and the proxy's own login
+/// is put back, because the socket still goes to the same proxy.
+fn redirected_target(job: &Job, first: &Target, u: &Url) -> Target {
+    let mut t =
+        bare_target(job, u).with_headers_from(first, first.headers.clone(), first.agent.clone());
+    if let Some(line) = proxy_auth_line(job) {
+        if t.proxy_authorization().is_none() {
+            t.headers.push(line);
+        }
+    }
+    t
+}
+
+/// The socket and request shape for `u`, before any header is attached.
+fn bare_target(job: &Job, u: &Url) -> Target {
     let mut t = match &job.cfg.proxy {
         // An HTTP forward proxy changes the request itself: absolute-form for
         // cleartext, a CONNECT tunnel for TLS. Both are expressed by naming the
@@ -353,7 +406,7 @@ fn target_for(engine: &Engine, job: &Job, creds: &Creds, u: &Url) -> Target {
         _ => Target::direct(&u.host, u.port, &u.path),
     };
     t.tls = u.tls();
-    t.with_headers(headers, Some(engine.cfg.user_agent.clone()))
+    t
 }
 
 /// Probe one URL, following redirects.
@@ -370,11 +423,12 @@ async fn resolve_one(
         message: e,
         ..Default::default()
     })?;
+    let first = target_for(engine, job, creds, &u);
+    let mut t = first.clone();
     for _ in 0..MAX_REDIRECTS {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
-        let t = target_for(engine, job, creds, &u);
         let hop = Instant::now();
         // Resilient rather than a bare HEAD: a server that answers HEAD with an
         // empty reply (hetzner's speed-test hosts do) otherwise resolves to
@@ -390,6 +444,7 @@ async fn resolve_one(
                 message: format!("redirect to {loc:?}: {e}"),
                 ..Default::default()
             })?;
+            t = redirected_target(job, &first, &u);
             continue;
         }
         // A forward expressed in HTML rather than in a header: a referrer
@@ -404,6 +459,7 @@ async fn resolve_one(
                 .and_then(|loc| u.join(&loc).ok())
             {
                 u = next;
+                t = redirected_target(job, &first, &u);
                 continue;
             }
         }
@@ -458,12 +514,8 @@ async fn attempt_transfer(
         );
     }
 
-    // ---- ftp:// ----------------------------------------------------------
-    //
-    // Routed before anything else because FTP is a different protocol with a
-    // different cost model, not an HTTP variant: range preemption costs
-    // control-channel round trips that HTTP pays nothing for, so the object
-    // streams sequentially from one connection.
+    // FTP first: range preemption costs control-channel round trips HTTP pays
+    // nothing for, so the object streams sequentially from one connection.
     if Url::parse(&job.cfg.urls[0])
         .map(|u| u.is_ftp())
         .unwrap_or(false)
@@ -471,23 +523,8 @@ async fn attempt_transfer(
         return ftp_transfer(engine, job, &conn, &creds, cancel).await;
     }
 
-    // ---- probe every mirror, CONCURRENTLY --------------------------------
-    //
-    // One HEAD per mirror, and they are independent — each asks a different
-    // host what it holds — so the set costs about what the slowest one does
-    // rather than the sum. In series this was the most expensive thing about
-    // handing libhydra a mirror list: measured on the CLI against a real
-    // twelve-mirror Fedora document, a dozen sequential probes cost 14.4 s
-    // before the first byte. That matters more here than anywhere else,
-    // because this is the embedding surface for mobile, where the round trips
-    // being multiplied are the long ones.
-    //
-    // Bounded, but not by politeness: each probe goes to a DIFFERENT host, and
-    // one HEAD apiece is not something any of them feels — the per-host
-    // ceilings elsewhere answer that question. The cap is only so a
-    // forty-mirror document cannot open forty sockets at once and hit an fd
-    // limit.
-    const PROBE_FANOUT: usize = 16;
+    // Probe every mirror concurrently: in series a dozen HEADs cost 14.4 s
+    // before the first byte, and on mobile those round trips are the long ones.
     let gate = Arc::new(tokio::sync::Semaphore::new(PROBE_FANOUT));
     let mut set = tokio::task::JoinSet::new();
     for (i, raw) in job.cfg.urls.iter().enumerate() {
@@ -557,9 +594,19 @@ async fn attempt_transfer(
         .or_else(|| primary.url.file_name());
     let known_size =
         (primary.probe.status < 300 && primary.probe.size > 0).then_some(primary.probe.size);
-    {
+    let strong = |p: &Probe| p.validator.is_some() && !p.weak_validator;
+    let validator = primary
+        .probe
+        .validator
+        .clone()
+        .filter(|_| strong(&primary.probe));
+    // What the range map on disk was recorded against, before it is replaced:
+    // spans held for one object must not be spliced into another.
+    let (prev_size, prev_validator) = {
         let mut g = job.lock();
+        let prev = (g.size, g.validator.take());
         g.size = known_size;
+        g.validator = validator.clone();
         g.file_name = file_name;
         g.resolved_url = Some(format!(
             "{}://{}{}",
@@ -570,39 +617,21 @@ async fn attempt_transfer(
         if let Some(s) = known_size {
             g.progress.total_bytes = s;
         }
-    }
+        prev
+    };
     engine.emit(job, EV::HYDRA_EVENT_RESOLVED);
 
     let output = job.lock().output_path.clone();
 
-    // ---- no ranges, or no size: one streaming GET ------------------------
-    //
-    // Not a degraded mode to apologise for: without a size there is nothing to
-    // partition, and without range support there is no second request to make.
-    // One connection is the correct answer, and pretending otherwise produces
-    // eight copies of the same bytes.
+    // No size or no ranges: nothing to partition, so one streaming GET is the
+    // correct answer rather than a degraded one.
     let Some(size) = known_size.filter(|_| primary.probe.ranges) else {
         return stream_transfer(engine, job, &conn, &primary.target, &output, cancel).await;
     };
 
-    // ---- keep only mirrors that agree -----------------------------------
-    //
-    // A correctness gate, not an optimisation. Two mirrors that disagree about
-    // the object produce a file assembled from both, of exactly the right
-    // length, that is not either object — a corruption every length check
-    // passes. A weak validator is not evidence of agreement either: the
-    // specification lets one compare equal across representations that are
-    // merely equivalent, which is precisely what must not be spliced.
-    //
-    // Unless a Metalink document stated the size. That is different evidence,
-    // and it makes the pairwise test both unnecessary and unsatisfiable:
-    // independent mirror operators run independent web servers and cannot share
-    // an `ETag`, so requiring one keeps exactly ONE source out of a
-    // nineteen-mirror list. A size published by whoever built the object, from a
-    // host that is usually not one of the mirrors, admits a mirror on stronger
-    // grounds — and the document's digest, per chunk where it published
-    // `<pieces>`, is what actually catches one serving something else.
-    let strong = |p: &Probe| p.validator.is_some() && !p.weak_validator;
+    // Splice only mirrors that agree on the object — a strong validator, or the
+    // size a Metalink document attested, since independent mirrors cannot share
+    // an `ETag` and the document's digest is what catches a wrong one.
     let usable: Vec<&Resolved> = match job.cfg.attested_size {
         Some(want) => resolved
             .iter()
@@ -635,19 +664,21 @@ async fn attempt_transfer(
         });
     }
 
-    // ---- resume ----------------------------------------------------------
     let mut held: Vec<(u64, u64)> = if job.cfg.resume {
         job.lock().held.clone()
     } else {
         Vec::new()
     };
-    // A mirror serving a different size is a different object: splicing what is
-    // on disk into it would be the same corruption the mirror gate refuses.
-    if job.lock().size.is_some_and(|s| s != size) {
+    // A different size, or a different strong validator, is a different
+    // object: splicing what is on disk into it would be the same corruption
+    // the mirror gate refuses.
+    let changed = prev_size.is_some_and(|s| s != size)
+        || matches!((&prev_validator, &validator), (Some(a), Some(b)) if a != b);
+    if changed {
         held.clear();
     }
 
-    let ceiling = engine.connection_ceiling(job.cfg.max_connections);
+    let ceiling = connections_for_size(engine.connection_ceiling(job.cfg.max_connections), size);
     // Plans for the mirrors that SURVIVED probing, in the order they survived
     // in. `usable` is a subset of the configured URL list, so the ranking has to
     // be carried across by URL or a dropped mirror shifts every rank after it —
@@ -794,7 +825,14 @@ async fn attempt_transfer(
         n_sources
     );
 
-    let mut observe = progress_observer(engine.clone(), job.clone(), size, already, n_sources);
+    let mut observe = progress_observer(
+        engine.clone(),
+        job.clone(),
+        size,
+        already,
+        n_sources,
+        cancel.clone(),
+    );
     let pace = pace_for(engine, job);
     let tick_ms = if engine.progress_interval_ms() >= 1000 {
         80
@@ -1016,8 +1054,6 @@ fn pace_for(engine: &Arc<Engine>, job: &Arc<Job>) -> Pace {
     Pace::pair(engine.limiter.clone(), job.limiter.clone())
 }
 
-// ------------------------------------------------------------- the observer
-
 /// The callback `run_transfer_cancellable` invokes once per scheduler tick.
 ///
 /// Two rates are computed and only one is published. The scheduler's own
@@ -1032,17 +1068,18 @@ fn progress_observer(
     size: u64,
     already: u64,
     n_sources: usize,
+    cancel: Arc<AtomicBool>,
 ) -> impl FnMut(&Scheduler, u64) + Send {
     let interval = Duration::from_millis(engine.progress_interval_ms());
     let started = Instant::now();
     let mut last_emit = Instant::now() - Duration::from_secs(3600);
-    let mut smoothed = 0.0f64;
-    let mut mark: Option<(u64, Instant)> = None;
+    let mut meter = RateMeter::new(1.5);
     // Per connection: (range start, cursor, bytes credited). The scheduler
     // reports a position, not a total, so the delta has to be accumulated.
     let mut per_conn: std::collections::HashMap<usize, (u64, u64, u64)> =
         std::collections::HashMap::new();
     let mut counted_bytes = already;
+    let mut reclaims_credited = 0u64;
 
     move |s: &Scheduler, done: u64| {
         for j in 0..s.n_conns() {
@@ -1056,7 +1093,10 @@ fn progress_observer(
                 *e = (lo, pos, e.2);
             }
         }
-        if last_emit.elapsed() < interval && done < size {
+        // The transfer's last call after a stop must land whatever the
+        // interval says: the spans it reports are what the resume starts from.
+        let stopping = cancel.load(Ordering::Relaxed);
+        if !stopping && last_emit.elapsed() < interval && done < size {
             return;
         }
         last_emit = Instant::now();
@@ -1064,20 +1104,9 @@ fn progress_observer(
         // `held_ranges` allocates, so it is computed at the publish cadence and
         // not at the 50 Hz tick rate.
         let held = s.held_ranges();
-        let now = Instant::now();
-        if let Some((prev, at)) = mark {
-            let dt = now.duration_since(at).as_secs_f64();
-            if dt > 0.0 {
-                let inst = done.saturating_sub(prev) as f64 / dt;
-                // The smoothing factor is derived from dt so the time constant
-                // is independent of how often this runs.
-                let alpha = (-dt / 1.5f64).exp();
-                smoothed = smoothed * alpha + inst * (1.0 - alpha);
-            }
-        }
-        mark = Some((done, now));
-
-        let elapsed = started.elapsed().as_secs_f64().max(1e-3);
+        let elapsed = started.elapsed().as_secs_f64();
+        let smoothed = meter.sample(elapsed, done);
+        let elapsed = elapsed.max(1e-3);
         let active_conns = (0..s.n_conns())
             .filter(|&j| s.conn_range(j).is_some())
             .count() as u32;
@@ -1088,10 +1117,11 @@ fn progress_observer(
             .bytes_received
             .fetch_add(done.saturating_sub(counted_bytes), Ordering::Relaxed);
         counted_bytes = done;
-        engine
-            .metrics
-            .stall_count
-            .store(s.stats.reclaims, Ordering::Relaxed);
+        credit_increase(
+            &engine.metrics.stall_count,
+            &mut reclaims_credited,
+            s.stats.reclaims,
+        );
 
         let mut g = job.lock();
         g.progress.bytes_downloaded = done;
@@ -1099,13 +1129,9 @@ fn progress_observer(
         g.progress.bytes_per_second = smoothed as u64;
         g.progress.average_bytes_per_second =
             (done.saturating_sub(already) as f64 / elapsed) as u64;
-        // Only once the estimate has warmed past 1 KB/s: an ETA computed from
-        // startup noise counts down from nonsense.
-        g.progress.eta_seconds = if smoothed > 1024.0 {
-            ((size.saturating_sub(done.min(size))) as f64 / smoothed) as u64
-        } else {
-            0
-        };
+        g.progress.eta_seconds = meter
+            .eta_secs(size.saturating_sub(done.min(size)))
+            .map_or(0, |eta| eta as u64);
         g.progress.active_connections = active_conns;
         g.progress.active_sources = n_sources as u32;
         g.progress.completed_ranges = held.len() as u32;
@@ -1151,8 +1177,6 @@ fn progress_observer(
         });
     }
 }
-
-// ------------------------------------------------- single-stream and ftp paths
 
 /// One GET, streamed to the destination, for a server offering no ranges or no
 /// size.
@@ -1281,18 +1305,22 @@ async fn ftp_transfer(
     }
     let size = sp.size;
     let output = job.lock().output_path.clone();
-    {
+    let prev_size = {
         let mut g = job.lock();
+        let prev = g.size;
         g.size = Some(size);
+        g.validator = None;
         g.file_name = u.file_name();
         g.resolved_url = Some(job.cfg.urls[0].clone());
         g.progress.total_bytes = size;
-    }
+        prev
+    };
     engine.emit(job, EV::HYDRA_EVENT_RESOLVED);
 
     // FTP resumes with REST, which names one offset — so only a contiguous
     // prefix is usable, not the arbitrary span set an HTTP transfer leaves.
-    let start = if job.cfg.resume {
+    // A different size is a different object, and its prefix is not ours.
+    let start = if job.cfg.resume && prev_size.is_none_or(|s| s == size) {
         contiguous_prefix(&job.lock().held)
     } else {
         0
@@ -1419,6 +1447,28 @@ mod tests {
         // Out of order and overlapping, which is what an interrupted
         // multi-connection transfer leaves behind.
         assert_eq!(contiguous_prefix(&[(5, 15), (0, 8), (30, 40)]), 15);
+    }
+
+    #[test]
+    fn small_objects_are_not_split_below_a_quarter_megabyte_per_connection() {
+        assert_eq!(connections_for_size(8, 31), 1);
+        assert_eq!(connections_for_size(8, MIN_BYTES_PER_CONNECTION * 2 - 1), 1);
+        assert_eq!(connections_for_size(8, MIN_BYTES_PER_CONNECTION * 2), 2);
+        assert_eq!(connections_for_size(8, 5 << 20), 8);
+        assert_eq!(connections_for_size(1, 0), 1);
+    }
+
+    #[test]
+    fn a_running_total_is_credited_by_its_increase_only() {
+        let counter = AtomicU64::new(0);
+        let (mut a, mut b) = (0u64, 0u64);
+        credit_increase(&counter, &mut a, 3);
+        credit_increase(&counter, &mut b, 5);
+        credit_increase(&counter, &mut a, 4);
+        assert_eq!(counter.load(Ordering::Relaxed), 9, "3 + 5 + (4 - 3)");
+        // A total that went backwards (a restarted transfer) adds nothing.
+        credit_increase(&counter, &mut a, 1);
+        assert_eq!(counter.load(Ordering::Relaxed), 9);
     }
 
     #[test]

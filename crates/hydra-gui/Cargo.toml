@@ -41,7 +41,7 @@ serde_json = { workspace = true }
 iced = { version = "0.14", features = ["tokio", "svg", "image", "advanced"] }
 # Config/state directory resolution per platform (~/Library/Application Support,
 # %APPDATA%, ~/.config) — the GUI persists its download list and settings there.
-dirs = "6"
+dirs = "7"
 # Human dates for the "Last Try Date" column and scheduler times.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `config.toml` in ~/.config/hydra (or %APPDATA%\hydra): user-editable
@@ -111,7 +111,7 @@ ksni = { version = "0.3", default-features = false, features = [
 # x11rb 0.13) so cargo unifies the two into one copy: a second, separately
 # featured x11rb ends up linking libxcb, which then has to be installed to
 # build at all. See src/linux_taskbar.rs.
-x11rb = "0.13"
+x11rb = "0.14"
 
 [build-dependencies]
 # Compiles the generated .rc (app icon + VERSIONINFO) into hydra-gui.exe —

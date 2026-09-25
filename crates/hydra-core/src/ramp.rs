@@ -354,12 +354,8 @@ impl ConcurrencyRamp {
         if let Some(n) = self.settled {
             return Ramp::Settled(n);
         }
-        // ---- warm-up gate --------------------------------------------------
-        //
-        // Hold the window at arm's length while the level's connections are still
-        // coming up: `start` is called on every poll, so `window_ends_at` keeps
-        // moving and no window can close over a handshake. See `arm_warmup` for the
-        // measurement error this prevents.
+        // Warm-up gate: `start` on every poll keeps `window_ends_at` moving, so
+        // no window can close over a handshake. See `arm_warmup`.
         if let Some(deadline) = self.warm_deadline {
             let warm = self.delivering.unwrap_or(usize::MAX) >= self.level;
             if warm || now >= deadline {
@@ -386,34 +382,13 @@ impl ConcurrencyRamp {
             return Ramp::Hold;
         }
 
-        // Require the same evidence TWICE before raising, and average the two windows.
-        //
-        // One window can land mid-slow-start, while a newly admitted flow is still
-        // opening its congestion window: its rate is still climbing, which is
-        // indistinguishable from "this connection is paying for itself". Acting on a
-        // single window is what drove the search to the ceiling on a path one stream
-        // already saturated (settled counts [2, 8, 8, 8, 8] over five repetitions,
-        // resulting in 1.68-2.23x slower transfers).
-        //
-        // The first window at a level is held back rather than recorded, so `Admission`
-        // sees one sample per level and its per-connection gain arithmetic stays valid.
-        // The two are averaged, which also damps the window-to-window variance that
-        // made a single reading unreliable on a volatile link.
-        if let Some(first) = self.held_rate.take() {
-            // Take the SECOND window, not the average of the two.
-            //
-            // Averaging seemed conservative and is the opposite. The first window at a
-            // new level lands mid-slow-start, while the newly admitted flows are still
-            // opening their congestion windows; the second is closer to steady state.
-            // Averaging them therefore reports a number no window measured, and because
-            // the first is always the lower of the two on a warming path, the average
-            // understates the level's true rate — making the NEXT step look larger than
-            // it is and driving the search upward. Measured: the search reached 8 in 9
-            // of 12 runs on paths where one connection was 1.8-3.2x faster.
-            //
-            // The first window is not wasted: it is the settling time that makes the
-            // second one meaningful.
-            let _ = first;
+        // Two windows per level, and only the SECOND is judged. The first lands
+        // mid-slow-start, while newly admitted flows are still opening their
+        // congestion windows; acting on it drove the search to the ceiling on
+        // paths one stream already saturated, and averaging the two understated
+        // the level and did the same (8 in 9 of 12 runs). `Admission` still sees
+        // one sample per level.
+        if self.held_rate.take().is_some() {
             return self.decide(rate, now, delta);
         }
         self.held_rate = Some(rate);
@@ -445,22 +420,11 @@ impl ConcurrencyRamp {
                 Ramp::Settled(n)
             }
             Admit::Add if self.level < self.max => {
-                // DOUBLE, do not increment.
-                //
-                // Incrementing costs one settle-plus-window per connection, so
-                // reaching 8 takes 7 windows. Measured on a live path with
-                // delta ~0.5-1.0 s that is 16-32 s of clock — longer than the whole
-                // 3.15 MB transfer, which is why the first version of this ramp was
-                // 1.74x slower than a fixed `-x 8` (p = 0.016) despite moving no
-                // wasted bytes. The search was free in bytes and ruinous in time.
-                //
-                // Doubling reaches the ceiling in log2(max) windows: 3 instead of 7
-                // for max=8. This is slow start's own argument — when the target is
-                // unknown and each probe costs a round trip, multiply. The overshoot
-                // it risks is bounded and recoverable, because `Admission` settles
-                // at the last level whose marginal gain paid, and `set_active_limit`
-                // can lower the count without cancelling anything: an over-admitted
-                // connection finishes the range it holds and then goes quiet.
+                // Double rather than increment: each step costs a settle plus a
+                // window (~2-4 s live), so 7 steps to reach 8 outran a 3 MB
+                // transfer and made the ramp 1.74x slower than a fixed `-x 8`.
+                // Overshoot is recoverable, since `Admission` settles at the last
+                // level that paid and `set_active_limit` lowers without cancelling.
                 self.level = (self.level * 2).min(self.max);
                 self.held_rate = None;
                 // Re-arm the warm-up gate for the connections this admits: they have
@@ -494,11 +458,8 @@ mod tests {
     fn verdict_reports_the_chosen_and_the_tried_level_with_their_rates() {
         let mut r = ConcurrencyRamp::new(0.15, 8);
         assert_eq!(r.verdict(), None, "no verdict while the search is running");
-        // A long `delta` makes each window many steps wide, so the synthetic rate
-        // is measured to within a few percent rather than quantised by the step.
         let (mut now, delta, step) = (0.0, 0.5, 0.05);
         r.start(now, delta);
-        // One connection delivers 1000 B/s; two deliver 900 B/s: saturated at one.
         let mut settled = None;
         for _ in 0..2000 {
             let rate = if r.level() >= 2 { 900.0 } else { 1000.0 };
@@ -541,7 +502,6 @@ mod tests {
         r.start(now, delta);
         let mut settled = None;
         for _ in 0..4000 {
-            // Perfect scaling: every level pays, so the search runs to the ceiling.
             let rate = 1000.0 * r.level() as f64;
             now += step;
             r.observe((rate * step) as u64, now);
@@ -571,9 +531,7 @@ mod tests {
         let mut now = 0.0;
         r.start(now, delta);
         for _ in 0..(max * 40) {
-            // Aggregate rate: linear in connections until saturation, flat after.
             let rate = per_conn * r.level().min(sat) as f64;
-            // Advance in small steps, feeding bytes at that rate.
             let step = 0.05;
             now += step;
             r.observe((rate * step) as u64, now);
@@ -596,7 +554,6 @@ mod tests {
         let delta = 0.12;
         let mut now = 0.0;
         r.start(now, delta);
-        // A path with plenty of headroom, so nothing but the clamp can stop it.
         for _ in 0..400 {
             let rate = 400e3 * r.level() as f64;
             now += 0.05;

@@ -735,18 +735,9 @@ pub async fn run_transfer_with_reserves<C: Connector>(
                 *f = f.saturating_add(1);
             }
             let kind = e.kind();
-            // A server that ignores `Range`, mislabels a `Content-Range`, answers
-            // with a status this client cannot use, or redirects a transfer that
-            // is already under way will do the same to the next request; retrying
-            // is how a client hammers a broken endpoint instead of reporting it.
-            // A streak rather than the first one, because a single 5xx from one
-            // node of a CDN is worth another attempt.
-            //
-            // Reporting matters as much as stopping. An expired pre-signed URL —
-            // a GitHub release asset, an S3 link — starts answering 403 part-way
-            // through, and every request after that fails the same way. Spinning
-            // on it until the no-progress deadline tells the user only that
-            // nothing is arriving; failing on it tells them what the server said.
+            // A protocol error (ignored `Range`, wrong `Content-Range`, expired
+            // signed URL) repeats on every retry; a streak of them is reported
+            // rather than spun on, while a single 5xx from one CDN node is retried.
             hard_streak = if matches!(
                 kind,
                 io::ErrorKind::InvalidData | io::ErrorKind::NotConnected
@@ -1172,33 +1163,11 @@ pub async fn run_transfer_with_reserves<C: Connector>(
             }
         }
 
-        // 1e. lower the ceiling for connections the origin admits and then STARVES.
-        //
-        // `throttle_cap` was driven only by a `429`/`503`. An origin that accepts
-        // the TCP connection, answers the request, and then serves nothing on it
-        // produces no error at all, so the cap never moved and the transfer
-        // retried the same losing configuration for its whole life. Measured on
-        // `saimei.ftp.acc.umu.se` at `-x 8`: two connections delivered, six sat
-        // at 0 B/s for the whole stall timeout, all six were reclaimed at once,
-        // re-requested, starved again, and the cycle repeated — a fresh handshake
-        // and a lost congestion window each round, 2.2x slower than ONE
-        // connection. The adaptive search handled the same origin correctly,
-        // because it measures; only the fixed count had nothing to learn from.
-        //
-        // The evidence is the same shape as a refusal and is read the same way:
-        // a connection that was requested and has delivered nothing by the time
-        // the scheduler is about to reclaim it for silence, while another on the
-        // same origin has been streaming the whole time, is a request the origin
-        // has effectively refused. Connections that are delivering are proof of a
-        // count this origin serves, and the cap steps down toward it. The
-        // refusal-free probe above earns the connection back if the limit was
-        // momentary.
-        //
-        // Decided BEFORE the tick on purpose. The tick that reclaims a starved
-        // range also re-assigns it, and with the cap still at the budget it hands
-        // the range straight back to a connection the origin is going to starve
-        // again. `conn_stalling` is the scheduler's own reclaim predicate, so
-        // what is lowered here is exactly what that tick would otherwise re-ask.
+        // 1e. lower the ceiling for connections the origin admits and then STARVES:
+        // a request that has delivered nothing while a sibling on the same origin
+        // streams is a refusal without the status code (`saimei.ftp.acc.umu.se`).
+        // Decided BEFORE the tick, which would otherwise re-assign the reclaimed
+        // range to a connection the origin is about to starve again.
         let now = t0.elapsed().as_secs_f64();
         {
             let mut starved = 0usize;
@@ -1355,25 +1324,9 @@ pub async fn run_transfer_with_reserves<C: Connector>(
             }
         }
 
-        // Wait for the TICK, and only the tick.
-        //
-        // This used to also wake on every arrival — `Some(a) = rx.recv()` beside
-        // the ticker — which turned the tick loop into a per-read loop: every 16
-        // to 64 KiB that landed on any socket woke this task, credited one
-        // arrival, and then ran the whole loop body again, the stalled-connection
-        // scan, the repair evaluation, the reason bookkeeping, the progress
-        // callback with its per-connection rendering, all of it, before sleeping
-        // for the next read. Measured on a 1 GB transfer at four connections
-        // against `aria2c`: 19 000 voluntary and 5 700 involuntary context
-        // switches against 1 800 and 40, and 40 000 and 22 000 over TLS where the
-        // reads are 16 KiB records. The user time was already lower than
-        // `aria2c`'s; all of the CPU gap was this.
-        //
-        // Nothing needs sub-tick latency. Arrivals carry their own timestamps, so
-        // rate samples are exact whenever they are credited; the channel is
-        // unbounded, so a tick's worth of them queue without back-pressure; and
-        // every decision this loop makes is a tick-granularity decision anyway.
-        // They are drained at the top of the loop, as they always were.
+        // Wait for the tick, never for an arrival: waking per read ran this whole
+        // loop body per 16-64 KiB and was 10x the context switches of aria2c.
+        // Arrivals carry their own timestamps, so nothing needs sub-tick latency.
         ticker.tick().await;
         observe(&sched, sched.bytes_held());
 
@@ -1408,20 +1361,10 @@ pub async fn run_transfer_with_reserves<C: Connector>(
             // The deadline is extended by `backoff_grace`: the time the scheduler
             // has DELIBERATELY spent with every source suspended, capped.
             //
-            // Silence the scheduler asked for is not a stall. After repeated stalls a
-            // source is suspended for a backoff interval, and with a single source —
-            // one URL, one CDN, the common case — nothing can move until it expires.
-            // Charging that against the no-progress deadline made hydra abort
-            // transfers it had itself paused: on a 121.7 MiB GitHub release asset, 4
-            // of 8 multi-connection runs died at "no progress for 16s", three of them
-            // holding 126.9-127.0 MB of 127.6 MB — 99.6% fetched, reported as failed.
-            //
-            // The grace is CAPPED, and the cap is the whole design. An uncapped
-            // version (reset the clock whenever every source is suspended) hangs
-            // forever on a source that black-holes from the first byte: each stall
-            // triggers another suspension, which forgives another deadline. That is
-            // the failure `a_lone_black_holing_source_fails_instead_of_idling_forever`
-            // exists to catch, and it caught it.
+            // Silence the scheduler asked for is not a stall — with one source,
+            // nothing can move until its backoff expires. The cap is what keeps a
+            // source that black-holes from the first byte from forgiving itself
+            // forever.
             for (_, h) in inflight.drain() {
                 h.abort();
             }

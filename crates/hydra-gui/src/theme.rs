@@ -437,6 +437,24 @@ pub fn btn_tab(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Sty
 
 // ------------------------------------------------------------ inputs & misc
 
+/// The red a dialog says "this is wrong" in — a refused OK, an entry that
+/// cannot be stored.
+pub const ERROR_RED: u32 = 0xC02B2B;
+
+pub fn error_text() -> Color {
+    c(ERROR_RED)
+}
+
+/// A text box whose contents cannot be used: the frame and the text go
+/// red, and everything else stays as the plain box draws it.
+pub fn input_invalid(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        border: border(c(ERROR_RED), 1.0, 2.0),
+        value: c(ERROR_RED),
+        ..input(theme, status)
+    }
+}
+
 pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let dark = is_dark(theme);
     text_input::Style {

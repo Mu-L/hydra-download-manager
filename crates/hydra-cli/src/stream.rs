@@ -54,6 +54,10 @@ pub struct Job {
     /// to segments. See `hya_stream::hls::Concurrency` for the measurement
     /// behind that.
     pub conns: usize,
+    /// `--no-clobber`: leave a finished file alone.
+    pub no_clobber: bool,
+    /// `--force`: overwrite a finished file without asking.
+    pub force: bool,
 }
 
 /// How a stream attempt ended.
@@ -157,33 +161,9 @@ async fn get(
 /// would save every stream on the internet as `index`. The directory above
 /// it is nearly always the asset id, which at least distinguishes them.
 fn output_name(url: &str, ext: &str) -> String {
-    let bare = url.split(['?', '#']).next().unwrap_or(url);
-    // Only the PATH can name a file. Without this the host would, and
-    // `https://cdn.example/` would save as `cdn.mp4`.
-    let path = match bare.find("://") {
-        Some(i) => {
-            let rest = &bare[i + 3..];
-            rest.find('/').map(|j| &rest[j..]).unwrap_or("")
-        }
-        None => bare,
-    };
-    let mut parts = path.rsplit('/').filter(|p| !p.is_empty());
-    let file = parts.next().unwrap_or("stream");
-    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
-    const GENERIC: &[&str] = &[
-        "index", "master", "manifest", "playlist", "mono", "stream", "media", "video", "main",
-    ];
-    let name = if GENERIC.contains(&stem.to_ascii_lowercase().as_str()) {
-        parts.next().unwrap_or(stem)
-    } else {
-        stem
-    };
-    // Decoded here rather than before the generic-stem test above: the escape is
-    // what the reader should not see, but `master`/`index` never carry one, and
-    // deciding on the raw segment keeps that comparison exact. Sanitizing straight
-    // afterwards is what makes decoding safe — `%2F` becomes a separator, `%00` a
-    // NUL the OS would truncate the name at, and both land in the map below.
-    let name: String = crate::url::pct_decode(name)
+    // `%2F` becomes a separator and `%00` a NUL once decoded, so the map
+    // below runs on the decoded stem.
+    let name: String = hya_stream::url::stream_base_name(url)
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
@@ -252,12 +232,19 @@ pub async fn run(job: Job) -> Verdict {
     // every segment at the wrong host.
     let (body, base) = match get_at(&conn, &job.url, &job, hls::playlist_cap()).await {
         Ok(b) => b,
-        // Unreachable, or larger than any manifest: either way this is not a
-        // stream, and the caller reports it the way it reports anything else.
+        // Unreachable, or larger than any manifest. A question about the
+        // manifest gets the transport's own answer; a plain download falls
+        // through to the ranged path, which reports the failure it meets.
+        Err(e) if job.list => return Verdict::Failed(format!("{}: {e}", job.url)),
         Err(_) => return Verdict::NotAManifest,
     };
     let text = String::from_utf8_lossy(&body).into_owned();
-    let is_dash = if text.trim_start().starts_with("#EXTM3U") {
+    // A byte-order mark before `#EXTM3U` is a playlist some encoders emit.
+    let is_dash = if text
+        .trim_start_matches('\u{feff}')
+        .trim_start()
+        .starts_with("#EXTM3U")
+    {
         false
     } else if text.contains("<MPD") {
         true
@@ -277,34 +264,108 @@ pub async fn run(job: Job) -> Verdict {
         });
     }
 
-    let want_ext = if job.container.eq_ignore_ascii_case("ts") {
+    if is_dash {
+        run_dash(&conn, &job, &text, &base, &cancel).await
+    } else {
+        run_hls(&conn, &job, text, &base, &cancel).await
+    }
+}
+
+/// `mp4` or `ts`, as `--container` asked.
+fn container_ext(job: &Job) -> &'static str {
+    if job.container.eq_ignore_ascii_case("ts") {
         "ts"
     } else {
         "mp4"
-    };
+    }
+}
+
+/// The extension the finished file carries, decided once the manifest has
+/// said what the segments are: `--container` for video, but a packed audio
+/// stream's own — a `.mp4` full of ADTS frames is a file that lies about
+/// itself — unless `--output` names one.
+fn wanted_ext(job: &Job, plans: &[hls::Plan]) -> String {
+    match plans {
+        [only] if only.raw_audio.is_some() => job
+            .output
+            .as_deref()
+            .and_then(std::path::Path::extension)
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| only.native_ext().to_string()),
+        _ => container_ext(job).to_string(),
+    }
+}
+
+/// Where the finished file goes: `--output`, or a name derived from the URL
+/// under `ext`, and either way the answer to a file already there.
+fn resolve_output(job: &Job, ext: &str) -> Result<PathBuf, Verdict> {
     let out_path = job.output.clone().unwrap_or_else(|| {
-        let name = output_name(&job.url, want_ext);
+        let name = output_name(&job.url, ext);
         match &job.output_dir {
             Some(d) => d.join(name),
             None => PathBuf::from(name),
         }
     });
+    existing_decision(job, out_path)
+}
 
-    if is_dash {
-        run_dash(&conn, &job, &text, &base, &out_path, want_ext, &cancel).await
-    } else {
-        run_hls(&conn, &job, text, &base, &out_path, want_ext, &cancel).await
+/// What to do about a finished file already at `out_path`.
+///
+/// A stream's own resume lives in its `.part` checkpoints, so a file under the
+/// final name is a completed download: the flags answer, a terminal is asked,
+/// and a non-interactive run writes beside it rather than over it.
+fn existing_decision(job: &Job, out_path: PathBuf) -> Result<PathBuf, Verdict> {
+    if !out_path.exists() {
+        return Ok(out_path);
+    }
+    let on_disk = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    let offer = crate::prompt::ResumeOffer::Refused(
+        "a stream resumes from its .part checkpoints, not from the finished file".into(),
+    );
+    let flags = crate::prompt::Flags {
+        resume: false,
+        no_clobber: job.no_clobber,
+        force: job.force,
+        assume_default: job.quiet,
+    };
+    match crate::prompt::ask(&out_path, on_disk, 0, &offer, flags)
+        .unwrap_or(crate::prompt::Existing::Rename)
+    {
+        crate::prompt::Existing::Skip => {
+            if !job.quiet {
+                eprintln!(
+                    "stream: {} already exists; not retrieved",
+                    out_path.display()
+                );
+            }
+            Err(Verdict::Done {
+                path: out_path,
+                bytes: on_disk,
+            })
+        }
+        crate::prompt::Existing::Rename => match crate::prompt::next_free_name(&out_path) {
+            Some(fresh) => {
+                if !job.quiet {
+                    eprintln!("stream: writing to {}", fresh.display());
+                }
+                Ok(fresh)
+            }
+            None => Err(Verdict::Failed(
+                "no free filename beside the existing one".into(),
+            )),
+        },
+        _ => {
+            let _ = std::fs::remove_file(&out_path);
+            Ok(out_path)
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_hls(
     conn: &Arc<TlsCapableConnector>,
     job: &Job,
     text: String,
     base: &str,
-    out_path: &PathBuf,
-    want_ext: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Verdict {
     let mut playlist = hls::parse(&text, base);
@@ -313,6 +374,9 @@ async fn run_hls(
     // Set from the master, before `playlist` becomes the media playlist:
     // once that happens the rendition groups are gone.
     let mut audio_url: Option<String> = None;
+    // Its `#EXT-X-DEFINE` variables likewise: a media playlist may `IMPORT`
+    // them, and they are gone with the master.
+    let mut imported: Vec<(String, String)> = Vec::new();
 
     if playlist.is_master() {
         if job.list {
@@ -339,7 +403,9 @@ async fn run_hls(
             Err(e) => return Verdict::Failed(format!("could not read the variant playlist: {e}")),
         };
         source = chosen.url.clone();
-        playlist = hls::parse(&String::from_utf8_lossy(&body), &chosen.url);
+        imported = std::mem::take(&mut playlist.variables);
+        playlist =
+            hls::parse_with_variables(&String::from_utf8_lossy(&body), &chosen.url, &imported);
     } else if job.list {
         println!("HLS  {}  (single rendition)", job.url);
         return Verdict::Listed;
@@ -363,7 +429,7 @@ async fn run_hls(
             // count is fixed from this point, and a second track that starts
             // a window late is a recording whose sound is permanently behind
             // its picture.
-            match media_playlist(conn, job, au).await {
+            match media_playlist(conn, job, au, &imported).await {
                 Ok(apl) => windows.push(Window::of(&apl)),
                 Err(e) => {
                     eprintln!("stream: audio unusable, recording video only ({e})");
@@ -377,11 +443,10 @@ async fn run_hls(
             Live::Hls {
                 url: source,
                 audio_url,
+                imported,
             },
             windows,
             playlist.refresh_after(),
-            out_path,
-            want_ext,
             cancel,
         )
         .await;
@@ -396,7 +461,7 @@ async fn run_hls(
     // being silent.
     let mut plans = vec![plan];
     if let Some(au) = &audio_url {
-        match media_playlist(conn, job, au).await {
+        match media_playlist(conn, job, au, &imported).await {
             // Audio that will not resolve is not a reason to lose the video.
             Ok(apl) => match hls::Plan::build(&apl, None) {
                 Ok(p) => plans.push(p),
@@ -405,17 +470,14 @@ async fn run_hls(
             Err(e) => eprintln!("stream: audio unusable, video only ({e})"),
         }
     }
-    assemble(conn, job, plans, out_path, want_ext, cancel).await
+    assemble(conn, job, plans, cancel).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_dash(
     conn: &Arc<TlsCapableConnector>,
     job: &Job,
     text: &str,
     base: &str,
-    out_path: &PathBuf,
-    want_ext: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Verdict {
     let mf = dash::parse(text, base);
@@ -471,8 +533,6 @@ async fn run_dash(
             },
             windows,
             mf.refresh_after(),
-            out_path,
-            want_ext,
             cancel,
         )
         .await;
@@ -488,19 +548,25 @@ async fn run_dash(
             Err(e) => eprintln!("stream: audio unusable, video only ({e})"),
         }
     }
-    assemble(conn, job, plans, out_path, want_ext, cancel).await
+    assemble(conn, job, plans, cancel).await
 }
 
-/// Fetch a playlist and parse it against the URL it came from.
+/// Fetch a playlist and parse it against the URL it came from, with the
+/// master's `#EXT-X-DEFINE` variables available to `IMPORT`.
 async fn media_playlist(
     conn: &Arc<TlsCapableConnector>,
     job: &Job,
     url: &str,
+    imported: &[(String, String)],
 ) -> Result<hls::Playlist, String> {
     let body = get(conn, url, job, hls::playlist_cap())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(hls::parse(&String::from_utf8_lossy(&body), url))
+    Ok(hls::parse_with_variables(
+        &String::from_utf8_lossy(&body),
+        url,
+        imported,
+    ))
 }
 
 // ------------------------------------------------------------- assembly
@@ -555,17 +621,6 @@ fn fetcher(
     }
 }
 
-pub(crate) fn human(n: u64) -> String {
-    const U: [&str; 4] = ["B", "KB", "MB", "GB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < 3 {
-        v /= 1024.0;
-        i += 1;
-    }
-    format!("{v:.1} {}", U[i])
-}
-
 /// A progress line on stderr, so stdout stays clean for `--json` and pipes.
 fn spawn_progress(
     meter: Arc<hls::Meter>,
@@ -588,8 +643,8 @@ fn spawn_progress(
             };
             eprint!(
                 "\r\x1b[K{where_}  {}  {}/s",
-                human(bytes),
-                human(rate as u64)
+                hya_core::fmt::bytes(bytes),
+                hya_core::fmt::bytes(rate as u64)
             );
             let _ = std::io::stderr().flush();
         }
@@ -600,11 +655,19 @@ async fn assemble(
     conn: &Arc<TlsCapableConnector>,
     job: &Job,
     plans: Vec<hls::Plan>,
-    out_path: &PathBuf,
-    want_ext: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Verdict {
+    let want_ext = wanted_ext(job, &plans);
+    let out_path = match resolve_output(job, &want_ext) {
+        Ok(p) => p,
+        Err(v) => return v,
+    };
     let staging = format!("{}.part", out_path.display());
+    // Say so before the first segment, not after the last: a download that
+    // ends in "needs ffmpeg" has cost the whole transfer to learn it.
+    if let Some(why) = ffmpeg_needed_but_missing(&plans, &want_ext) {
+        return Verdict::Failed(why);
+    }
     // AES-128 keys, fetched with the same session as the manifest.
     let mut keys = hls::Keys::new();
     for plan in &plans {
@@ -701,13 +764,102 @@ async fn assemble(
     if !job.quiet {
         eprintln!();
     }
-    let kinds: Vec<hls::Segments> = plans.iter().map(|p| p.kind).collect();
-    finish(&kinds, &parts, out_path, want_ext, job)
+    let tracks: Vec<Track> = plans.iter().map(Track::Planned).collect();
+    finish(&tracks, &parts, &out_path, &want_ext, job)
+}
+
+/// Why the assembly cannot be finished here, when ffmpeg is absent.
+fn ffmpeg_needed_but_missing(plans: &[hls::Plan], want_ext: &str) -> Option<String> {
+    if hls::ffmpeg_available() {
+        return None;
+    }
+    let [plan] = plans else {
+        return Some(
+            "combining separate video and audio tracks needs ffmpeg; install it, or pick a \
+             rendition that carries both"
+                .into(),
+        );
+    };
+    if hls::plan_finish_for(plan, want_ext, false) != hls::Finish::Refuse {
+        return None;
+    }
+    Some(match (plan.raw_audio, plan.kind) {
+        (Some(audio), _) => format!(
+            "these segments are raw {} audio; ask for .{}, or install ffmpeg to get .{want_ext}",
+            audio.ext().to_ascii_uppercase(),
+            audio.ext()
+        ),
+        (None, hls::Segments::Ts) => "MPEG-TS to MP4 needs ffmpeg; install it, or pass \
+                                      --container ts to keep the transport stream"
+            .into(),
+        (None, hls::Segments::Fmp4) => "these segments are fragmented MP4, not MPEG-TS; ask \
+                                        for MP4, or install ffmpeg"
+            .into(),
+    })
+}
+
+/// What one staging file holds, for the step that turns it into the output:
+/// the plan it was assembled from, or — for a recording, which has no plan —
+/// only the container its window declared.
+enum Track<'a> {
+    Planned(&'a hls::Plan),
+    Recorded(hls::Segments),
+}
+
+impl Track<'_> {
+    fn kind(&self) -> hls::Segments {
+        match self {
+            Track::Planned(p) => p.kind,
+            Track::Recorded(k) => *k,
+        }
+    }
+
+    fn native_ext(&self) -> &'static str {
+        match self {
+            Track::Planned(p) => p.native_ext(),
+            Track::Recorded(hls::Segments::Ts) => "ts",
+            Track::Recorded(hls::Segments::Fmp4) => "mp4",
+        }
+    }
+
+    fn finish(
+        &self,
+        want_ext: &str,
+        src: &std::path::Path,
+        dst: &std::path::Path,
+    ) -> Result<hls::Finished, String> {
+        match self {
+            Track::Planned(p) => hls::finish_plan(p, want_ext, src, dst),
+            Track::Recorded(k) => hls::finish(*k, want_ext, src, dst),
+        }
+    }
+}
+
+/// Where an assembled track goes when the last step could not run: beside
+/// the intended output, under a name that says what it is.
+fn kept_track_path(
+    out_path: &std::path::Path,
+    index: usize,
+    tracks: usize,
+    track: &Track,
+) -> PathBuf {
+    let ext = track.native_ext();
+    let stem = out_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "stream".into());
+    let name = if tracks > 1 {
+        let role = if index == 0 { "video" } else { "audio" };
+        format!("{stem}.{role}.{ext}")
+    } else {
+        format!("{stem}.{ext}")
+    };
+    out_path.with_file_name(name)
 }
 
 fn finish(
     // One per staging file, in the same order.
-    kinds: &[hls::Segments],
+    tracks: &[Track],
     // `(staging file, checkpoint sidecar)`; a recording has no sidecar.
     parts: &[(String, Option<String>)],
     out_path: &PathBuf,
@@ -740,16 +892,11 @@ fn finish(
             std::path::Path::new(&parts[0].0),
             std::path::Path::new(&parts[1].0),
             out_path,
-            kinds[1],
+            tracks[1].kind(),
         )
         .map(|()| hls::Finished::Remuxed)
     } else {
-        hls::finish(
-            kinds[0],
-            want_ext,
-            std::path::Path::new(&parts[0].0),
-            out_path,
-        )
+        tracks[0].finish(want_ext, std::path::Path::new(&parts[0].0), out_path)
     };
     match result {
         Ok(finished) => {
@@ -768,7 +915,11 @@ fn finish(
             }
             let bytes = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
             if !job.quiet {
-                eprintln!("stream: {} ({})", out_path.display(), human(bytes));
+                eprintln!(
+                    "stream: {} ({})",
+                    out_path.display(),
+                    hya_core::fmt::bytes(bytes)
+                );
             }
             Verdict::Done {
                 path: out_path.clone(),
@@ -776,8 +927,26 @@ fn finish(
             }
         }
         // The tracks are playable on their own; keeping them beats deleting
-        // the download because the last step could not run.
-        Err(e) => Verdict::Failed(e),
+        // the download because the last step could not run — under a name
+        // that says what they are, not a `.part.t0` nobody will recognise.
+        Err(e) => {
+            let mut kept = Vec::new();
+            for (i, (p, c)) in parts.iter().enumerate() {
+                let dest = kept_track_path(out_path, i, parts.len(), &tracks[i]);
+                if std::fs::rename(p, &dest).is_ok() {
+                    kept.push(dest.display().to_string());
+                } else {
+                    kept.push(p.clone());
+                }
+                if let Some(c) = c {
+                    let _ = std::fs::remove_file(c);
+                }
+            }
+            Verdict::Failed(format!(
+                "{e}; kept the assembled stream at {}",
+                kept.join(" and ")
+            ))
+        }
     }
 }
 
@@ -789,6 +958,8 @@ enum Live {
         /// The `#EXT-X-MEDIA` rendition the variant plays with, when the
         /// sound is a playlist of its own.
         audio_url: Option<String>,
+        /// The master's `#EXT-X-DEFINE` variables, for every re-read.
+        imported: Vec<(String, String)>,
     },
     Dash {
         url: String,
@@ -836,8 +1007,12 @@ async fn refresh(
     source: &Live,
 ) -> Result<(WindowList, bool, std::time::Duration), String> {
     match source {
-        Live::Hls { url, audio_url } => {
-            let pl = media_playlist(conn, job, url)
+        Live::Hls {
+            url,
+            audio_url,
+            imported,
+        } => {
+            let pl = media_playlist(conn, job, url, imported)
                 .await
                 .map_err(|e| format!("could not re-read the playlist: {e}"))?;
             if let Some(d) = &pl.drm {
@@ -853,7 +1028,7 @@ async fn refresh(
                 // The track count was fixed when the recording started, so a
                 // window that cannot be read now has to stop the recording
                 // rather than quietly leave the audio behind the picture.
-                let apl = media_playlist(conn, job, au)
+                let apl = media_playlist(conn, job, au, imported)
                     .await
                     .map_err(|e| format!("could not re-read the audio playlist: {e}"))?;
                 windows.push(Window::of(&apl));
@@ -887,17 +1062,19 @@ async fn refresh(
 }
 
 /// Record a live stream until it ends or Ctrl-C.
-#[allow(clippy::too_many_arguments)]
 async fn record(
     conn: &Arc<TlsCapableConnector>,
     job: &Job,
     source: Live,
     primed: WindowList,
     first_refresh: std::time::Duration,
-    out_path: &PathBuf,
-    want_ext: &str,
     cancel: &Arc<AtomicBool>,
 ) -> Verdict {
+    let want_ext = container_ext(job);
+    let out_path = match resolve_output(job, want_ext) {
+        Ok(p) => p,
+        Err(v) => return v,
+    };
     let staging = format!("{}.part", out_path.display());
     let tracks = primed.len();
     let mut files = Vec::with_capacity(tracks);
@@ -1061,19 +1238,11 @@ async fn record(
                         Err(_) => return Err(std::io::Error::other("fetch gate closed")),
                     };
                     let lane = m2.occupy(&c2);
-                    // Bounded like every other attempt: an origin that
+                    // Supervised like every other attempt: an origin that
                     // accepts and then goes silent would otherwise block the
                     // append loop forever, with the deadline never reached
                     // and Ctrl-C unable to land.
-                    let r = match tokio::time::timeout(hls::ATTEMPT_TIMEOUT, f(url, d2, c2.clone()))
-                        .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "live segment stalled",
-                        )),
-                    };
+                    let r = watched(f(url, d2, c2.clone()), &c2).await;
                     if let Some(l) = lane {
                         l.finish(r.is_ok());
                     }
@@ -1167,7 +1336,67 @@ async fn record(
         }
         return Verdict::Failed(e);
     }
-    finish(&kinds, &parts, out_path, want_ext, job)
+    let tracks: Vec<Track> = kinds.iter().map(|k| Track::Recorded(*k)).collect();
+    finish(&tracks, &parts, &out_path, want_ext, job)
+}
+
+/// Run one live-segment fetch under idle supervision, as `fetch_all` runs a
+/// VOD segment's: abandoned once `counter` has not moved for
+/// [`hls::ATTEMPT_TIMEOUT`], or after [`hls::ATTEMPT_CEILING`] regardless.
+/// A wall-clock timeout here killed any segment slower than the allowance,
+/// however steadily its bytes were arriving.
+async fn watched<Fut>(fut: Fut, counter: &AtomicU64) -> std::io::Result<u64>
+where
+    Fut: std::future::Future<Output = std::io::Result<u64>>,
+{
+    supervised(fut, counter, hls::ATTEMPT_TIMEOUT, hls::ATTEMPT_CEILING).await
+}
+
+async fn supervised<Fut>(
+    fut: Fut,
+    counter: &AtomicU64,
+    idle: std::time::Duration,
+    ceiling: std::time::Duration,
+) -> std::io::Result<u64>
+where
+    Fut: std::future::Future<Output = std::io::Result<u64>>,
+{
+    tokio::pin!(fut);
+    let started = tokio::time::Instant::now();
+    let mut seen = counter.load(Ordering::Relaxed);
+    let mut moved_at = started;
+    let tick = (idle / 20).clamp(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_secs(3),
+    );
+    let mut ticker = tokio::time::interval(tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = ticker.tick() => {
+                let now = counter.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    moved_at = tokio::time::Instant::now();
+                } else if moved_at.elapsed() >= idle {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("live segment stalled: no bytes for {}s", idle.as_secs()),
+                    ));
+                }
+                if started.elapsed() >= ceiling {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "live segment still arriving after {}s; abandoned",
+                            ceiling.as_secs()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn append(src: &str, out: &mut std::fs::File) -> std::io::Result<()> {
@@ -1232,7 +1461,7 @@ pub async fn inspect_file(job: &Job) -> Result<(), String> {
     println!("URL          {url}");
     println!("File name    {name}");
     match probe.stated_length() {
-        Some(n) => println!("Size         {} ({n} bytes)", human(n)),
+        Some(n) => println!("Size         {} ({n} bytes)", hya_core::fmt::bytes(n)),
         None => println!("Size         unknown (the server states no length)"),
     }
     if let Some(ct) = &probe.content_type {
@@ -1466,6 +1695,20 @@ mod tests {
         let verdict = run(job_for(format!("{base}/master.m3u8"), out.clone())).await;
 
         let reqs = seen.lock().unwrap().clone();
+        if !hls::ffmpeg_available() {
+            // Without a muxer the answer is known before the first segment,
+            // and no segment is fetched to learn it.
+            match &verdict {
+                Verdict::Failed(msg) => assert!(msg.contains("ffmpeg"), "{msg}"),
+                other => panic!("must refuse up front without ffmpeg: {other:?}"),
+            }
+            assert!(
+                !reqs.iter().any(|(path, _)| path == "/v/v0.ts"),
+                "a segment was fetched for a file that could never be finished"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
         for want in ["/a/en.m3u8", "/a/a0.ts", "/v/v0.ts"] {
             assert!(
                 reqs.iter().any(|(path, _)| path == want),
@@ -1474,11 +1717,115 @@ mod tests {
         }
         // Combining is ffmpeg's step and these four-byte fixtures are not
         // media, so it may refuse them; what this pins is that both tracks
-        // were fetched and handed to it.
+        // were fetched and handed to it, and that a refusal leaves the tracks
+        // under names that say what they are rather than as `.part` litter.
         if let Verdict::Failed(msg) = &verdict {
             assert!(msg.contains("ffmpeg"), "unexpected failure: {msg}");
+            assert!(msg.contains("kept the assembled stream"), "{msg}");
+            assert!(dir.join("out.video.ts").exists(), "{msg}");
+            assert!(dir.join("out.audio.ts").exists(), "{msg}");
+            assert!(!dir.join("out.mp4.part.t0").exists());
+            assert!(!dir.join("out.mp4.part.t0.ck").exists());
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Some encoders write a byte-order mark before `#EXTM3U`; the playlist
+    /// is no less a playlist for it.
+    #[tokio::test]
+    async fn a_playlist_with_a_byte_order_mark_is_still_a_playlist() {
+        let (base, _seen) = serve(vec![
+            (
+                "/index.m3u8".into(),
+                "\u{feff}#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nv0.ts\n#EXT-X-ENDLIST\n"
+                    .into(),
+            ),
+            ("/v0.ts".into(), b"VVVV".to_vec()),
+        ]);
+        let dir = std::env::temp_dir().join("hydra-cli-hls-bom");
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.ts");
+        let job = Job {
+            container: "ts".into(),
+            ..job_for(format!("{base}/index.m3u8"), out.clone())
+        };
+        match run(job).await {
+            Verdict::Done { path, .. } => assert_eq!(std::fs::read(&path).unwrap(), b"VVVV"),
+            other => panic!("a BOM must not hide the playlist: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A finished file under the output name is not overwritten without a
+    /// word: `--no-clobber` keeps it, a non-interactive run writes beside it,
+    /// `--force` replaces it.
+    #[tokio::test]
+    async fn an_existing_output_is_kept_renamed_around_or_forced() {
+        let (base, seen) = serve(vec![
+            (
+                "/index.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nv0.ts\n#EXT-X-ENDLIST\n".into(),
+            ),
+            ("/v0.ts".into(), b"VVVV".to_vec()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("hydra-cli-hls-nc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.ts");
+        std::fs::write(&out, b"OLD").unwrap();
+        let job = Job {
+            container: "ts".into(),
+            no_clobber: true,
+            ..job_for(format!("{base}/index.m3u8"), out.clone())
+        };
+        match run(job).await {
+            Verdict::Done { path, bytes } => {
+                assert_eq!(path, out);
+                assert_eq!(bytes, 3);
+            }
+            other => panic!("--no-clobber must keep the file: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&out).unwrap(), b"OLD");
+        assert!(
+            !seen.lock().unwrap().iter().any(|(p, _)| p == "/v0.ts"),
+            "nothing is fetched for a file that is kept"
+        );
+
+        let job = Job {
+            container: "ts".into(),
+            ..job_for(format!("{base}/index.m3u8"), out.clone())
+        };
+        match run(job).await {
+            Verdict::Done { path, .. } => assert_eq!(path, dir.join("out.ts.1")),
+            other => panic!("a non-interactive run writes beside the file: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&out).unwrap(), b"OLD");
+
+        let job = Job {
+            container: "ts".into(),
+            force: true,
+            ..job_for(format!("{base}/index.m3u8"), out.clone())
+        };
+        assert!(matches!(run(job).await, Verdict::Done { .. }));
+        assert_eq!(std::fs::read(&out).unwrap(), b"VVVV");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--list-streams` against a URL that cannot be fetched reported "not an
+    /// HLS or DASH manifest", hiding the transport's own answer.
+    #[tokio::test]
+    async fn a_listing_that_cannot_fetch_the_manifest_reports_the_real_error() {
+        let (base, _seen) = serve(vec![]);
+        let job = Job {
+            list: true,
+            ..job_for(format!("{base}/gone.m3u8"), PathBuf::from("unused"))
+        };
+        match run(job).await {
+            Verdict::Failed(msg) => assert!(msg.contains("404"), "the status must be named: {msg}"),
+            other => panic!("a fetch failure is not 'not a manifest': {other:?}"),
+        }
+        // Without the flag the plain download path gets to report it instead.
+        let job = job_for(format!("{base}/gone.m3u8"), PathBuf::from("unused"));
+        assert!(matches!(run(job).await, Verdict::NotAManifest));
     }
 
     #[tokio::test]
@@ -1638,6 +1985,180 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A media playlist may `IMPORT` a variable the master `DEFINE`d; parsing
+    /// it without the master's table leaves `{$cdn}` in every segment URL.
+    #[tokio::test]
+    async fn a_media_playlist_imports_the_masters_variables() {
+        let (base, seen) = serve(vec![
+            (
+                "/master.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n",
+                    "#EXT-X-DEFINE:NAME=\"cdn\",VALUE=\"c1\"\n",
+                    "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360\n",
+                    "v/index.m3u8\n"
+                )
+                .into(),
+            ),
+            (
+                "/v/index.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n",
+                    "#EXT-X-DEFINE:IMPORT=\"cdn\"\n",
+                    "#EXTINF:4.0,\n{$cdn}/v0.ts\n#EXT-X-ENDLIST\n"
+                )
+                .into(),
+            ),
+            ("/v/c1/v0.ts".into(), b"VVVV".to_vec()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("hydra-cli-hls-define-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = Job {
+            container: "ts".into(),
+            ..job_for(format!("{base}/master.m3u8"), dir.join("out.ts"))
+        };
+        match run(job).await {
+            Verdict::Done { path, .. } => assert_eq!(std::fs::read(&path).unwrap(), b"VVVV"),
+            other => panic!("the imported variable must resolve: {other:?}"),
+        }
+        assert!(
+            seen.lock().unwrap().iter().any(|(p, _)| p == "/v/c1/v0.ts"),
+            "the segment was asked for under an unsubstituted name"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Packed AAC segments concatenate into an `.aac` file, and that is what
+    /// the download is named when `--output` names nothing: a `.mp4` full of
+    /// ADTS frames plays nowhere, and `--container` speaks of video.
+    #[tokio::test]
+    async fn a_raw_audio_playlist_lands_under_its_own_extension() {
+        let (base, _seen) = serve(vec![
+            (
+                "/radio/index.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\na0.aac\n#EXTINF:4.0,\na1.aac\n\
+                 #EXT-X-ENDLIST\n"
+                    .into(),
+            ),
+            ("/radio/a0.aac".into(), b"AAAA".to_vec()),
+            ("/radio/a1.aac".into(), b"BBBB".to_vec()),
+        ]);
+        let dir = std::env::temp_dir().join(format!("hydra-cli-hls-aac-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let job = Job {
+            output: None,
+            output_dir: Some(dir.clone()),
+            ..job_for(format!("{base}/radio/index.m3u8"), PathBuf::new())
+        };
+        match run(job).await {
+            Verdict::Done { path, bytes } => {
+                assert_eq!(path, dir.join("radio.aac"));
+                assert_eq!(bytes, 8);
+                assert_eq!(std::fs::read(&path).unwrap(), b"AAAABBBB");
+            }
+            other => panic!("raw audio is placed as it is: {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_wanted_extension_follows_the_segments_unless_output_names_one() {
+        let aac = hls::Plan::build(
+            &hls::parse(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\na0.aac\n#EXT-X-ENDLIST\n",
+                "http://h/i.m3u8",
+            ),
+            None,
+        )
+        .unwrap();
+        let ts = hls::Plan::build(
+            &hls::parse(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\nv0.ts\n#EXT-X-ENDLIST\n",
+                "http://h/i.m3u8",
+            ),
+            None,
+        )
+        .unwrap();
+        let job = Job {
+            container: "mp4".into(),
+            ..Job::default()
+        };
+        assert_eq!(wanted_ext(&job, std::slice::from_ref(&aac)), "aac");
+        assert_eq!(wanted_ext(&job, std::slice::from_ref(&ts)), "mp4");
+        let named = Job {
+            output: Some(PathBuf::from("show.M4A")),
+            ..job.clone()
+        };
+        assert_eq!(wanted_ext(&named, std::slice::from_ref(&aac)), "m4a");
+        assert_eq!(
+            wanted_ext(&named, std::slice::from_ref(&ts)),
+            "mp4",
+            "--container decides for video, whatever the name says"
+        );
+        // Two tracks are a mux, which is a container job whatever the audio is.
+        assert_eq!(wanted_ext(&job, &[ts.clone(), aac.clone()]), "mp4");
+        // Refused up front when the answer would need ffmpeg and there is none.
+        if !hls::ffmpeg_available() {
+            let why = ffmpeg_needed_but_missing(std::slice::from_ref(&aac), "mp4").unwrap();
+            assert!(why.contains("raw AAC") && why.contains(".aac"), "{why}");
+            assert!(ffmpeg_needed_but_missing(std::slice::from_ref(&aac), "aac").is_none());
+        }
+    }
+
+    /// The live recorder's supervision is idle-based, as the library's is:
+    /// a segment that keeps delivering is never abandoned for being slow.
+    #[tokio::test]
+    async fn a_slow_but_moving_live_segment_is_not_abandoned() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+        let idle = std::time::Duration::from_millis(200);
+        // Forty ticks of 10 ms: twice the idle allowance end to end, never
+        // idle for a twentieth of it.
+        let trickle = async move {
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(40)
+        };
+        let got = supervised(trickle, &counter, idle, std::time::Duration::from_secs(30)).await;
+        assert_eq!(got.unwrap(), 40);
+    }
+
+    #[tokio::test]
+    async fn a_live_segment_that_stops_moving_is_abandoned() {
+        let counter = AtomicU64::new(0);
+        let idle = std::time::Duration::from_millis(100);
+        let silent = std::future::pending::<std::io::Result<u64>>();
+        let e = supervised(silent, &counter, idle, std::time::Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("stalled"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_dripping_live_segment_meets_the_ceiling() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+        let drip = async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let e = supervised(
+            drip,
+            &counter,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("abandoned"), "{e}");
+    }
+
     #[test]
     fn a_generic_manifest_name_borrows_the_directory_above_it() {
         // Every stream on the internet is called index.m3u8; the asset id is
@@ -1750,12 +2271,5 @@ mod tests {
         // wrong local time would be worse than an honest unknown one.
         assert_eq!(to_local("not a date"), "not a date");
         assert_eq!(to_local(""), "");
-    }
-
-    #[test]
-    fn sizes_read_the_way_people_write_them() {
-        assert_eq!(human(0), "0.0 B");
-        assert_eq!(human(1536), "1.5 KB");
-        assert_eq!(human(5 * 1024 * 1024), "5.0 MB");
     }
 }

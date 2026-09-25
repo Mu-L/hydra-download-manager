@@ -129,8 +129,9 @@ the pinned one moves the extension off `jpnonmbbkjdpeebdhkjoliklfhkdcomj`.
 The script rewrites the manifest key to match (a mismatched pair is rejected
 outright by the browser) and warns with the id it produced. Such a build
 still reaches Hydra over the WebSocket — `extbus` accepts any extension
-origin — but not over native messaging, which is allow-listed by id and is
-the only path that can launch the app.
+origin that presents the `ipc.json` token, which only the native host hands
+out — so it needs the native-messaging allow-list to name its id, and that
+list is also what gates launching the app.
 
 `--out DIR` packs into DIR instead, which is how every installer ships the
 extension inside the installed application.
@@ -141,13 +142,23 @@ Two front doors to the same handler:
 
 | Transport | Port | Auth | Used by |
 |---|---|---|---|
-| WebSocket | `6799`, fallback `16799` (fixed) | `Origin: chrome-extension://…` | the extension, directly |
+| WebSocket | `6799`, fallback `16799` (fixed) | extension `Origin`, then `auth` with the `ipc.json` token | the extension, directly |
 | Line protocol | ephemeral, published in `ipc.json` | random token from `ipc.json` | `hydra-host` |
 
 The WebSocket is the primary path: no process spawn per request, and the
 live socket *is* the "Hydra is running" indicator (the toolbar shows a gray
 **X** while it is down). The native host remains the fallback and
 is the only path that can **launch** the app.
+
+Any extension origin gets past the WebSocket handshake, but the socket's
+first frame must be `{"type":"auth","token":…}` carrying the token from
+`ipc.json` — which the extension gets by asking the native host
+`{"type":"ws-token"}` (answered `{"ok":true,"ws_port":N,"token":…}` while
+the app is running) and caches in `storage.session`. Any other frame on an
+unauthenticated socket is answered `{"ok":false,"error":"unauthorized"}`
+and the socket closed (as is one idle for 5 s), so a stale token after an
+app restart simply triggers a refresh and a redial; the extension ids
+Hydra ships under (`nmhost::CHROMIUM_EXT_IDS`) are admitted without a token.
 
 Requests are JSON objects: `ping`, `config`, `open`,
 `download {url, filename?, cookies?, referer?, user_agent?, size?, mime?,

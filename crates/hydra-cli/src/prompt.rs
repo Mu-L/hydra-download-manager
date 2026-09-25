@@ -10,9 +10,10 @@
 //!
 //! So an interactive terminal asks. A non-interactive one must not: a prompt with
 //! nobody to answer it is a hang, which in a cron job or a CI step is worse than any
-//! of the four choices. When stdin is not a terminal the decision falls back to the
-//! flags, and the flags are always honoured without asking — an explicit `-c` or
-//! `--no-clobber` is already an answer, and re-asking would be ignoring it.
+//! of the four choices — and so is a read from a pipe nobody is writing to. When
+//! stdin is not a terminal the decision falls back to the flags, and the flags are
+//! always honoured without asking — an explicit `-c` or `--no-clobber` is already an
+//! answer, and re-asking would be ignoring it.
 //!
 //! # Why resume is not offered unconditionally
 //!
@@ -125,19 +126,9 @@ pub fn decide<R: BufRead, W: Write>(
     }
 
     if !interactive || flags.assume_default {
-        // No terminal. A piped answer is still an answer, though — `echo c | hydra ...`
-        // and an expect-style driver both arrive this way, and refusing to read them
-        // makes the prompt untestable and unscriptable. So try one non-blocking read of
-        // whatever is queued; only fall back when there is genuinely nothing.
-        let mut line = String::new();
-        if !flags.assume_default && input.read_line(&mut line)? > 0 {
-            if let Some(c) = parse_answer(line.trim(), offer) {
-                return Ok(c);
-            }
-        }
-        // Nothing to read. Choose the option that cannot destroy data: keep the
-        // existing file and write beside it (avoiding accidental overwrite or
-        // unbounded file loss).
+        // No terminal, so nothing is read: a pipe with no writer would block
+        // here forever. Choose the option that cannot destroy data — keep the
+        // existing file and write beside it.
         return Ok(Existing::Rename);
     }
 
@@ -145,15 +136,15 @@ pub fn decide<R: BufRead, W: Write>(
     writeln!(
         out,
         "hydra: {name} already exists ({} on disk, remote object is {}).",
-        crate::progress::human(on_disk),
-        crate::progress::human(remote_size)
+        hya_core::fmt::bytes(on_disk),
+        hya_core::fmt::bytes(remote_size)
     )?;
     match offer {
         ResumeOffer::Sound(held) => {
             writeln!(
                 out,
                 "  [c] continue from {}   [r] restart from zero   [n] save as a new name   [s] skip",
-                crate::progress::human(*held)
+                hya_core::fmt::bytes(*held)
             )?;
         }
         ResumeOffer::Verifiable(held) => {
@@ -166,7 +157,7 @@ pub fn decide<R: BufRead, W: Write>(
                 out,
                 "  [c] continue from {} (verify first)   [r] restart from zero   \
                  [n] save as a new name   [s] skip",
-                crate::progress::human(*held)
+                hya_core::fmt::bytes(*held)
             )?;
         }
         ResumeOffer::LooksComplete(held) => {
@@ -409,6 +400,28 @@ mod tests {
         assert!(w.is_empty(), "nothing should be printed when not asking");
     }
 
+    /// Piped input is not read when there is no terminal: a pipe whose writer
+    /// never writes would block the run, and a queued "r" answering a question
+    /// that was never asked would destroy a file.
+    #[test]
+    fn a_non_interactive_run_ignores_queued_input() {
+        let mut r = Cursor::new(b"r\n".to_vec());
+        let mut w = Vec::new();
+        let got = decide(
+            Path::new("/tmp/f"),
+            1,
+            2,
+            &sound(),
+            Flags::default(),
+            false,
+            &mut r,
+            &mut w,
+        )
+        .unwrap();
+        assert_eq!(got, Existing::Rename);
+        assert_eq!(r.position(), 0, "stdin must not be read without a terminal");
+    }
+
     #[test]
     fn eof_mid_prompt_does_not_destroy_data() {
         assert_eq!(run("", Flags::default(), true, &sound()), Existing::Rename);
@@ -510,7 +523,7 @@ mod tests {
         .unwrap();
         let shown = String::from_utf8(w).unwrap();
         assert!(shown.contains("big.iso"), "name the file: {shown}");
-        // human() uses three significant figures, so 1 MiB prints as "1.00 MiB".
+        // `fmt::bytes` uses three significant figures, so 1 MiB prints as "1.00 MiB".
         assert!(shown.contains("1.00 MiB"), "state what is on disk: {shown}");
         assert!(shown.contains("10.0 MiB"), "state the remote size: {shown}");
     }

@@ -1,0 +1,16 @@
+# Advisories reviewed and accepted. Each one reaches the tree only through
+# hya-gui's GUI stack and has no patched release those crates accept; drop
+# the entry once the upstream bump lands, since CI denies every warning.
+[advisories]
+ignore = [
+    # lru 0.16 via iced_wgpu -> cryoglyph: the use-after-free needs a key
+    # whose Drop panics inside pop(). cryoglyph's CacheKey is Copy and it
+    # never calls pop(). Fixed in lru 0.18.2, which cryoglyph 0.1 rejects.
+    "RUSTSEC-2026-0253",
+    # Unmaintained, no known vulnerability: fxhash via display-info 0.5 (latest);
+    # paste, rustybuzz and ttf-parser via iced 0.14's wgpu, svg and text stack.
+    "RUSTSEC-2025-0057",
+    "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0206",
+    "RUSTSEC-2026-0192",
+]

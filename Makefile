@@ -35,7 +35,7 @@ VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 PROFILE ?= release
 CARGO   ?= cargo
 
-.PHONY: all build cli gui host app dmg deb rpm linux appimage flatpak windows \
+.PHONY: all audit build cli gui host app dmg deb rpm linux appimage flatpak windows \
         windows-portable package clean \
         extensions \
         require-macos require-linux ffi header header-check ffi-compat \
@@ -192,3 +192,6 @@ lint:
 
 test:
 	cargo test --workspace --all-features
+
+audit:
+	cargo audit --deny warnings

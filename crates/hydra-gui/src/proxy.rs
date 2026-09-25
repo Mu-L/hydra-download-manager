@@ -113,6 +113,38 @@ pub fn spec_error(spec: &str) -> Option<String> {
     Proxy::parse(spec.trim()).err()
 }
 
+/// Why Options cannot accept "Use automatic configuration script". Said in
+/// the tab and again when OK is refused, so a route the app cannot take is
+/// never stored as if it could.
+pub const PAC_UNSUPPORTED: &str =
+    "Configuration scripts (PAC) are not evaluated yet — choose manual \
+     configuration or system settings.";
+
+/// What is wrong with the manual tab's fields, or `None` when they describe
+/// a proxy the transport can open. The same rules [`manual`] applies, asked
+/// before the settings are accepted instead of logged after they fail.
+pub fn manual_problem(s: &Settings) -> Option<String> {
+    let raw = s.proxy_host.trim();
+    if raw.is_empty() {
+        return Some(crate::i18n::tr("Enter the proxy server address."));
+    }
+    let spec = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("{}://{raw}", s.proxy_type.scheme())
+    };
+    if let Err(e) = Proxy::parse(&spec) {
+        return Some(e);
+    }
+    let port = s.proxy_port.trim();
+    if !port.is_empty() && !port.parse::<u16>().is_ok_and(|n| n > 0) {
+        return Some(
+            crate::i18n::tr("{port} is not a port number (1-65535).").replace("{port}", port),
+        );
+    }
+    None
+}
+
 /// The same question a dialog actually asks: what is wrong with the address
 /// the user is TYPING, or `None` while there is nothing to complain about.
 ///
@@ -220,17 +252,13 @@ fn system() -> Option<Proxy> {
 }
 
 fn from_env() -> Option<Proxy> {
-    const VARS: [&str; 6] = [
-        "all_proxy",
-        "ALL_PROXY",
-        "https_proxy",
-        "HTTPS_PROXY",
-        "http_proxy",
-        "HTTP_PROXY",
-    ];
-    VARS.iter()
-        .filter_map(|v| std::env::var(v).ok())
-        .find_map(|raw| parse_system(&raw))
+    match Proxy::from_env() {
+        Ok(px) => px,
+        Err(e) => {
+            crate::log::warn(&format!("proxy: ignoring system setting: {e}"));
+            None
+        }
+    }
 }
 
 /// A proxy address read from the environment or from a platform setting.
@@ -238,6 +266,7 @@ fn from_env() -> Option<Proxy> {
 /// Failure is a log line rather than an error: nothing the user typed in this
 /// app is wrong, so the honest report is that the system's own value could not
 /// be used.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 fn parse_system(raw: &str) -> Option<Proxy> {
     let raw = raw.trim();
     if raw.is_empty() {

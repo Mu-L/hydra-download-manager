@@ -72,7 +72,10 @@ impl Personality {
 }
 
 /// Decide the dialect from the invoked name and the arguments.
-pub fn detect(argv0: &str, args: &[String]) -> Personality {
+///
+/// A `--compat` value that names no dialect is an error: silently falling back
+/// to native would parse `-O` with the wrong meaning and look like it worked.
+pub fn detect(argv0: &str, args: &[String]) -> Result<Personality, String> {
     // An explicit --compat wins over everything.
     for (i, a) in args.iter().enumerate() {
         if let Some(v) = a.strip_prefix("--compat=") {
@@ -84,6 +87,10 @@ pub fn detect(argv0: &str, args: &[String]) -> Personality {
             }
         }
     }
+    Ok(detect_from_name(argv0))
+}
+
+fn detect_from_name(argv0: &str) -> Personality {
     let stem = std::path::Path::new(argv0)
         .file_stem()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
@@ -98,13 +105,31 @@ pub fn detect(argv0: &str, args: &[String]) -> Personality {
     }
 }
 
-fn parse_name(v: &str) -> Personality {
+fn parse_name(v: &str) -> Result<Personality, String> {
     match v.to_ascii_lowercase().as_str() {
-        "wget" => Personality::Wget,
-        "curl" => Personality::Curl,
-        _ => Personality::Native,
+        "wget" => Ok(Personality::Wget),
+        "curl" => Ok(Personality::Curl),
+        "native" | "hydra" => Ok(Personality::Native),
+        other => Err(format!(
+            "--compat {other:?}: not a dialect (want native, wget or curl)"
+        )),
     }
 }
+
+/// Flags after which curl writes to a file rather than to stdout.
+const CURL_OUTPUT_FLAGS: &[&str] = &[
+    "--output",
+    "--stdout",
+    "--remote-name",
+    "--content-disposition",
+    "--spider",
+    "--json",
+    "--inspect",
+    "--list-streams",
+    "--preview",
+    "--help",
+    "--version",
+];
 
 /// A translation outcome for one input token.
 enum Map {
@@ -260,7 +285,35 @@ pub fn canonicalize(p: Personality, args: &[String]) -> Result<(Vec<String>, Vec
 
         out.push(raw.clone());
     }
+    // curl writes the body to stdout unless told where to put it; a `curl URL`
+    // that quietly wrote a file would surprise every pipeline built on it.
+    if p == Personality::Curl
+        && !seen_dashdash_output(&out)
+        && !out.iter().any(|t| CURL_OUTPUT_FLAGS.contains(&t.as_str()))
+        && out.iter().any(|t| !t.starts_with('-'))
+    {
+        out.push("--stdout".into());
+    }
     Ok((out, notes))
+}
+
+/// A subcommand word (`checksum`, `formats`, ...) is not a URL to stream.
+fn seen_dashdash_output(out: &[String]) -> bool {
+    out.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "interactive"
+                | "parity"
+                | "checksum"
+                | "metalink"
+                | "formats"
+                | "bench"
+                | "completions"
+                | "update"
+                | "compat-link"
+                | "install-completions"
+        )
+    })
 }
 
 /// Append canonical tokens, dropping a boolean flag already emitted.
@@ -303,6 +356,16 @@ macro_rules! bare {
     };
 }
 
+/// wget's `-t 0` means retry forever and curl's `--retry 0` means never;
+/// the native parser takes a count of at least one.
+fn tries_value(p: Personality, v: String) -> String {
+    match (p, v.trim()) {
+        (Personality::Wget, "0" | "inf") => u32::MAX.to_string(),
+        (Personality::Curl, "0") => "1".to_string(),
+        _ => v,
+    }
+}
+
 /// Long options, shared where the two tools agree.
 fn map_long(p: Personality, name: &str, take: &mut dyn FnMut(bool) -> Option<String>) -> Map {
     let need = |t: &mut dyn FnMut(bool) -> Option<String>, flag: &str| -> Result<String, Map> {
@@ -322,7 +385,14 @@ fn map_long(p: Personality, name: &str, take: &mut dyn FnMut(bool) -> Option<Str
         "limit-rate" => kv!("limit-rate", "limit-rate"),
         "header" => kv!("header", "header"),
         "user-agent" => kv!("user-agent", "user-agent"),
-        "output" => kv!("output", "output"),
+        "output" => {
+            let v = val!("output");
+            if v == "-" {
+                bare!("stdout")
+            } else {
+                Map::Emit(vec!["--output".into(), v])
+            }
+        }
         "continue" => bare!("continue"),
         "quiet" => bare!("quiet"),
         "verbose" => bare!("verbose"),
@@ -343,6 +413,16 @@ fn map_long(p: Personality, name: &str, take: &mut dyn FnMut(bool) -> Option<Str
         "remote-name" => bare!("remote-name"),
         "remote-time" | "use-server-timestamps" => bare!("remote-time"),
         "checksum" => kv!("checksum", "checksum"),
+        // curl's `--json DATA` is a POST; wget has no `--json`, so there it is
+        // hydra's own machine-readable output.
+        "json" if p == Personality::Curl => {
+            let _ = take(true);
+            Map::Reject(
+                "--json: in curl this sends a JSON request body, and hydra only issues GET \
+                 and HEAD. For hydra's machine-readable result use --compat native --json."
+                    .into(),
+            )
+        }
         "json" => bare!("json"),
         "silent" => bare!("quiet"),
         "no-progress-meter" | "no-progress" => bare!("no-progress"),
@@ -359,12 +439,30 @@ fn map_long(p: Personality, name: &str, take: &mut dyn FnMut(bool) -> Option<Str
         }
         "start-pos" => kv!("start-pos", "start-pos"),
         "proxy" => kv!("proxy", "proxy"),
-        "noproxy" | "no-proxy" => bare!("no-proxy"),
+        // curl's `--noproxy HOSTS` takes a list; only "*" maps onto a flag that
+        // disables proxying altogether.
+        "noproxy" => {
+            let v = val!("noproxy");
+            if v.trim() == "*" {
+                bare!("no-proxy")
+            } else {
+                Map::Reject(format!(
+                    "--noproxy {v:?}: a per-host exemption list is read from the no_proxy \
+                     environment variable; --noproxy '*' disables the proxy for every host"
+                ))
+            }
+        }
+        "no-proxy" => bare!("no-proxy"),
         "ipv4" | "inet4-only" => bare!("ipv4"),
         "ipv6" | "inet6-only" => bare!("ipv6"),
         "compat" => Map::Emit(vec![]),
-        "tries" | "retry" => kv!("tries", name),
-        "retry-delay" | "waitretry" => kv!("retry-delay", name),
+        "tries" | "retry" => Map::Emit(vec!["--tries".into(), tries_value(p, val!(name))]),
+        "retry-delay" | "waitretry" => {
+            let _ = take(true);
+            Map::Reject(format!(
+                "--{name}: the pause between retries is fixed in this client and cannot be set"
+            ))
+        }
         "wait" => kv!("wait", "wait"),
         "timeout" | "max-time" => kv!("timeout", name),
         "connect-timeout" => kv!("connect-timeout", "connect-timeout"),
@@ -417,9 +515,16 @@ fn map_long(p: Personality, name: &str, take: &mut dyn FnMut(bool) -> Option<Str
             "--{name}: hydra downloads named objects and does not crawl. \
              Use wget -r for recursive mirroring, then hydra for the large files."
         )),
+        "request" | "method" => match val!(name).to_ascii_uppercase().as_str() {
+            "GET" => Map::Emit(vec![]),
+            "HEAD" => bare!("spider"),
+            other => Map::Reject(format!(
+                "--{name} {other}: hydra is a downloader; it only issues GET and HEAD."
+            )),
+        },
         "post-data" | "post-file" | "body-data" | "body-file" | "data" | "data-ascii"
         | "data-binary" | "data-raw" | "data-urlencode" | "form" | "form-string"
-        | "upload-file" | "request" | "method" | "get" => Map::Reject(format!(
+        | "upload-file" | "get" => Map::Reject(format!(
             "--{name}: hydra is a downloader; it only issues GET and HEAD. \
              Use curl for request bodies and other methods."
         )),
@@ -433,16 +538,20 @@ fn map_long(p: Personality, name: &str, take: &mut dyn FnMut(bool) -> Option<Str
         "save-cookies" => kv!("save-cookies", "save-cookies"),
         "keep-session-cookies" => bare!("keep-session-cookies"),
         "junk-session-cookies" => bare!("junk-session-cookies"),
-        "user" | "password" | "http-user" | "http-password" | "ftp-user" | "ftp-password"
-        | "proxy-user" | "proxy-password" | "ask-password" | "netrc" | "digest" | "ntlm"
-        | "negotiate" | "anyauth" | "basic" | "oauth2-bearer" | "aws-sigv4" => {
+        // HTTP Basic is the one scheme both tools share a spelling for.
+        "user" | "http-user" => kv!("user", name),
+        "password" | "http-password" => kv!("password", name),
+        "basic" => Map::Emit(vec![]),
+        "ftp-user" | "ftp-password" | "proxy-user" | "proxy-password" | "ask-password"
+        | "netrc" | "digest" | "ntlm" | "negotiate" | "anyauth" | "oauth2-bearer" | "aws-sigv4" => {
             let _ = take(!matches!(
                 name,
-                "ask-password" | "netrc" | "digest" | "ntlm" | "negotiate" | "anyauth" | "basic"
+                "ask-password" | "netrc" | "digest" | "ntlm" | "negotiate" | "anyauth"
             ));
             Map::Reject(format!(
-                "--{name}: authentication is not implemented. Use --header \
-                 'Authorization: ...' for a token, or fetch via an authenticated proxy."
+                "--{name}: only HTTP Basic is implemented (--user, --password, or \
+                 user:pass@ in the URL); use --header 'Authorization: ...' for anything else, \
+                 and --proxy http://user:pass@host:port for a proxy login"
             ))
         }
         "compressed" | "compression" | "tr-encoding" => Map::Reject(format!(
@@ -498,7 +607,7 @@ fn map_short(p: Personality, ch: char, take: &mut dyn FnMut(bool) -> Option<Stri
             'a' => kv!("logfile-append", 'a'),
             'c' => bare!("continue"),
             'q' => bare!("quiet"),
-            't' => kv!("tries", 't'),
+            't' => Map::Emit(vec!["--tries".into(), tries_value(p, val!('t'))]),
             'T' => kv!("timeout", 'T'),
             'w' => kv!("wait", 'w'),
             'U' => kv!("user-agent", 'U'),
@@ -517,8 +626,9 @@ fn map_short(p: Personality, ch: char, take: &mut dyn FnMut(bool) -> Option<Stri
             'b' => Map::Reject(
                 "-b (background) is not implemented; use your shell's job control".into(),
             ),
-            'r' | 'm' | 'p' | 'k' | 'K' | 'l' | 'A' | 'R' | 'D' | 'I' | 'X' | 'H' | 'L' | 'i'
-            | 'F' | 'B' | 'E' => Map::Reject(format!(
+            'i' => kv!("input-file", 'i'),
+            'r' | 'm' | 'p' | 'k' | 'K' | 'l' | 'A' | 'R' | 'D' | 'I' | 'X' | 'H' | 'L' | 'F'
+            | 'B' | 'E' => Map::Reject(format!(
                 "-{ch}: hydra downloads named objects and does not crawl or rewrite HTML"
             )),
             'x' => Map::Inert("directory forcing is not applicable"),
@@ -562,12 +672,23 @@ fn map_short(p: Personality, ch: char, take: &mut dyn FnMut(bool) -> Option<Stri
                 Map::Reject("-w/--write-out is not implemented; use --json".into())
             }
             '#' => bare!("show-progress"),
-            'd' | 'F' | 'T' | 'X' | 'G' => Map::Reject(format!(
+            'X' => match val!('X').to_ascii_uppercase().as_str() {
+                "GET" => Map::Emit(vec![]),
+                "HEAD" => bare!("spider"),
+                other => Map::Reject(format!(
+                    "-X {other}: hydra is a downloader; it only issues GET and HEAD"
+                )),
+            },
+            'd' | 'F' | 'T' | 'G' => Map::Reject(format!(
                 "-{ch}: hydra is a downloader; it only issues GET and HEAD"
             )),
-            'u' | 'U' | 'n' | 'E' => {
-                let _ = take(matches!(ch, 'u' | 'U' | 'E'));
-                Map::Reject(format!("-{ch}: authentication is not implemented"))
+            'u' => kv!("user", 'u'),
+            'U' | 'n' | 'E' => {
+                let _ = take(matches!(ch, 'U' | 'E'));
+                Map::Reject(format!(
+                    "-{ch}: only HTTP Basic is implemented (-u user:pass); use --proxy \
+                     http://user:pass@host:port for a proxy login"
+                ))
             }
             'b' => kv!("cookie", 'b'),
             'c' => kv!("cookie-jar", 'c'),
@@ -606,11 +727,11 @@ mod tests {
 
     #[test]
     fn personality_comes_from_the_invoked_name() {
-        assert_eq!(detect("/usr/local/bin/hydra", &[]), Personality::Native);
-        assert_eq!(detect("/usr/local/bin/wget", &[]), Personality::Wget);
-        assert_eq!(detect("hydra-wget", &[]), Personality::Wget);
-        assert_eq!(detect("/opt/bin/curl", &[]), Personality::Curl);
-        assert_eq!(detect("hydra-curl.exe", &[]), Personality::Curl);
+        assert_eq!(detect("/usr/local/bin/hydra", &[]), Ok(Personality::Native));
+        assert_eq!(detect("/usr/local/bin/wget", &[]), Ok(Personality::Wget));
+        assert_eq!(detect("hydra-wget", &[]), Ok(Personality::Wget));
+        assert_eq!(detect("/opt/bin/curl", &[]), Ok(Personality::Curl));
+        assert_eq!(detect("hydra-curl.exe", &[]), Ok(Personality::Curl));
     }
 
     /// A repeated boolean flag is what the real tools do, so it cannot be an
@@ -651,12 +772,21 @@ mod tests {
 
     #[test]
     fn explicit_compat_overrides_the_name() {
-        assert_eq!(detect("wget", &s(&["--compat=curl"])), Personality::Curl);
-        assert_eq!(detect("curl", &s(&["--compat", "wget"])), Personality::Wget);
+        assert_eq!(
+            detect("wget", &s(&["--compat=curl"])),
+            Ok(Personality::Curl)
+        );
+        assert_eq!(
+            detect("curl", &s(&["--compat", "wget"])),
+            Ok(Personality::Wget)
+        );
         assert_eq!(
             detect("wget", &s(&["--compat=native"])),
-            Personality::Native
+            Ok(Personality::Native)
         );
+        // A typo must not silently become native, where -O means something else.
+        let e = detect("hydra", &s(&["--compat=culr"])).unwrap_err();
+        assert!(e.contains("culr"), "{e}");
     }
 
     /// The headline conflict: `-O` must mean opposite things per dialect.
@@ -676,6 +806,20 @@ mod tests {
             canon(Personality::Curl, &["-o", "out.bin", "http://x/f"]),
             s(&["--output", "out.bin", "http://x/f"])
         );
+        // And with neither, curl writes the body to stdout.
+        assert_eq!(
+            canon(Personality::Curl, &["-s", "http://x/f"]),
+            s(&["--quiet", "http://x/f", "--stdout"])
+        );
+        assert!(
+            !canon(Personality::Curl, &["-I", "http://x/f"]).contains(&"--stdout".to_string()),
+            "a HEAD has no body to stream"
+        );
+        assert!(
+            !canon(Personality::Curl, &["checksum", "http://x/f"])
+                .contains(&"--stdout".to_string()),
+            "a subcommand is not a transfer"
+        );
     }
 
     #[test]
@@ -687,11 +831,17 @@ mod tests {
         // curl -C - is "resume where it left off"; -C 1024 is an explicit offset.
         assert_eq!(
             canon(Personality::Curl, &["-C", "-", "http://x/f"]),
-            s(&["--continue", "http://x/f"])
+            s(&["--continue", "http://x/f", "--stdout"])
         );
         assert_eq!(
             canon(Personality::Curl, &["-C", "1024", "http://x/f"]),
-            s(&["--continue", "--start-pos", "1024", "http://x/f"])
+            s(&[
+                "--continue",
+                "--start-pos",
+                "1024",
+                "http://x/f",
+                "--stdout"
+            ])
         );
     }
 
@@ -715,14 +865,11 @@ mod tests {
         );
         assert_eq!(
             canon(Personality::Curl, &["-A", "me/1.0", "http://x/f"]),
-            s(&["--user-agent", "me/1.0", "http://x/f"])
+            s(&["--user-agent", "me/1.0", "http://x/f", "--stdout"])
         );
         // And curl's -U is proxy-user, which must NOT become a user agent.
         let e = canonicalize(Personality::Curl, &s(&["-U", "bob:pw", "http://x/f"])).unwrap_err();
-        assert!(
-            e.contains("authentication"),
-            "curl -U must not be read as a UA: {e}"
-        );
+        assert!(e.contains("Basic"), "curl -U must not be read as a UA: {e}");
     }
 
     /// Every dialect funnels headers through the one validating parser.
@@ -792,18 +939,149 @@ mod tests {
     }
 
     #[test]
+    fn curl_and_wget_credentials_reach_the_basic_auth_flags() {
+        assert_eq!(
+            canon(Personality::Curl, &["-u", "a:b", "-o", "f", "http://x/f"]),
+            s(&["--user", "a:b", "--output", "f", "http://x/f"])
+        );
+        assert_eq!(
+            canon(
+                Personality::Wget,
+                &["--http-user=a", "--http-password=b", "http://x/f"]
+            ),
+            s(&["--user", "a", "--password", "b", "http://x/f"])
+        );
+        let e = canonicalize(Personality::Curl, &s(&["--ntlm", "http://x/f"])).unwrap_err();
+        assert!(e.contains("Basic"), "{e}");
+    }
+
+    #[test]
+    fn wget_dash_i_is_an_input_file() {
+        assert_eq!(
+            canon(Personality::Wget, &["-i", "urls.txt"]),
+            s(&["--input-file", "urls.txt"])
+        );
+    }
+
+    #[test]
+    fn curl_json_is_a_request_body_and_is_refused_with_its_value_consumed() {
+        let e = canonicalize(Personality::Curl, &s(&["--json", "{}", "http://x/f"])).unwrap_err();
+        assert!(e.contains("request body"), "{e}");
+        // wget has no --json, so there it is hydra's own flag.
+        assert_eq!(
+            canon(Personality::Wget, &["--json", "http://x/f"]),
+            s(&["--json", "http://x/f"])
+        );
+    }
+
+    #[test]
+    fn noproxy_consumes_its_host_list() {
+        assert_eq!(
+            canon(
+                Personality::Curl,
+                &["--noproxy", "*", "-o", "f", "http://x/f"]
+            ),
+            s(&["--no-proxy", "--output", "f", "http://x/f"])
+        );
+        let e = canonicalize(
+            Personality::Curl,
+            &s(&["--noproxy", "a.test,b.test", "http://x/f"]),
+        )
+        .unwrap_err();
+        assert!(e.contains("no_proxy"), "{e}");
+        assert_eq!(
+            canon(Personality::Wget, &["--no-proxy", "http://x/f"]),
+            s(&["--no-proxy", "http://x/f"])
+        );
+    }
+
+    #[test]
+    fn a_dash_output_means_stdout_in_the_long_form_too() {
+        assert_eq!(
+            canon(Personality::Curl, &["--output", "-", "http://x/f"]),
+            s(&["--stdout", "http://x/f"])
+        );
+        assert_eq!(
+            canon(Personality::Wget, &["--output=-", "http://x/f"]),
+            s(&["--stdout", "http://x/f"])
+        );
+    }
+
+    #[test]
+    fn get_and_head_are_the_only_methods_and_others_are_refused() {
+        assert_eq!(
+            canon(Personality::Curl, &["-X", "GET", "-o", "f", "http://x/f"]),
+            s(&["--output", "f", "http://x/f"])
+        );
+        assert_eq!(
+            canon(Personality::Curl, &["--request", "head", "http://x/f"]),
+            s(&["--spider", "http://x/f"])
+        );
+        assert!(canonicalize(Personality::Curl, &s(&["-X", "POST", "http://x/f"])).is_err());
+    }
+
+    #[test]
+    fn a_max_filesize_with_a_suffix_survives_the_curl_dialect_and_parses() {
+        let (out, _) = canonicalize(
+            Personality::Curl,
+            &s(&["--max-filesize", "10M", "http://x/f"]),
+        )
+        .unwrap();
+        let full: Vec<String> = std::iter::once("hydra".to_string())
+            .chain(out.iter().cloned())
+            .collect();
+        let parsed = crate::cli::Cli::try_parse_from(&full).expect("10M is a size");
+        assert_eq!(parsed.max_filesize, Some(10 << 20));
+    }
+
+    #[test]
+    fn tries_zero_means_forever_in_wget_and_once_in_curl() {
+        assert_eq!(
+            canon(Personality::Wget, &["-t", "0", "http://x/f"]),
+            s(&["--tries", &u32::MAX.to_string(), "http://x/f"])
+        );
+        assert_eq!(
+            canon(Personality::Wget, &["--tries=3", "http://x/f"]),
+            s(&["--tries", "3", "http://x/f"])
+        );
+        assert_eq!(
+            canon(
+                Personality::Curl,
+                &["--retry", "0", "-o", "f", "http://x/f"]
+            ),
+            s(&["--tries", "1", "--output", "f", "http://x/f"])
+        );
+        assert!(canonicalize(Personality::Wget, &s(&["--waitretry", "2", "http://x/f"])).is_err());
+    }
+
+    #[test]
     fn headers_and_referer_translate() {
         assert_eq!(
             canon(
                 Personality::Curl,
-                &["-H", "X-A: 1", "-H", "X-B: 2", "http://x/f"]
+                &["-H", "X-A: 1", "-H", "X-B: 2", "-O", "http://x/f"]
             ),
-            s(&["--header", "X-A: 1", "--header", "X-B: 2", "http://x/f"])
+            s(&[
+                "--header",
+                "X-A: 1",
+                "--header",
+                "X-B: 2",
+                "--remote-name",
+                "http://x/f"
+            ])
         );
         // Both tools spell referer differently but it is just a header.
         assert_eq!(
-            canon(Personality::Curl, &["-e", "http://ref/", "http://x/f"]),
-            s(&["--header", "Referer: http://ref/", "http://x/f"])
+            canon(
+                Personality::Curl,
+                &["-e", "http://ref/", "-O", "http://x/f"]
+            ),
+            s(&[
+                "--header",
+                "Referer: http://ref/",
+                "--remote-name",
+                "http://x/f"
+            ])
         );
         assert_eq!(
             canon(Personality::Wget, &["--referer=http://ref/", "http://x/f"]),
@@ -846,8 +1124,8 @@ mod tests {
     fn agreed_long_flags_pass_through_in_any_dialect() {
         for p in [Personality::Wget, Personality::Curl, Personality::Native] {
             assert_eq!(
-                canon(p, &["--limit-rate", "2M", "http://x/f"]),
-                s(&["--limit-rate", "2M", "http://x/f"]),
+                canon(p, &["--limit-rate", "2M", "-O", "http://x/f"])[..2],
+                s(&["--limit-rate", "2M"]),
                 "dialect {:?}",
                 p
             );

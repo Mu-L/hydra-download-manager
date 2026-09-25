@@ -42,15 +42,22 @@ pub const MAX_CONCURRENCY: usize = 32;
 /// Attempts per segment. One lost segment is a hole no player recovers from,
 /// so this is the one place that insists.
 const ATTEMPTS: usize = 3;
-/// How long one attempt at a segment may take before it is abandoned.
+/// How long a segment may go without a single byte arriving before the
+/// attempt is abandoned.
 ///
-/// Without this a stalled origin holds a slot until the OS gives up on the
-/// socket, which can be minutes — and the retry machinery never fires,
-/// because no error ever arrives. A timeout turns "hung forever" into "one
-/// failed attempt", which is a thing the pipeline already knows how to
-/// handle. Generous, because a segment is seconds of video and a slow phone
-/// connection is not a stall.
+/// An idle watchdog, not a deadline: a stalled origin holds a slot until the
+/// OS gives up on the socket, which can be minutes, and no error ever
+/// arrives to trigger a retry — while a slow-but-healthy segment that takes
+/// longer than this to arrive in full is not a stall and must not be killed.
+/// [`ATTEMPT_CEILING`] bounds the whole attempt.
 pub const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Absolute ceiling on one attempt at a segment, however steadily its bytes
+/// trickle in. A last resort against an origin that drips one byte a
+/// minute forever; generous enough that a single-segment feature film on a
+/// slow link never meets it.
+pub const ATTEMPT_CEILING: std::time::Duration = std::time::Duration::from_secs(4 * 3600);
+/// How often the idle watchdog reads the byte counter.
+const WATCHDOG_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
 // --------------------------------------------------------------- parsing
 
@@ -62,7 +69,8 @@ pub const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// entitled to simply answers 403.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyRef {
-    /// Where the 16-byte key is served from, already resolved.
+    /// Where the 16-byte key is served from, already resolved — or a `data:`
+    /// URI carrying the key itself, which [`Plan::inline_keys`] decodes.
     pub uri: String,
     /// The initialisation vector, always concrete by the time it gets here:
     /// either the playlist's explicit `IV`, or — per RFC 8216 §5.2 — the
@@ -98,9 +106,9 @@ impl Segment {
 
     /// The `Range` header value this segment needs, if any.
     pub fn range_header(&self) -> Option<String> {
-        self.range
-            .filter(|(_, len)| *len > 0)
-            .map(|(off, len)| format!("bytes={off}-{}", off + len - 1))
+        let (off, len) = self.range.filter(|(_, len)| *len > 0)?;
+        let last = off.checked_add(len)?.checked_sub(1)?;
+        Some(format!("bytes={off}-{last}"))
     }
 }
 
@@ -143,19 +151,75 @@ pub enum Segments {
     Fmp4,
 }
 
+/// A packed elementary audio stream (RFC 8216 §3.1): the segments are bare
+/// frames, so their concatenation is the file and no container is involved.
+///
+/// Such a playlist reports [`Segments::Ts`] as its kind — the segments
+/// concatenate and remux exactly as transport stream does — and carries this
+/// beside it so the assembled file gets the extension its bytes deserve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RawAudio {
+    /// AAC in ADTS framing.
+    Aac,
+    Mp3,
+    /// Dolby AC-3.
+    Ac3,
+    /// Dolby E-AC-3.
+    Ec3,
+}
+
+impl RawAudio {
+    /// The extension the concatenated segments should carry.
+    pub fn ext(self) -> &'static str {
+        match self {
+            RawAudio::Aac => "aac",
+            RawAudio::Mp3 => "mp3",
+            RawAudio::Ac3 => "ac3",
+            RawAudio::Ec3 => "ec3",
+        }
+    }
+
+    fn from_path(path: &str) -> Option<RawAudio> {
+        let lower = path.to_ascii_lowercase();
+        let ext = lower.rsplit('.').next()?;
+        match ext {
+            "aac" => Some(RawAudio::Aac),
+            "mp3" => Some(RawAudio::Mp3),
+            "ac3" => Some(RawAudio::Ac3),
+            "ec3" | "eac3" => Some(RawAudio::Ec3),
+            _ => None,
+        }
+    }
+}
+
 /// Why a playlist cannot be downloaded. Separated from a plain IO error
 /// because the answer for the user is different in each case.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Refusal {
     /// A DRM system was named in the playlist. Hydra does not circumvent DRM.
     Drm(String),
-    /// AES-128 content protection: an ordinary key, but the decrypt path is
-    /// not implemented yet.
+    /// Content protection other than AES-128, whose decrypt path is not
+    /// implemented.
     Encrypted(String),
     /// A live playlist handed to the VOD path.
     Live,
     /// Nothing playable in the manifest.
     Empty,
+    /// An AES-128 key whose `IV` is present but not 16 hex bytes. Guessing
+    /// at it would corrupt the first block of every segment undetectably.
+    UnreadableIv,
+    /// An AES-128 key at a URI this client cannot fetch, or a `data:` URI
+    /// that does not hold a 16-byte key. Writing the ciphertext instead
+    /// would look like a download that worked.
+    UnresolvableKey(String),
+    /// A `{$name}` reference with no `EXT-X-DEFINE` behind it (RFC 8216bis
+    /// §4.4.2.3 says the playlist must not be parsed).
+    UndefinedVariable(String),
+    /// The manifest uses a form this client does not assemble; the message
+    /// names it.
+    Unsupported(String),
 }
 
 impl std::fmt::Display for Refusal {
@@ -173,6 +237,19 @@ impl std::fmt::Display for Refusal {
             Refusal::Encrypted(m) => write!(f, "{m} encrypted streams are not supported yet"),
             Refusal::Live => write!(f, "this is a live stream; only VOD is supported so far"),
             Refusal::Empty => write!(f, "the playlist lists no segments"),
+            Refusal::UnreadableIv => write!(
+                f,
+                "the playlist's AES-128 key has an IV that is not 16 hex bytes, so the \
+                 segments cannot be decrypted correctly"
+            ),
+            Refusal::UnresolvableKey(u) => {
+                write!(f, "the playlist's AES-128 key cannot be fetched from {u:?}")
+            }
+            Refusal::UndefinedVariable(n) => write!(
+                f,
+                "the playlist refers to a variable {{${n}}} that no EXT-X-DEFINE declares"
+            ),
+            Refusal::Unsupported(why) => write!(f, "{why}"),
         }
     }
 }
@@ -191,8 +268,19 @@ pub struct Playlist {
     /// recording has no size to report progress against, so how much TIME
     /// has been captured is the only honest measure of how far it has got.
     pub durations: Vec<f64>,
-    /// `#EXT-X-MAP` initialisation segment, present for fragmented MP4.
+    /// Each segment's media sequence number, in step with `segments`. Not
+    /// simply `media_sequence + index`: an `#EXT-X-GAP` segment is left out
+    /// of the list but still counts, so the numbers jump where one was.
+    pub sequences: Vec<u64>,
+    /// The first `#EXT-X-MAP` initialisation segment, present for fragmented
+    /// MP4.
     pub init: Option<Segment>,
+    /// Every later `#EXT-X-MAP` that names a different initialisation
+    /// segment, as `(index, init)`: the init to write before
+    /// `segments[index]`. An `#EXT-X-DISCONTINUITY` alone needs nothing
+    /// written — the concatenation stays valid — but the new map that
+    /// usually follows one does.
+    pub init_changes: Vec<(usize, Segment)>,
     /// Summed `#EXTINF`, seconds.
     pub duration: f64,
     pub live: bool,
@@ -209,6 +297,15 @@ pub struct Playlist {
     pub drm: Option<String>,
     pub encryption: Option<String>,
     pub segments_kind: Option<Segments>,
+    /// Set when the segments are a packed audio stream rather than a
+    /// container. `segments_kind` is [`Segments::Ts`] then; see [`RawAudio`].
+    pub raw_audio: Option<RawAudio>,
+    /// `#EXT-X-DEFINE:NAME=…,VALUE=…` declarations, for a caller to hand to
+    /// [`parse_with_variables`] when a media playlist `IMPORT`s them.
+    pub variables: Vec<(String, String)>,
+    /// A reason the playlist cannot be assembled that is neither DRM nor an
+    /// unsupported cipher: a broken key, an undefined variable.
+    pub refusal: Option<Refusal>,
 }
 
 impl Playlist {
@@ -235,17 +332,19 @@ impl Playlist {
         chosen.url.is_some().then_some(chosen)
     }
 
-    /// The window as `(sequence number, url)`, so a caller refreshing a live
-    /// playlist can tell which segments it has not seen.
-    /// The window with each entry's duration, for a recorder reporting how
-    /// much time it has captured.
+    /// The window as `(sequence number, segment, seconds)`, so a caller
+    /// refreshing a live playlist can tell which segments it has not seen
+    /// and how much time it has captured.
     pub fn timed_window(&self) -> Vec<(u64, Segment, f64)> {
         self.segments
             .iter()
             .enumerate()
             .map(|(i, s)| {
                 (
-                    self.media_sequence + i as u64,
+                    self.sequences
+                        .get(i)
+                        .copied()
+                        .unwrap_or_else(|| self.media_sequence.saturating_add(i as u64)),
                     s.clone(),
                     self.durations.get(i).copied().unwrap_or(0.0),
                 )
@@ -367,9 +466,118 @@ fn tag_value(line: &str) -> &str {
     line.split_once(':').map(|(_, v)| v).unwrap_or("")
 }
 
+/// The key a `data:` URI carries (RFC 2397), when it is exactly 16 bytes.
+fn data_key(uri: &str) -> Option<[u8; 16]> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    let bytes = if meta
+        .rsplit(';')
+        .next()
+        .is_some_and(|p| p.eq_ignore_ascii_case("base64"))
+    {
+        base64_decode(payload)?
+    } else {
+        percent_decode(payload)
+    };
+    bytes.try_into().ok()
+}
+
+/// Standard base64, padding optional. Small enough to own rather than pull
+/// the transport crate in for.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some(u32::from(c - b'A')),
+            b'a'..=b'z' => Some(u32::from(c - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(c - b'0') + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut acc = 0u32;
+        for &c in chunk {
+            acc = (acc << 6) | val(c)?;
+        }
+        match chunk.len() {
+            4 => out.extend_from_slice(&[(acc >> 16) as u8, (acc >> 8) as u8, acc as u8]),
+            3 => out.extend_from_slice(&[(acc >> 10) as u8, (acc >> 2) as u8]),
+            2 => out.push((acc >> 4) as u8),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Replace every `{$name}` (RFC 8216bis §4.4.2.3), or name the first one
+/// with no definition.
+fn substitute(s: &str, vars: &[(String, String)]) -> Result<String, String> {
+    if !s.contains("{$") {
+        return Ok(s.to_string());
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("{$") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let name = &after[..end];
+        match vars.iter().find(|(n, _)| n == name) {
+            Some((_, v)) => out.push_str(v),
+            None => return Err(name.to_string()),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// The value of query parameter `name` in `url`, percent-decoded.
+fn query_param(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1.split('#').next()?;
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (k == name).then(|| String::from_utf8_lossy(&percent_decode(v)).into_owned())
+    })
+}
+
 /// Parse a playlist. `base` is the URL it was fetched from; every URI is
 /// resolved against it so the caller only ever sees absolute URLs.
 pub fn parse(text: &str, base: &str) -> Playlist {
+    parse_with_variables(text, base, &[])
+}
+
+/// [`parse`], with the master playlist's `EXT-X-DEFINE` variables available
+/// to this playlist's `IMPORT` declarations.
+pub fn parse_with_variables(text: &str, base: &str, imported: &[(String, String)]) -> Playlist {
     let mut pl = Playlist::default();
     let mut pending: Option<Vec<(String, String)>> = None;
     let mut want_segment = false;
@@ -379,17 +587,72 @@ pub fn parse(text: &str, base: &str) -> Playlist {
     let mut pending_range: Option<(Option<u64>, u64)> = None;
     let mut last_end: Option<(String, u64)> = None;
     let mut pending_duration = 0.0f64;
+    let mut gap = false;
     // `(key uri, explicit IV)` from the most recent `#EXT-X-KEY`.
     let mut active_key: Option<(String, Option<[u8; 16]>)> = None;
+    // The init map in force, so a MAP that merely repeats it is not a change.
+    let mut current_init: Option<Segment> = None;
+    // Media sequence number of the next segment URI, gaps included.
+    let mut seq = 0u64;
     let mut ended = false;
     let mut vod = false;
+
+    let refuse = |pl: &mut Playlist, r: Refusal| {
+        pl.refusal.get_or_insert(r);
+    };
+    let key_for = |active: &Option<(String, Option<[u8; 16]>)>, seq: u64| {
+        active.as_ref().map(|(uri, iv)| KeyRef {
+            uri: uri.clone(),
+            iv: iv.unwrap_or_else(|| iv_from_sequence(seq)),
+        })
+    };
 
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(v) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+        let expanded;
+        let line = if line.contains("{$") {
+            match substitute(line, &pl.variables) {
+                Ok(l) => {
+                    expanded = l;
+                    expanded.as_str()
+                }
+                Err(name) => {
+                    refuse(&mut pl, Refusal::UndefinedVariable(name));
+                    continue;
+                }
+            }
+        } else {
+            line
+        };
+        if let Some(v) = line.strip_prefix("#EXT-X-DEFINE:") {
+            let a = attrs(v);
+            let value = if let Some(name) = attr(&a, "IMPORT") {
+                match imported.iter().find(|(n, _)| n == name) {
+                    Some((_, v)) => Some((name.to_string(), v.clone())),
+                    None => {
+                        refuse(&mut pl, Refusal::UndefinedVariable(name.to_string()));
+                        None
+                    }
+                }
+            } else if let Some(name) = attr(&a, "QUERYPARAM") {
+                match query_param(base, name) {
+                    Some(v) => Some((name.to_string(), v)),
+                    None => {
+                        refuse(&mut pl, Refusal::UndefinedVariable(name.to_string()));
+                        None
+                    }
+                }
+            } else {
+                attr(&a, "NAME")
+                    .map(|n| (n.to_string(), attr(&a, "VALUE").unwrap_or("").to_string()))
+            };
+            if let Some(v) = value {
+                pl.variables.push(v);
+            }
+        } else if let Some(v) = line.strip_prefix("#EXT-X-STREAM-INF:") {
             pending = Some(attrs(v));
         } else if let Some(v) = line.strip_prefix("#EXT-X-MEDIA:") {
             let a = attrs(v);
@@ -422,30 +685,32 @@ pub fn parse(text: &str, base: &str) -> Playlist {
                 // and in practice always arrives with a DRM key system.
                 pl.drm.get_or_insert_with(|| "SAMPLE-AES".to_string());
             } else if method == "AES-128" {
-                match attr(&a, "IV").map(parse_hex_iv) {
-                    // Present but not 16 hex bytes. Falling back to the
-                    // sequence IV here would be UNDETECTABLE corruption: a
-                    // wrong IV damages only the FIRST cipher block, so every
-                    // later block decrypts cleanly and the PKCS#7 padding at
-                    // the end still validates. The download would report
-                    // success with 16 bytes of garbage per segment.
+                pl.encryption.get_or_insert_with(|| "AES-128".to_string());
+                active_key = None;
+                // Present but not 16 hex bytes. Falling back to the sequence
+                // IV would be UNDETECTABLE corruption: a wrong IV damages only
+                // the FIRST cipher block, so every later block decrypts
+                // cleanly and the PKCS#7 padding still validates.
+                let iv = match attr(&a, "IV").map(parse_hex_iv) {
                     Some(None) => {
-                        pl.drm
-                            .get_or_insert_with(|| "AES-128 with an unreadable IV".to_string());
-                        active_key = None;
+                        refuse(&mut pl, Refusal::UnreadableIv);
+                        continue;
                     }
-                    // Absent is the spec's sequence-number rule; present and
-                    // valid is an explicit override.
-                    iv => {
-                        pl.encryption.get_or_insert_with(|| "AES-128".to_string());
-                        // A playlist may rotate keys part-way through, so
-                        // this is the key for the segments that FOLLOW,
-                        // until the next tag.
-                        active_key = attr(&a, "URI")
-                            .and_then(|u| crate::url::join(base, u))
-                            .map(|uri| (uri, iv.flatten()));
-                    }
+                    iv => iv.flatten(),
+                };
+                let uri = attr(&a, "URI").unwrap_or("");
+                let resolved = if uri.starts_with("data:") {
+                    data_key(uri).map(|_| uri.to_string())
+                } else {
+                    crate::url::join(base, uri)
+                };
+                match resolved {
+                    // The key for the segments that FOLLOW, until the next tag.
+                    Some(u) => active_key = Some((u, iv)),
+                    None => refuse(&mut pl, Refusal::UnresolvableKey(uri.to_string())),
                 }
+            } else if !method.is_empty() {
+                refuse(&mut pl, Refusal::Encrypted(method));
             }
         } else if let Some(v) = line.strip_prefix("#EXT-X-MAP:") {
             let a = attrs(v);
@@ -454,12 +719,26 @@ pub fn parse(text: &str, base: &str) -> Playlist {
                     let range = attr(&a, "BYTERANGE")
                         .and_then(parse_byterange)
                         .map(|(off, len)| (off.unwrap_or(0), len));
-                    // An init map is never itself encrypted under EXT-X-KEY.
-                    pl.init = Some(Segment {
+                    // RFC 8216 §4.3.2.5: the key in force applies to the
+                    // init section too. Its IV, when not explicit, is the
+                    // next segment's sequence number.
+                    let init = Segment {
                         url,
                         range,
-                        key: None,
-                    });
+                        key: key_for(&active_key, seq),
+                    };
+                    if current_init.as_ref() != Some(&init) {
+                        let at = pl.segments.len();
+                        if pl.init.is_none() && at == 0 {
+                            pl.init = Some(init.clone());
+                        } else if pl.init_changes.last().is_some_and(|(i, _)| *i == at) {
+                            pl.init_changes.pop();
+                            pl.init_changes.push((at, init.clone()));
+                        } else {
+                            pl.init_changes.push((at, init.clone()));
+                        }
+                        current_init = Some(init);
+                    }
                 }
                 pl.segments_kind = Some(Segments::Fmp4);
             }
@@ -467,6 +746,7 @@ pub fn parse(text: &str, base: &str) -> Playlist {
             pending_range = parse_byterange(v);
         } else if let Some(v) = line.strip_prefix("#EXT-X-MEDIA-SEQUENCE:") {
             pl.media_sequence = v.trim().parse().unwrap_or(0);
+            seq = pl.media_sequence;
         } else if let Some(v) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
             pl.target_duration = v.trim().parse().unwrap_or(0.0);
         } else if let Some(v) = line.strip_prefix("#EXTINF:") {
@@ -478,6 +758,8 @@ pub fn parse(text: &str, base: &str) -> Playlist {
             pl.duration += secs;
             pending_duration = secs;
             want_segment = true;
+        } else if line == "#EXT-X-GAP" {
+            gap = true;
         } else if line == "#EXT-X-ENDLIST" {
             ended = true;
         } else if let Some(v) = line.strip_prefix("#EXT-X-PLAYLIST-TYPE:") {
@@ -485,38 +767,62 @@ pub fn parse(text: &str, base: &str) -> Playlist {
         } else if !line.starts_with('#') {
             if want_segment {
                 want_segment = false;
+                let this_seq = seq;
+                seq = seq.saturating_add(1);
+                let range = pending_range.take();
+                if gap {
+                    // Not on the server; fetching it is a 404 and a failed
+                    // download. It still occupies a sequence number.
+                    gap = false;
+                    last_end = None;
+                    continue;
+                }
                 if pl.segments_kind.is_none() {
                     let path = line.split(['?', '#']).next().unwrap_or(line);
-                    pl.segments_kind = Some(if path.to_ascii_lowercase().ends_with(".ts") {
-                        Segments::Ts
-                    } else {
-                        Segments::Fmp4
-                    });
+                    let lower = path.to_ascii_lowercase();
+                    pl.raw_audio = RawAudio::from_path(&lower);
+                    pl.segments_kind = Some(
+                        if pl.raw_audio.is_some()
+                            || lower.ends_with(".ts")
+                            || lower.ends_with(".m2ts")
+                            || lower.ends_with(".mts")
+                        {
+                            Segments::Ts
+                        } else {
+                            Segments::Fmp4
+                        },
+                    );
                 }
                 if let Some(url) = crate::url::join(base, line) {
-                    let range = pending_range.take().map(|(off, len)| {
-                        let off = off.unwrap_or_else(|| match &last_end {
-                            // Omitted offset: continue where the previous
-                            // sub-range of this same resource ended.
-                            Some((u, end)) if *u == url => *end,
-                            _ => 0,
-                        });
-                        last_end = Some((url.clone(), off + len));
-                        (off, len)
-                    });
-                    if range.is_none() {
-                        last_end = None;
-                    }
+                    let range = match range {
+                        Some((off, len)) => {
+                            let off = off.unwrap_or_else(|| match &last_end {
+                                // Omitted offset: continue where the previous
+                                // sub-range of this same resource ended.
+                                Some((u, end)) if *u == url => *end,
+                                _ => 0,
+                            });
+                            let Some(end) = off.checked_add(len) else {
+                                // Past the end of any file: a range no server
+                                // can satisfy, so the segment is dropped.
+                                last_end = None;
+                                continue;
+                            };
+                            last_end = Some((url.clone(), end));
+                            Some((off, len))
+                        }
+                        None => {
+                            last_end = None;
+                            None
+                        }
+                    };
                     // RFC 8216 §5.2: with no explicit IV the segment's own
                     // media sequence number is the IV. Resolving it here is
                     // what lets a decryptor work from the segment alone.
-                    let seq = pl.media_sequence + pl.segments.len() as u64;
-                    let key = active_key.as_ref().map(|(uri, iv)| KeyRef {
-                        uri: uri.clone(),
-                        iv: iv.unwrap_or_else(|| iv_from_sequence(seq)),
-                    });
+                    let key = key_for(&active_key, this_seq);
                     pl.segments.push(Segment { url, range, key });
                     pl.durations.push(pending_duration);
+                    pl.sequences.push(this_seq);
                 }
             } else if let Some(a) = pending.take() {
                 let res = attr(&a, "RESOLUTION").unwrap_or("");
@@ -595,6 +901,12 @@ pub struct Plan {
     /// Bytes the chosen variant implies, for the progress bar. An estimate:
     /// the real total is only known once the last segment lands.
     pub estimated_size: Option<u64>,
+    /// `(index, init)`: an initialisation segment to write before
+    /// `segments[index]`, wherever the stream switched to a new one.
+    pub init_changes: Vec<(usize, Segment)>,
+    /// The segments are packed audio frames; see [`RawAudio`].
+    pub raw_audio: Option<RawAudio>,
+    identity: String,
 }
 
 impl Plan {
@@ -602,6 +914,9 @@ impl Plan {
     pub fn build(media: &Playlist, bandwidth: Option<u64>) -> Result<Plan, Refusal> {
         if let Some(d) = &media.drm {
             return Err(Refusal::Drm(d.clone()));
+        }
+        if let Some(r) = &media.refusal {
+            return Err(r.clone());
         }
         // AES-128 is NOT refused: it is ordinary content protection, and the
         // key is an ordinary URL. What it does require is that the caller
@@ -619,29 +934,78 @@ impl Plan {
         if media.segments.is_empty() {
             return Err(Refusal::Empty);
         }
-        Ok(Plan {
-            init: media.init.clone(),
-            segments: media.segments.clone(),
-            kind: media.segments_kind.unwrap_or(Segments::Ts),
-            duration: media.duration,
-            estimated_size: bandwidth
-                .filter(|_| media.duration > 0.0)
-                .map(|b| (b as f64 * media.duration / 8.0) as u64),
-        })
+        Ok(Plan::assemble(
+            media.init.clone(),
+            media.init_changes.clone(),
+            media.segments.clone(),
+            media.segments_kind.unwrap_or(Segments::Ts),
+            media.raw_audio,
+            media.duration,
+            bandwidth,
+        ))
     }
 
-    /// Every distinct key URL this plan needs, in first-use order.
+    pub(crate) fn assemble(
+        init: Option<Segment>,
+        init_changes: Vec<(usize, Segment)>,
+        segments: Vec<Segment>,
+        kind: Segments,
+        raw_audio: Option<RawAudio>,
+        duration: f64,
+        bandwidth: Option<u64>,
+    ) -> Plan {
+        let identity = identity(init.as_ref(), &segments);
+        Plan {
+            init,
+            segments,
+            kind,
+            duration,
+            estimated_size: bandwidth
+                .filter(|_| duration > 0.0)
+                .map(|b| (b as f64 * duration / 8.0) as u64),
+            init_changes,
+            raw_audio,
+            identity,
+        }
+    }
+
+    /// Every segment and init this plan fetches, in the order they are
+    /// written.
+    fn objects(&self) -> impl Iterator<Item = &Segment> {
+        self.init
+            .iter()
+            .chain(self.init_changes.iter().map(|(_, s)| s))
+            .chain(&self.segments)
+    }
+
+    /// Every distinct key URL this plan needs fetched, in first-use order.
     ///
     /// The library performs no IO, so fetching them is the caller's job: it
     /// already has the connector, the cookies and the session that the
     /// manifest itself was fetched with, and the key must be fetched with
-    /// exactly those.
+    /// exactly those. Keys carried inline as `data:` URIs are not listed;
+    /// [`Plan::inline_keys`] has them.
     pub fn key_uris(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for s in &self.segments {
+        for s in self.objects() {
             if let Some(k) = &s.key {
-                if !out.iter().any(|u| u == &k.uri) {
+                if !k.uri.starts_with("data:") && !out.iter().any(|u| u == &k.uri) {
                     out.push(k.uri.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// The keys the playlist carried inline as `data:` URIs, ready to use.
+    pub fn inline_keys(&self) -> Keys {
+        let mut out = Keys::new();
+        for s in self.objects() {
+            if let Some(k) = &s.key {
+                if k.uri.starts_with("data:") && !out.contains_key(&k.uri) {
+                    if let Some(key) = data_key(&k.uri) {
+                        out.insert(k.uri.clone(), key);
+                    }
                 }
             }
         }
@@ -650,30 +1014,46 @@ impl Plan {
 
     /// Whether any segment needs a key.
     pub fn is_encrypted(&self) -> bool {
-        self.segments.iter().any(|s| s.key.is_some())
+        self.objects().any(|s| s.key.is_some())
     }
 
     /// A stable name for this exact plan, used to tell one rendition's
-    /// staging file from another's. The first segment's URL is enough: two
-    /// renditions of the same stream never share one.
+    /// staging file from another's: the first segment's URL without its
+    /// query string, the segment count and the init's URL. Query strings
+    /// are left out because signed and rotating tokens would otherwise make
+    /// every refetched playlist a different plan, and nothing could resume.
     ///
-    /// Whitespace-free by construction (it is a URL), which matters because
-    /// the checkpoint sidecar is whitespace-separated.
+    /// Whitespace-free by construction, which matters because the
+    /// checkpoint sidecar is whitespace-separated.
     pub fn id(&self) -> &str {
-        self.segments
-            .first()
-            .map(|s| s.url.as_str())
-            .unwrap_or_default()
+        &self.identity
     }
 
-    /// The extension `.ts`/`.mp4` this plan writes natively, before any
-    /// remux the caller may ask for.
+    /// The extension the assembled file carries natively — `.ts`, `.mp4`,
+    /// or the audio stream's own — before any remux the caller may ask for.
     pub fn native_ext(&self) -> &'static str {
-        match self.kind {
-            Segments::Ts => "ts",
-            Segments::Fmp4 => "mp4",
+        match (self.raw_audio, self.kind) {
+            (Some(a), _) => a.ext(),
+            (None, Segments::Ts) => "ts",
+            (None, Segments::Fmp4) => "mp4",
         }
     }
+}
+
+fn identity(init: Option<&Segment>, segments: &[Segment]) -> String {
+    let path_only = |s: &Segment| {
+        s.url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .replace(char::is_whitespace, "%20")
+    };
+    format!(
+        "{}|{}|{}",
+        segments.first().map(path_only).unwrap_or_default(),
+        segments.len(),
+        init.map(path_only).unwrap_or_default()
+    )
 }
 
 // ------------------------------------------------------------- assembly
@@ -1044,8 +1424,13 @@ pub const KEY_FETCH_CAP: usize = 4096;
 
 /// Decrypt `part` when its segment is encrypted, and report the plaintext
 /// length. A segment with no key passes through untouched.
-fn decrypt_segment(seg: &Segment, part: &str, keys: &Keys, raw: u64) -> std::io::Result<u64> {
-    let Some(k) = &seg.key else { return Ok(raw) };
+fn decrypt_segment(
+    key: Option<&KeyRef>,
+    part: &str,
+    keys: &Keys,
+    raw: u64,
+) -> std::io::Result<u64> {
+    let Some(k) = key else { return Ok(raw) };
     let key = keys.get(&k.uri).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1099,13 +1484,14 @@ fn decrypt_in_place(path: &str, key: &[u8; 16], iv: &[u8; 16]) -> std::io::Resul
 }
 
 /// A segment being fetched: its task, its staging file, its live byte
-/// counter, and its index in the plan — the index rides along so the append
-/// side can find the segment's key without searching for it.
+/// counter, its key, and whether it is a media segment (an init between
+/// two is written but not counted as one).
 type Pending = (
     tokio::task::JoinHandle<std::io::Result<u64>>,
     String,
     Arc<AtomicU64>,
-    usize,
+    Option<KeyRef>,
+    bool,
 );
 
 /// Fetch one segment to `dest`, updating `counter` as bytes arrive.
@@ -1193,11 +1579,23 @@ where
     let stopped = || cancel.load(Ordering::Relaxed);
     let interrupted = || std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled");
     let ceiling = concurrency.ceiling();
+    let inline = plan.inline_keys();
+    let merged;
+    let keys = if inline.is_empty() {
+        keys
+    } else {
+        merged = keys
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .chain(inline)
+            .collect();
+        &merged
+    };
     // Refuse before a single byte is fetched. Discovering a missing key
     // segment-by-segment would leave a part-written file, and writing the
     // ciphertext instead would produce noise that looks like a download that
     // worked.
-    for seg in &plan.segments {
+    for seg in plan.objects() {
         if let Some(k) = &seg.key {
             if !keys.contains_key(&k.uri) {
                 return Err(std::io::Error::new(
@@ -1236,7 +1634,7 @@ where
             meter.begin("init".into(), counter.clone());
             match with_retries(&fetch, init, &part, &counter, &gate, meter).await {
                 Ok(n) => {
-                    let n = decrypt_segment(init, &part, keys, n)?;
+                    let n = decrypt_segment(init.key.as_ref(), &part, keys, n)?;
                     append(&part, out)?;
                     meter.settle(&counter, n);
                     appended += n;
@@ -1273,6 +1671,11 @@ where
         std::collections::VecDeque::with_capacity(lookahead);
     let mut next = resume.skip;
     let total = plan.segments.len();
+    // A changed init map is fetched and written in sequence, just ahead of
+    // the first segment that needs it. Changes before the resume point are
+    // already on disk.
+    let changes: &[(usize, Segment)] = &plan.init_changes;
+    let mut change_i = changes.partition_point(|(at, _)| *at < resume.skip);
 
     let outcome = loop {
         // Checked here rather than only in the spawn guard: with nothing yet
@@ -1282,10 +1685,31 @@ where
             break Err(interrupted());
         }
         while inflight.len() < lookahead && next < total {
-            let seg = plan.segments[next].clone();
-            let part = format!("{staging}.p{next}");
+            let due = changes.get(change_i).filter(|(at, _)| *at <= next);
+            if due.is_some() {
+                change_i += 1;
+            }
+            let (seg, part, label, is_segment) = match due {
+                Some((at, init)) => (
+                    init.clone(),
+                    format!("{staging}.i{at}"),
+                    "Init".to_string(),
+                    false,
+                ),
+                None => {
+                    let i = next;
+                    next += 1;
+                    (
+                        plan.segments[i].clone(),
+                        format!("{staging}.p{i}"),
+                        format!("Segment {}", i + 1),
+                        true,
+                    )
+                }
+            };
+            let key = seg.key.clone();
             let counter = Arc::new(AtomicU64::new(0));
-            meter.begin(format!("Segment {}", next + 1), counter.clone());
+            meter.begin(label, counter.clone());
             let (fetch, part2, c2, gate, m2) = (
                 fetch.clone(),
                 part.clone(),
@@ -1302,10 +1726,9 @@ where
                 // a window running at reduced width for as long as it lasts.
                 with_retries(&fetch, &seg, &part2, &c2, &gate, &m2).await
             });
-            inflight.push_back((task, part, counter, next));
-            next += 1;
+            inflight.push_back((task, part, counter, key, is_segment));
         }
-        let Some((task, part, counter, idx)) = inflight.pop_front() else {
+        let Some((task, part, counter, key, is_segment)) = inflight.pop_front() else {
             break Ok(());
         };
         let result = match task.await {
@@ -1317,7 +1740,7 @@ where
                 // Decrypt before appending: the output is plaintext, so a
                 // resumed run never has to know which of its existing bytes
                 // were once encrypted.
-                let n = match decrypt_segment(&plan.segments[idx], &part, keys, n) {
+                let n = match decrypt_segment(key.as_ref(), &part, keys, n) {
                     Ok(n) => n,
                     Err(e) => {
                         meter.drop_inflight(&counter);
@@ -1331,7 +1754,7 @@ where
                 }
                 meter.settle(&counter, n);
                 appended += n;
-                settled_segments += 1;
+                settled_segments += u64::from(is_segment);
                 // Written after the bytes are in the output file, so a
                 // checkpoint never claims more than is on disk.
                 note(settled_segments, appended);
@@ -1351,7 +1774,7 @@ where
 
     // Whatever happened, the siblings still running must be drained: their
     // staging files would otherwise be written after this returns.
-    for (task, part, counter, _) in inflight {
+    for (task, part, counter, _, _) in inflight {
         task.abort();
         let _ = task.await;
         meter.drop_inflight(&counter);
@@ -1410,18 +1833,11 @@ where
             // given back below — never around the whole call, which would
             // hold a row open through the backoff while nothing transfers.
             let lane = meter.occupy(counter);
-            let r = match tokio::time::timeout(
-                ATTEMPT_TIMEOUT,
+            let r = watched(
                 fetch(seg.clone(), dest.to_string(), counter.clone()),
+                counter,
             )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("segment stalled for {}s", ATTEMPT_TIMEOUT.as_secs()),
-                )),
-            };
+            .await;
             if let Some(l) = lane {
                 l.finish(matches!(r, Ok(n) if n > 0));
             }
@@ -1440,6 +1856,47 @@ where
         }
     }
     Err(last.unwrap_or_else(|| std::io::Error::other("segment failed")))
+}
+
+/// Run one fetch attempt under the idle watchdog: abandoned once `counter`
+/// has not moved for [`ATTEMPT_TIMEOUT`], or after [`ATTEMPT_CEILING`]
+/// regardless.
+async fn watched<Fut>(fut: Fut, counter: &AtomicU64) -> std::io::Result<u64>
+where
+    Fut: std::future::Future<Output = std::io::Result<u64>>,
+{
+    tokio::pin!(fut);
+    let started = tokio::time::Instant::now();
+    let mut seen = counter.load(Ordering::Relaxed);
+    let mut moved_at = started;
+    let mut ticker = tokio::time::interval(WATCHDOG_TICK);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = ticker.tick() => {
+                let now = counter.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    moved_at = tokio::time::Instant::now();
+                } else if moved_at.elapsed() >= ATTEMPT_TIMEOUT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("segment stalled: no bytes for {}s", ATTEMPT_TIMEOUT.as_secs()),
+                    ));
+                }
+                if started.elapsed() >= ATTEMPT_CEILING {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "segment still arriving after {}h; abandoned",
+                            ATTEMPT_CEILING.as_secs() / 3600
+                        ),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Cap for one playlist body.
@@ -1514,6 +1971,68 @@ pub fn finish(
     src: &std::path::Path,
     dst: &std::path::Path,
 ) -> Result<Finished, String> {
+    let refusal = match kind {
+        Segments::Ts => "MPEG-TS to MP4 needs ffmpeg; install it, or ask for TS instead",
+        Segments::Fmp4 => {
+            "these segments are fragmented MP4, not MPEG-TS; ask for MP4, or install ffmpeg"
+        }
+    };
+    finish_by(
+        plan_finish(kind, want_ext, ffmpeg().is_some()),
+        kind == Segments::Fmp4,
+        refusal,
+        src,
+        dst,
+    )
+}
+
+/// [`plan_finish`] for a plan rather than a bare kind, so a packed audio
+/// stream is placed under its own extension instead of being mistaken for
+/// transport stream.
+pub fn plan_finish_for(plan: &Plan, want_ext: &str, ffmpeg_present: bool) -> Finish {
+    match plan.raw_audio {
+        None => plan_finish(plan.kind, want_ext, ffmpeg_present),
+        Some(audio) if want_ext.eq_ignore_ascii_case(audio.ext()) => Finish::Move,
+        // Any container around bare frames is a real mux job.
+        Some(_) if ffmpeg_present => Finish::Remux,
+        Some(_) => Finish::Refuse,
+    }
+}
+
+/// [`finish`] for a plan rather than a bare kind; see [`plan_finish_for`].
+pub fn finish_plan(
+    plan: &Plan,
+    want_ext: &str,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<Finished, String> {
+    let Some(audio) = plan.raw_audio else {
+        return finish(plan.kind, want_ext, src, dst);
+    };
+    let refusal = format!(
+        "these segments are raw {} audio; ask for .{} , or install ffmpeg to get .{want_ext}",
+        audio.ext().to_ascii_uppercase(),
+        audio.ext()
+    );
+    finish_by(
+        plan_finish_for(plan, want_ext, ffmpeg().is_some()),
+        true,
+        &refusal,
+        src,
+        dst,
+    )
+}
+
+/// Carry out a [`Finish`] decision. `plays_as_is` says the assembly is
+/// already a playable file, so a failed remux falls back to placing it and
+/// saying so rather than losing the download.
+fn finish_by(
+    decision: Finish,
+    plays_as_is: bool,
+    refusal: &str,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<Finished, String> {
     let place = || {
         std::fs::rename(src, dst)
             .or_else(|_| {
@@ -1523,27 +2042,16 @@ pub fn finish(
             })
             .map_err(|e| format!("could not move the finished file: {e}"))
     };
-    match plan_finish(kind, want_ext, ffmpeg().is_some()) {
+    match decision {
         Finish::Move => place().map(|()| Finished::AsIs),
-        Finish::Remux => match remux(src, dst, kind) {
+        Finish::Remux => match remux(src, dst, Segments::Fmp4) {
             Ok(()) => Ok(Finished::Remuxed),
-            // For fragmented MP4 the remux is an IMPROVEMENT, not a
-            // requirement: the assembly already plays. Losing the download
-            // because ffmpeg disliked it would be the wrong trade, so it
-            // falls back to what it has — and says so, rather than leaving
-            // the caller to believe it got a faststart MP4.
-            Err(e) if kind == Segments::Fmp4 => place().map(|()| Finished::RemuxSkipped(e)),
+            Err(e) if plays_as_is => place().map(|()| Finished::RemuxSkipped(e)),
             // MPEG-TS is different: what was asked for genuinely cannot be
             // produced, so the caller has to be told.
             Err(e) => Err(e),
         },
-        Finish::Refuse => Err(match kind {
-            Segments::Ts => "MPEG-TS to MP4 needs ffmpeg; install it, or ask for TS instead".into(),
-            Segments::Fmp4 => {
-                "these segments are fragmented MP4, not MPEG-TS; ask for MP4, or install ffmpeg"
-                    .to_string()
-            }
-        }),
+        Finish::Refuse => Err(refusal.to_string()),
     }
 }
 
@@ -1738,12 +2246,16 @@ fn winget_scan(root: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// Remux `src` into `dst`. Stream copy only — no re-encoding, so this is
-/// bounded by disk rather than CPU and never touches quality.
+/// bounded by disk rather than CPU and never touches quality. `kind` is
+/// accepted for compatibility; ffmpeg reads the source's own framing.
 ///
 /// Pure-Rust TS→MP4 is the intended path and is not written yet; until it
 /// is, a system ffmpeg does the job and its absence is reported as the
 /// actionable thing it is, rather than leaving an unplayable file behind.
-pub fn remux(src: &std::path::Path, dst: &std::path::Path, kind: Segments) -> Result<(), String> {
+///
+/// No `-bsf:a aac_adtstoasc`: the MP4 muxer inserts that filter itself when
+/// it meets ADTS AAC, and forcing it breaks MP3 and AC-3 audio.
+pub fn remux(src: &std::path::Path, dst: &std::path::Path, _kind: Segments) -> Result<(), String> {
     let Some(ff) = ffmpeg() else {
         return Err(
             "MPEG-TS to MP4 needs ffmpeg on PATH; install it, or choose the TS row instead".into(),
@@ -1756,14 +2268,6 @@ pub fn remux(src: &std::path::Path, dst: &std::path::Path, kind: Segments) -> Re
     cmd.args(["-y", "-loglevel", "error", "-i"])
         .arg(src)
         .args(["-c", "copy"]);
-    // The source's own framing decides the input filter; the DESTINATION
-    // decides the container flags.
-    if kind == Segments::Ts && to_mp4 {
-        // AAC inside MPEG-TS is ADTS-framed; MP4 wants it raw. Without this
-        // filter the video is fine and the audio is silence or noise, which
-        // is the worst kind of wrong because it looks like it worked.
-        cmd.args(["-bsf:a", "aac_adtstoasc"]);
-    }
     if to_mp4 {
         // Put `moov` at the front so the file is seekable immediately.
         // Meaningless (and rejected) for any other container.
@@ -1784,8 +2288,9 @@ pub fn remux(src: &std::path::Path, dst: &std::path::Path, kind: Segments) -> Re
 }
 
 /// Combine a video track and an audio track into one file. Stream copy, so
-/// nothing is re-encoded and quality is untouched. `audio_kind` is the
-/// container the audio track was assembled in.
+/// nothing is re-encoded and quality is untouched. `audio_kind` is accepted
+/// for compatibility; ffmpeg reads each input's own framing and the MP4
+/// muxer adds the ADTS filter itself when the audio is AAC.
 ///
 /// DASH keeps the two apart, and so does HLS whenever a variant names an
 /// `AUDIO` rendition group; putting them back together is genuinely a muxing
@@ -1796,7 +2301,7 @@ pub fn mux(
     video: &std::path::Path,
     audio: &std::path::Path,
     dst: &std::path::Path,
-    audio_kind: Segments,
+    _audio_kind: Segments,
 ) -> Result<(), String> {
     let Some(ff) = ffmpeg() else {
         return Err(
@@ -1814,13 +2319,6 @@ pub fn mux(
         .arg("-i")
         .arg(audio)
         .args(["-c", "copy", "-map", "0:v:0", "-map", "1:a:0"]);
-    if audio_kind == Segments::Ts && to_mp4 {
-        // Same trap as `remux`: AAC inside MPEG-TS is ADTS-framed and MP4
-        // wants it raw. Skipping the filter leaves a file whose picture is
-        // perfect and whose sound is noise — the failure this whole function
-        // exists to avoid.
-        cmd.args(["-bsf:a", "aac_adtstoasc"]);
-    }
     if to_mp4 {
         // Rejected outright by every other muxer, so it is not passed to one.
         cmd.args(["-movflags", "+faststart"]);
@@ -2107,14 +2605,14 @@ v5/index.m3u8\n";
         // number. The spec's sequence rule is for an ABSENT IV; guessing at a
         // present-but-broken one corrupts the first block of every segment in
         // a way no padding check can catch, so the download would report
-        // success over damaged output.
+        // success over damaged output. And it is its own refusal: nothing
+        // about it is DRM.
         let bad = text.replace("0x000102030405060708090A0B0C0D0E0F", "0xnothex");
         let pl = parse(&bad, "https://e/x.m3u8");
         assert!(pl.segments[0].key.is_none());
-        assert_eq!(
-            Plan::build(&pl, None),
-            Err(Refusal::Drm("AES-128 with an unreadable IV".into()))
-        );
+        assert_eq!(pl.drm, None);
+        assert_eq!(Plan::build(&pl, None), Err(Refusal::UnreadableIv));
+        assert!(!Refusal::UnreadableIv.to_string().contains("protected"));
 
         // An IV of the wrong length is just as broken as one that is not hex.
         for wrong in ["0x0011", "0x000102030405060708090A0B0C0D0E0F00"] {
@@ -3328,5 +3826,504 @@ v5/index.m3u8\n";
         .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// AES-128-CBC/PKCS#7 of `plain` under `key`/`iv`, as a segment on disk
+    /// would be.
+    fn encrypt(plain: &[u8], key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
+        use aes::cipher::{block_padding::Pkcs7, BlockModeEncrypt, KeyIvInit};
+        let mut buf = vec![0u8; plain.len() + 16];
+        buf[..plain.len()].copy_from_slice(plain);
+        let n = cbc::Encryptor::<aes::Aes128>::new(key.into(), iv.into())
+            .encrypt_padded::<Pkcs7>(&mut buf, plain.len())
+            .unwrap()
+            .len();
+        buf.truncate(n);
+        buf
+    }
+
+    /// A fetcher that answers each URL with a fixed body, all at once.
+    fn bodies(map: Vec<(&'static str, Vec<u8>)>) -> impl Fetcher {
+        let map = Arc::new(map);
+        move |seg: Segment, dest: String, counter: Arc<AtomicU64>| -> FetchSeg {
+            let map = map.clone();
+            Box::pin(async move {
+                use std::io::Write;
+                let body = map
+                    .iter()
+                    .find(|(suffix, _)| seg.url.ends_with(suffix))
+                    .map(|(_, b)| b.clone())
+                    .ok_or_else(|| std::io::Error::other(format!("no body for {}", seg.url)))?;
+                std::fs::File::create(&dest)?.write_all(&body)?;
+                counter.store(body.len() as u64, Ordering::Relaxed);
+                Ok(body.len() as u64)
+            })
+        }
+    }
+
+    async fn assemble(
+        plan: &Plan,
+        fetch: impl Fetcher,
+        keys: &Keys,
+        name: &str,
+    ) -> std::io::Result<Vec<u8>> {
+        let dir = scratch(name);
+        let staging = dir.join("o.part").to_string_lossy().into_owned();
+        let mut f = std::fs::File::create(&staging).unwrap();
+        let r = fetch_all(
+            plan,
+            &mut f,
+            &staging,
+            fetch,
+            &Arc::new(Meter::default()),
+            &Arc::new(AtomicBool::new(false)),
+            Resume::default(),
+            Concurrency::default(),
+            keys,
+        )
+        .await;
+        drop(f);
+        let out = std::fs::read(&staging).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        r.map(|_| out)
+    }
+
+    /// A segment whose bytes keep arriving, however slowly, is not a stall:
+    /// the old wall-clock timeout killed an 80 s segment three times over
+    /// and failed the download.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_moving_segment_is_not_abandoned() {
+        let plan = Plan::build(
+            &parse(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                "https://e/x.m3u8",
+            ),
+            None,
+        )
+        .unwrap();
+        // Five bytes, 25 s apart: 125 s in all, twice the idle allowance.
+        let fetch = move |_: Segment, dest: String, counter: Arc<AtomicU64>| -> FetchSeg {
+            Box::pin(async move {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&dest)?;
+                for b in b"slow!" {
+                    tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                    f.write_all(&[*b])?;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(5)
+            })
+        };
+        let out = assemble(&plan, fetch, &Keys::new(), "slow-moving")
+            .await
+            .unwrap();
+        assert_eq!(out, b"slow!");
+    }
+
+    /// The absolute ceiling still exists, for a segment that drips forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_segment_that_trickles_forever_meets_the_ceiling() {
+        let plan = Plan::build(
+            &parse(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n",
+                "https://e/x.m3u8",
+            ),
+            None,
+        )
+        .unwrap();
+        let fetch = move |_: Segment, _: String, counter: Arc<AtomicU64>| -> FetchSeg {
+            Box::pin(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let err = assemble(&plan, fetch, &Keys::new(), "trickle")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("still arriving"), "{err}");
+    }
+
+    #[test]
+    fn a_later_init_map_is_recorded_where_it_takes_over() {
+        let text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+                    #EXT-X-MAP:URI=\"a.mp4\"\n#EXTINF:4,\ns0.m4s\n\
+                    #EXT-X-MAP:URI=\"a.mp4\"\n#EXTINF:4,\ns1.m4s\n\
+                    #EXT-X-DISCONTINUITY\n\
+                    #EXT-X-MAP:URI=\"b.mp4\"\n#EXTINF:4,\ns2.m4s\n#EXTINF:4,\ns3.m4s\n\
+                    #EXT-X-ENDLIST\n";
+        let pl = parse(text, "https://e/v/x.m3u8");
+        assert_eq!(pl.init, Some(Segment::new("https://e/v/a.mp4")));
+        // A repeated map is not a change; the new one is, at the segment
+        // that first needs it.
+        assert_eq!(pl.init_changes, [(2, Segment::new("https://e/v/b.mp4"))]);
+        assert_eq!(pl.segments.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_changed_init_map_is_written_before_the_segments_that_need_it() {
+        let text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+                    #EXT-X-MAP:URI=\"a.mp4\"\n#EXTINF:4,\ns0.m4s\n\
+                    #EXT-X-DISCONTINUITY\n\
+                    #EXT-X-MAP:URI=\"b.mp4\"\n#EXTINF:4,\ns1.m4s\n#EXTINF:4,\ns2.m4s\n\
+                    #EXT-X-ENDLIST\n";
+        let plan = Plan::build(&parse(text, "https://e/v/x.m3u8"), None).unwrap();
+        let fetch = bodies(vec![
+            ("a.mp4", b"A".to_vec()),
+            ("b.mp4", b"B".to_vec()),
+            ("s0.m4s", b"[0]".to_vec()),
+            ("s1.m4s", b"[1]".to_vec()),
+            ("s2.m4s", b"[2]".to_vec()),
+        ]);
+        let out = assemble(&plan, fetch, &Keys::new(), "init-change")
+            .await
+            .unwrap();
+        assert_eq!(
+            out, b"A[0]B[1][2]",
+            "the second init must precede segment 1"
+        );
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_fetched_is_refused_not_dropped() {
+        for uri in ["skd://vault/1", "mailto:x@y"] {
+            let text = format!(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+                 #EXT-X-KEY:METHOD=AES-128,URI=\"{uri}\"\n\
+                 #EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n"
+            );
+            let pl = parse(&text, "https://e/x.m3u8");
+            // Writing the ciphertext as if it were clear would be the silent
+            // failure; the segment carries no key AND the plan is refused.
+            assert!(pl.segments[0].key.is_none());
+            assert_eq!(
+                Plan::build(&pl, None),
+                Err(Refusal::UnresolvableKey(uri.into())),
+                "{uri}"
+            );
+        }
+        // A key tag with no URI at all is the same failure.
+        let pl = parse(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-KEY:METHOD=AES-128\n\
+             #EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n",
+            "https://e/x.m3u8",
+        );
+        assert!(matches!(
+            Plan::build(&pl, None),
+            Err(Refusal::UnresolvableKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_inline_data_key_is_decoded_and_used_without_a_fetch() {
+        let key = test_key();
+        let iv = iv_from_sequence(0);
+        let b64 = {
+            const T: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for c in key.chunks(3) {
+                let b = [c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+                let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+                out.push(T[(n >> 18) as usize & 63] as char);
+                out.push(T[(n >> 12) as usize & 63] as char);
+                out.push(if c.len() > 1 {
+                    T[(n >> 6) as usize & 63] as char
+                } else {
+                    '='
+                });
+                out.push(if c.len() > 2 {
+                    T[n as usize & 63] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        };
+        let text = format!(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"data:text/plain;base64,{b64}\"\n\
+             #EXTINF:4,\nseg0.ts\n#EXT-X-ENDLIST\n"
+        );
+        let plan = Plan::build(&parse(&text, "https://e/x.m3u8"), None).unwrap();
+        assert!(plan.is_encrypted());
+        assert!(plan.key_uris().is_empty(), "nothing to fetch");
+        assert_eq!(plan.inline_keys().values().next(), Some(&key));
+
+        let fetch = bodies(vec![("seg0.ts", encrypt(b"clear text", &key, &iv))]);
+        let out = assemble(&plan, fetch, &Keys::new(), "data-key")
+            .await
+            .unwrap();
+        assert_eq!(out, b"clear text");
+
+        // Percent-encoded is the other form, and a wrong length is refused.
+        let pct: String = key.iter().map(|b| format!("%{b:02X}")).collect();
+        let pl = parse(
+            &text.replace(
+                &format!("data:text/plain;base64,{b64}"),
+                &format!("data:,{pct}"),
+            ),
+            "https://e/x.m3u8",
+        );
+        assert_eq!(Plan::build(&pl, None).unwrap().inline_keys().len(), 1);
+        let short = parse(
+            &text.replace(
+                &format!("data:text/plain;base64,{b64}"),
+                "data:;base64,AAEC",
+            ),
+            "https://e/x.m3u8",
+        );
+        assert!(matches!(
+            Plan::build(&short, None),
+            Err(Refusal::UnresolvableKey(_))
+        ));
+    }
+
+    #[test]
+    fn raw_audio_playlists_keep_their_own_extension() {
+        let text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\na0.aac\n#EXTINF:4,\na1.aac\n#EXT-X-ENDLIST\n";
+        let pl = parse(text, "https://e/x.m3u8");
+        // Concatenable like transport stream, so that is the kind...
+        assert_eq!(pl.segments_kind, Some(Segments::Ts));
+        assert_eq!(pl.raw_audio, Some(RawAudio::Aac));
+        let plan = Plan::build(&pl, None).unwrap();
+        // ...but the file is `.aac`, not `.ts`.
+        assert_eq!(plan.native_ext(), "aac");
+        assert_eq!(plan_finish_for(&plan, "aac", false), Finish::Move);
+        assert_eq!(plan_finish_for(&plan, "AAC", true), Finish::Move);
+        assert_eq!(plan_finish_for(&plan, "mp4", true), Finish::Remux);
+        assert_eq!(plan_finish_for(&plan, "mp4", false), Finish::Refuse);
+        assert_eq!(plan_finish_for(&plan, "ts", false), Finish::Refuse);
+
+        let mp3 = parse(&text.replace(".aac", ".mp3?t=1"), "https://e/x.m3u8");
+        assert_eq!(mp3.raw_audio, Some(RawAudio::Mp3));
+        assert_eq!(Plan::build(&mp3, None).unwrap().native_ext(), "mp3");
+        // A container playlist is untouched by any of this.
+        let ts = Plan::build(&parse(&media_vod(), "https://e/x.m3u8"), None).unwrap();
+        assert_eq!(ts.raw_audio, None);
+        assert_eq!(
+            plan_finish_for(&ts, "ts", false),
+            plan_finish(Segments::Ts, "ts", false)
+        );
+    }
+
+    #[test]
+    fn a_gap_segment_is_skipped_but_still_counts_in_the_sequence() {
+        let text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:10\n\
+                    #EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n\
+                    #EXTINF:4,\na.ts\n\
+                    #EXT-X-GAP\n#EXTINF:4,\nmissing.ts\n\
+                    #EXTINF:4,\nc.ts\n#EXT-X-ENDLIST\n";
+        let pl = parse(text, "https://e/x.m3u8");
+        assert_eq!(pl.segments.len(), 2, "the gap is not fetched");
+        assert!(!pl.segments.iter().any(|s| s.url.ends_with("missing.ts")));
+        assert_eq!(pl.sequences, [10, 12]);
+        // The IV is the segment's real sequence number, gap included.
+        assert_eq!(
+            pl.segments[1].key.as_ref().unwrap().iv,
+            iv_from_sequence(12)
+        );
+        assert_eq!(
+            pl.timed_window()
+                .iter()
+                .map(|(n, _, _)| *n)
+                .collect::<Vec<_>>(),
+            [10, 12]
+        );
+    }
+
+    #[test]
+    fn variables_are_substituted_into_uris() {
+        let master = "#EXTM3U\n#EXT-X-DEFINE:NAME=\"cdn\",VALUE=\"https://edge.example\"\n\
+                      #EXT-X-STREAM-INF:BANDWIDTH=1000\n{$cdn}/v/index.m3u8?tok=abc\n";
+        let m = parse(master, "https://origin.example/master.m3u8");
+        assert_eq!(
+            m.variants[0].url,
+            "https://edge.example/v/index.m3u8?tok=abc"
+        );
+        assert_eq!(
+            m.variables,
+            [("cdn".to_string(), "https://edge.example".to_string())]
+        );
+
+        let media = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n\
+                     #EXT-X-DEFINE:IMPORT=\"cdn\"\n\
+                     #EXT-X-DEFINE:QUERYPARAM=\"tok\"\n\
+                     #EXT-X-DEFINE:NAME=\"dir\",VALUE=\"seg\"\n\
+                     #EXT-X-KEY:METHOD=AES-128,URI=\"{$cdn}/k?t={$tok}\",IV=0x000102030405060708090A0B0C0D0E0F\n\
+                     #EXTINF:4,\n{$cdn}/{$dir}/0.ts?t={$tok}\n#EXT-X-ENDLIST\n";
+        let pl = parse_with_variables(media, &m.variants[0].url, &m.variables);
+        assert_eq!(pl.refusal, None);
+        assert_eq!(pl.segments[0].url, "https://edge.example/seg/0.ts?t=abc");
+        assert_eq!(
+            pl.segments[0].key.as_ref().unwrap().uri,
+            "https://edge.example/k?t=abc"
+        );
+
+        // A reference nothing defines is a refusal, not a literal `{$x}` URL.
+        let undefined =
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\n{$nope}/0.ts\n#EXT-X-ENDLIST\n";
+        let pl = parse(undefined, "https://e/x.m3u8");
+        assert!(pl.segments.is_empty());
+        assert_eq!(
+            Plan::build(&pl, None),
+            Err(Refusal::UndefinedVariable("nope".into()))
+        );
+        // An IMPORT the master never declared is the same.
+        let pl = parse_with_variables(media, "https://e/x.m3u8?tok=1", &[]);
+        assert_eq!(pl.refusal, Some(Refusal::UndefinedVariable("cdn".into())));
+    }
+
+    #[test]
+    fn an_init_map_under_an_active_key_is_encrypted_too() {
+        let text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:5\n\
+                    #EXT-X-KEY:METHOD=AES-128,URI=\"k\",IV=0x000102030405060708090A0B0C0D0E0F\n\
+                    #EXT-X-MAP:URI=\"init.mp4\"\n\
+                    #EXTINF:4,\ns0.m4s\n#EXT-X-ENDLIST\n";
+        let pl = parse(text, "https://e/v/x.m3u8");
+        let init = pl.init.as_ref().unwrap();
+        let k = init
+            .key
+            .as_ref()
+            .expect("RFC 8216 §4.3.2.5: the key applies to the map");
+        assert_eq!(k.uri, "https://e/v/k");
+        assert_eq!(k.iv[..4], [0, 1, 2, 3]);
+        let plan = Plan::build(&pl, None).unwrap();
+        assert!(plan.is_encrypted());
+
+        // Without an explicit IV the map takes the next segment's number.
+        let no_iv = text.replace(",IV=0x000102030405060708090A0B0C0D0E0F", "");
+        let pl = parse(&no_iv, "https://e/v/x.m3u8");
+        assert_eq!(pl.init.unwrap().key.unwrap().iv, iv_from_sequence(5));
+        // And a map before any key is in the clear.
+        let clear = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+                     #EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:4,\ns0.m4s\n#EXT-X-ENDLIST\n";
+        assert!(parse(clear, "https://e/x.m3u8").init.unwrap().key.is_none());
+    }
+
+    #[test]
+    fn absurd_numbers_do_not_overflow() {
+        // A byte range past the end of any file is dropped, not wrapped.
+        let text =
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:18446744073709551615\n\
+                    #EXTINF:4,\n#EXT-X-BYTERANGE:10@18446744073709551610\nbig.mp4\n\
+                    #EXTINF:4,\n#EXT-X-BYTERANGE:18446744073709551615@5\nbig.mp4\n\
+                    #EXTINF:4,\nok.ts\n#EXTINF:4,\nok2.ts\n#EXT-X-ENDLIST\n";
+        let pl = parse(text, "https://e/x.m3u8");
+        assert_eq!(pl.segments.len(), 2, "both overflowing ranges are dropped");
+        assert_eq!(pl.sequences, [u64::MAX, u64::MAX], "saturated, not wrapped");
+        assert_eq!(pl.timed_window().len(), 2);
+        let s = Segment {
+            url: "https://e/x".into(),
+            range: Some((u64::MAX, 5)),
+            key: None,
+        };
+        assert_eq!(s.range_header(), None);
+    }
+
+    #[test]
+    fn a_plan_id_ignores_signed_query_strings() {
+        let signed = |tok: &str| {
+            format!(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init.mp4?sig={tok}\"\n\
+                 #EXTINF:4,\ns0.m4s?sig={tok}\n#EXTINF:4,\ns1.m4s?sig={tok}\n#EXT-X-ENDLIST\n"
+            )
+        };
+        let a = Plan::build(&parse(&signed("aaa"), "https://e/v/x.m3u8"), None).unwrap();
+        let b = Plan::build(&parse(&signed("bbb"), "https://e/v/x.m3u8"), None).unwrap();
+        assert_eq!(a.id(), b.id(), "a rotated token must not defeat a resume");
+        assert!(!a.id().contains("aaa"));
+        assert!(!a.id().chars().any(char::is_whitespace));
+        // A different rendition, or a different length, is a different plan.
+        let other = Plan::build(
+            &parse(&signed("aaa").replace("v/", "w/"), "https://e/w/x.m3u8"),
+            None,
+        )
+        .unwrap();
+        assert_ne!(a.id(), other.id());
+        let shorter = Plan::build(
+            &parse(
+                &signed("aaa").replace("#EXTINF:4,\ns1.m4s?sig=aaa\n", ""),
+                "https://e/v/x.m3u8",
+            ),
+            None,
+        )
+        .unwrap();
+        assert_ne!(a.id(), shorter.id());
+    }
+
+    #[test]
+    fn every_refusal_explains_itself_without_calling_it_drm() {
+        for r in [
+            Refusal::UnreadableIv,
+            Refusal::UnresolvableKey("skd://x".into()),
+            Refusal::UndefinedVariable("cdn".into()),
+            Refusal::Unsupported("no segment addressing".into()),
+        ] {
+            let msg = r.to_string();
+            assert!(!msg.contains("protected"), "{msg}");
+            assert!(!msg.is_empty());
+        }
+        assert!(Refusal::UnresolvableKey("skd://x".into())
+            .to_string()
+            .contains("skd://x"));
+        assert!(Refusal::UndefinedVariable("cdn".into())
+            .to_string()
+            .contains("{$cdn}"));
+        // An unknown METHOD is unsupported encryption, not clear text.
+        let pl = parse(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-KEY:METHOD=AES-256,URI=\"k\"\n\
+             #EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n",
+            "https://e/x.m3u8",
+        );
+        assert_eq!(
+            Plan::build(&pl, None),
+            Err(Refusal::Encrypted("AES-256".into()))
+        );
+    }
+
+    #[test]
+    fn a_raw_audio_assembly_is_placed_under_its_own_extension() {
+        let dir = fresh("finish-raw");
+        let src = dir.join("o.part");
+        std::fs::write(&src, b"adts").unwrap();
+        let plan = Plan::build(
+            &parse(
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\na0.aac\n#EXT-X-ENDLIST\n",
+                "https://e/x.m3u8",
+            ),
+            None,
+        )
+        .unwrap();
+        let dst = dir.join("out.aac");
+        assert_eq!(finish_plan(&plan, "aac", &src, &dst), Ok(Finished::AsIs));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"adts");
+        assert!(!src.exists());
+        // A container playlist takes the old path unchanged.
+        let ts = Plan::build(&parse(&media_vod(), "https://e/x.m3u8"), None).unwrap();
+        std::fs::write(&src, b"ts").unwrap();
+        assert_eq!(
+            finish_plan(&ts, "ts", &src, &dir.join("out.ts")),
+            Ok(Finished::AsIs)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_extinf_without_a_uri_lists_no_segment() {
+        let pl = parse(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\n#EXT-X-ENDLIST\n",
+            "https://e/x.m3u8",
+        );
+        assert!(pl.segments.is_empty());
+        assert_eq!(Plan::build(&pl, None), Err(Refusal::Empty));
+        // A tag between EXTINF and its URI does not lose the segment.
+        let pl = parse(
+            "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4,\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:00Z\na.ts\n#EXT-X-ENDLIST\n",
+            "https://e/x.m3u8",
+        );
+        assert_eq!(pl.segments.len(), 1);
     }
 }

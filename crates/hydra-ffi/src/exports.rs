@@ -39,14 +39,16 @@ struct EngineBox {
 ///
 /// `p` must be a handle from [`hydra_engine_create`] that has not been passed
 /// to [`hydra_engine_destroy`].
-unsafe fn boxed<'a>(p: *mut hydra_engine_t) -> Result<&'a mut EngineBox, hydra_error_code_t> {
+unsafe fn boxed<'a>(p: *mut hydra_engine_t) -> Result<&'a EngineBox, hydra_error_code_t> {
     if p.is_null() {
         return Err(err::set(E::HYDRA_ERR_INVALID_ARGUMENT, "engine is NULL"));
     }
     // SAFETY: the caller's contract is that `p` came from `hydra_engine_create`,
     // which hands out exactly `Box::into_raw` of an `EngineBox`. The magic check
-    // below rejects the common violations of that contract.
-    let b = unsafe { &mut *(p as *mut EngineBox) };
+    // below rejects the common violations of that contract. A shared borrow,
+    // because every exported call may run concurrently with every other and
+    // only `hydra_engine_destroy` — which takes the box back — ever mutates it.
+    let b = unsafe { &*(p as *const EngineBox) };
     if b.magic != MAGIC {
         return Err(err::set(
             E::HYDRA_ERR_INVALID_ARGUMENT,
@@ -262,6 +264,12 @@ pub unsafe extern "C" fn hydra_engine_config_init(
                 "struct_size is too small to be a hydra_engine_config_t",
             );
         }
+        if struct_size as usize > convert::MAX_CONFIG_BYTES {
+            return err::set(
+                E::HYDRA_ERR_INVALID_ARGUMENT,
+                "struct_size is too large to be a hydra_engine_config_t",
+            );
+        }
         let d = crate::engine::EngineCfg::default();
         let full = hydra_engine_config_t {
             size: struct_size,
@@ -283,11 +291,14 @@ pub unsafe extern "C" fn hydra_engine_config_init(
             user_agent: std::ptr::null(),
             reserved: [0; 32],
         };
-        // SAFETY: exactly `n` bytes are written, and `n` is clamped to the
-        // caller's own declared size, so an older caller's smaller struct is
-        // never overrun.
+        // SAFETY: `n` bytes are written from the defaults and the rest up to
+        // `struct_size` are zeroed; `n` is clamped to the caller's own declared
+        // size, so an older caller's smaller struct is never overrun, and a
+        // newer caller's appended fields — which this build cannot know — get
+        // the zero every future field is defined to default from.
         unsafe {
             std::ptr::copy_nonoverlapping(&full as *const _ as *const u8, config as *mut u8, n);
+            std::ptr::write_bytes((config as *mut u8).add(n), 0, struct_size as usize - n);
         }
         E::HYDRA_OK
     })
@@ -319,6 +330,12 @@ pub unsafe extern "C" fn hydra_job_config_init(
                 "struct_size is too small to be a hydra_job_config_t",
             );
         }
+        if struct_size as usize > convert::MAX_CONFIG_BYTES {
+            return err::set(
+                E::HYDRA_ERR_INVALID_ARGUMENT,
+                "struct_size is too large to be a hydra_job_config_t",
+            );
+        }
         let full = hydra_job_config_t {
             size: struct_size,
             version: crate::HYDRA_JOB_CONFIG_VERSION,
@@ -345,6 +362,7 @@ pub unsafe extern "C" fn hydra_job_config_init(
         // SAFETY: as in `hydra_engine_config_init`.
         unsafe {
             std::ptr::copy_nonoverlapping(&full as *const _ as *const u8, config as *mut u8, n);
+            std::ptr::write_bytes((config as *mut u8).add(n), 0, struct_size as usize - n);
         }
         E::HYDRA_OK
     })
@@ -560,8 +578,12 @@ fn shutdown_engine(eng: &Arc<Engine>, timeout_ms: u32) -> bool {
 /// same engine, and the handle must not be used afterwards. Passing NULL is a
 /// no-op.
 ///
-/// Thread-safe with respect to *other* engines. Blocking for up to a few hundred
-/// milliseconds while runtime threads are joined.
+/// Thread-safe with respect to *other* engines. **Blocking**: up to about half a
+/// second while runtime threads are joined, and up to two seconds more for the
+/// emergency shutdown when [`hydra_engine_shutdown`] was not called first. A
+/// callback still executing on an engine thread past that grace period is left
+/// to finish on its own; nothing inside the library is freed underneath it, but
+/// `user_data` is yours to keep alive until it returns.
 ///
 /// # Safety
 ///
@@ -919,13 +941,12 @@ pub unsafe extern "C" fn hydra_job_create(
             return err::set(E::HYDRA_ERR_INVALID_ARGUMENT, "out_job_id is NULL");
         }
         // SAFETY: caller's contract, validated field by field inside.
-        let (cfg, output, creds) = match unsafe { convert::job_cfg(config, &eng.cfg) } {
+        let input = match unsafe { convert::job_cfg(config, &eng.cfg) } {
             Ok(v) => v,
             Err(d) => return fail(d),
         };
-        // SAFETY: caller's contract.
-        let auto_start = unsafe { (*config).auto_start } != 0;
-        let job = eng.insert_job(cfg, output, creds);
+        let auto_start = input.auto_start;
+        let job = eng.insert_job(input.cfg, input.output_path, input.creds);
         // SAFETY: caller's contract.
         unsafe { std::ptr::write(out_job_id, job.id) };
         eng.emit(&job, hydra_event_type_t::HYDRA_EVENT_JOB_CREATED);
@@ -1139,10 +1160,17 @@ pub unsafe extern "C" fn hydra_job_cancel(
         };
         if !running {
             // Nothing is executing, so nothing will observe the stop flag: take
-            // the job to its terminal state here.
+            // the job to its terminal state here. The file is removed only if
+            // an attempt ever ran: before that, whatever sits at the destination
+            // is the host's, not a partial download.
             if stop == Stop::CancelRemove {
-                let path = job.lock().output_path.clone();
-                let _ = std::fs::remove_file(&path);
+                let (path, ran) = {
+                    let g = job.lock();
+                    (g.output_path.clone(), g.started_at_ms != 0)
+                };
+                if ran {
+                    let _ = std::fs::remove_file(&path);
+                }
                 let mut g = job.lock();
                 g.held.clear();
                 g.progress.bytes_downloaded = 0;
@@ -1797,6 +1825,12 @@ pub unsafe extern "C" fn hydra_event_set_callback(
 /// `max_level` is one of [`hydra_log_level_t`]; messages above it are discarded
 /// before they are formatted. Pass NULL as `callback` to clear.
 ///
+/// The callback runs on whichever engine thread produced the message, with the
+/// sink held so that clearing it is synchronous: once a call that passes NULL
+/// returns, no delivery is in flight and `user_data` may be freed. The price is
+/// that the callback **must not call back into the engine** — in particular not
+/// this function — and should return quickly.
+///
 /// **`user_data` is never owned by hydra and is never freed by hydra.** It is
 /// stored, never dereferenced, and handed back to your function verbatim. It
 /// must stay valid until the callback is cleared or the engine is destroyed —
@@ -2303,6 +2337,14 @@ pub unsafe extern "C" fn hydra_job_create_from_metalink(
         if out_job_id.is_null() {
             return err::set(E::HYDRA_ERR_INVALID_ARGUMENT, "out_job_id is NULL");
         }
+        // Read first, and only as many bytes as the caller declared: this copy
+        // is patched below, and NULL or a shorter (older) struct must be
+        // refused or defaulted here exactly as `hydra_job_create` does.
+        // SAFETY: caller's contract.
+        let mut patched = match unsafe { convert::read_job_config(config) } {
+            Ok(c) => c,
+            Err(d) => return fail(d),
+        };
         let chosen = match crate::metalink::choose(&b.doc, file_index) {
             Ok(c) => c,
             Err(d) => return fail(d),
@@ -2325,15 +2367,16 @@ pub unsafe extern "C" fn hydra_job_create_from_metalink(
             }
         };
         let ptrs: Vec<*const c_char> = holders.iter().map(|c| c.as_ptr()).collect();
-        // SAFETY: caller's contract that `config` is an initialised job config.
-        let mut patched = unsafe { std::ptr::read(config) };
         patched.urls = ptrs.as_ptr();
         patched.url_count = ptrs.len();
-        // SAFETY: `patched` is a local copy whose url array outlives the call.
-        let (mut cfg, output, creds) = match unsafe { convert::job_cfg(&patched, &eng.cfg) } {
+        // SAFETY: `patched` is a bounded local copy whose url array outlives
+        // the call, and its other pointers are the caller's, valid for this call.
+        let input = match unsafe { convert::job_cfg_from(&patched, &eng.cfg) } {
             Ok(v) => v,
             Err(d) => return fail(d),
         };
+        let (mut cfg, output, creds, auto_start) =
+            (input.cfg, input.output_path, input.creds, input.auto_start);
         cfg.source_plans = chosen.plans;
         cfg.attested_size = chosen.size;
         cfg.pieces = chosen.pieces;
@@ -2347,8 +2390,6 @@ pub unsafe extern "C" fn hydra_job_create_from_metalink(
                 .as_deref()
                 .and_then(crate::metalink::checksum_of);
         }
-        // SAFETY: caller's contract.
-        let auto_start = unsafe { (*config).auto_start } != 0;
         let job = eng.insert_job(cfg, output, creds);
         // SAFETY: `out_job_id` was checked non-null above.
         unsafe { std::ptr::write(out_job_id, job.id) };

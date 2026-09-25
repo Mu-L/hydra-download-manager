@@ -72,17 +72,13 @@ pub fn objects() -> Vec<RealObject> {
     ]
 }
 
-fn proxy() -> Option<(String, u16)> {
-    let raw = std::env::var("http_proxy")
-        .or_else(|_| std::env::var("HTTP_PROXY"))
-        .ok()?;
-    let rest = raw.split("://").last()?.trim_end_matches('/');
-    let (h, p) = rest.rsplit_once(':')?;
-    Some((h.to_string(), p.parse().ok()?))
+fn proxy(obj: &RealObject) -> Option<(String, u16)> {
+    let u = crate::url::Url::parse(&format!("http://{}{}", obj.origins[0], obj.path))?;
+    crate::url::ProxyPolicy::default().http_route(&u).ok()?
 }
 
 fn targets(obj: &RealObject, n_origins: usize) -> Vec<Target> {
-    let (ph, pp) = proxy().expect("http_proxy must be set");
+    let (ph, pp) = proxy(obj).expect("http_proxy must be set");
     obj.origins
         .iter()
         .take(n_origins)
@@ -277,7 +273,7 @@ pub struct AdaptiveRun {
 }
 
 pub async fn bench(reps: usize) {
-    if proxy().is_none() {
+    if proxy(&objects()[0]).is_none() {
         eprintln!("http_proxy not set; a direct-origin run needs DNS, which is unavailable here");
         return;
     }

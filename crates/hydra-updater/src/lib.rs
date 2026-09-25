@@ -36,10 +36,24 @@ pub const API_ENV: &str = "HYDRA_UPDATE_API";
 
 /// The API base currently in effect (env override or the GitHub default).
 pub fn api_base() -> String {
-    match std::env::var(API_ENV) {
-        Ok(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
-        _ => DEFAULT_API_BASE.to_string(),
+    std::env::var(API_ENV)
+        .ok()
+        .and_then(|v| accepted_api_base(&v))
+        .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
+}
+
+/// The base an `HYDRA_UPDATE_API` value amounts to, or `None` when it is
+/// empty or not safe to honour. The variable is read in release builds too
+/// (the mock flow depends on it), so a plain `http://` base is accepted on
+/// loopback only: anywhere else, whoever controls that environment or the
+/// network between could hand this process an executable to install.
+fn accepted_api_base(raw: &str) -> Option<String> {
+    let v = raw.trim().trim_end_matches('/');
+    if v.is_empty() {
+        return None;
     }
+    let url = http::Url::parse(v).ok()?;
+    (url.tls || url.is_loopback()).then(|| v.to_string())
 }
 
 // -------------------------------------------------------------- release data
@@ -80,6 +94,12 @@ impl Release {
     /// Version without the tag's `v` prefix.
     pub fn version(&self) -> &str {
         self.tag_name.trim_start_matches('v')
+    }
+
+    /// A pre-release by GitHub's flag or by its tag: `v0.3.0-rc2` is one
+    /// whether or not the box was ticked when it was published.
+    pub fn is_prerelease(&self) -> bool {
+        self.prerelease || parse_version(self.version()).is_some_and(|(_, rank)| rank != u64::MAX)
     }
 
     pub fn asset(&self, name: &str) -> Option<&ReleaseAsset> {
@@ -488,25 +508,86 @@ pub fn is_flatpak() -> bool {
 ///
 /// Linux: the deb and rpm both install into `/usr/bin` (scripts/package-linux.sh),
 /// Flatpak runs from an immutable `/app` mount, while `/usr/local` is by convention
-/// exactly the part of the filesystem no package manager touches. macOS: the `.pkg`
-/// records a receipt per package identifier and lands in `/Applications`; a dragged
-/// `.dmg` leaves no receipt, which is what separates the two installs that otherwise
-/// look identical. Windows: the setup installer owns whatever it wrote, and there
-/// is no unprivileged way to rewrite `Program Files`.
+/// exactly the part of the filesystem no package manager touches — except for
+/// Homebrew, whose Cellar and Caskroom live under its prefix and whose files are
+/// every bit as owned as dpkg's ([`brew_owned`]). macOS: the `.pkg` records a
+/// receipt per package identifier and lands in `/Applications`; so does the
+/// Homebrew cask, which leaves its payload directory in the Caskroom instead; a
+/// dragged `.dmg` leaves neither, which is what separates the three installs that
+/// otherwise look identical. Windows: the setup installer owns whatever it wrote,
+/// and there is no unprivileged way to rewrite `Program Files`.
 fn package_managed(dir: &Path) -> bool {
-    if is_flatpak() {
+    if is_flatpak() || brew_owned(dir).is_some() {
         return true;
     }
     if cfg!(target_os = "linux") {
         dir.starts_with("/usr") && !dir.starts_with("/usr/local")
     } else if cfg!(target_os = "macos") {
         dir.starts_with("/Applications")
-            && Path::new("/var/db/receipts/io.github.ja7ad.hydra.plist").exists()
+            && (Path::new("/var/db/receipts/io.github.ja7ad.hydra.plist").exists()
+                || cask_installed())
     } else {
         // Windows: no elevation path here (a UAC re-launch of the finisher
         // would prompt with the app already gone), so an install this
         // process cannot write is the installer's to replace.
         !update_target_is_writable(dir)
+    }
+}
+
+/// Which Homebrew artefact owns `dir`, going by Homebrew's own directories:
+/// a formula's keg under `Cellar`, a cask's payload under `Caskroom`, and
+/// on Linux everything under linuxbrew's single prefix. Updating those in
+/// place works until the next `brew upgrade`, which then reinstalls the
+/// version brew believes is there.
+fn brew_owned(dir: &Path) -> Option<Brew> {
+    for prefix in BREW_PREFIXES {
+        if dir.starts_with(format!("{prefix}/Caskroom")) {
+            return Some(Brew::Cask);
+        }
+        if dir.starts_with(format!("{prefix}/Cellar")) {
+            return Some(Brew::Formula);
+        }
+    }
+    dir.starts_with(LINUXBREW_PREFIX).then_some(Brew::Formula)
+}
+
+const LINUXBREW_PREFIX: &str = "/home/linuxbrew/.linuxbrew";
+const BREW_PREFIXES: [&str; 3] = ["/opt/homebrew", "/usr/local", LINUXBREW_PREFIX];
+
+/// The two things Homebrew installs Hydra as: the `hydra` formula (the CLI,
+/// built from source into a keg) and the `hydra` cask (the `.dmg`'s app,
+/// copied to `/Applications`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Brew {
+    Cask,
+    Formula,
+}
+
+/// Whether the Hydra cask is installed on this machine: its payload
+/// directory in the Caskroom is what `brew` leaves behind when it copies the
+/// app to `/Applications`, where the bundle itself is indistinguishable from
+/// a dragged one.
+fn cask_installed() -> bool {
+    BREW_PREFIXES
+        .iter()
+        .any(|p| Path::new(p).join("Caskroom").join("hydra").is_dir())
+}
+
+/// The command that updates a package-manager install, for the managers
+/// Hydra knows the spelling for, so a dialog that cannot update in place can
+/// say what will. `None` for installs Hydra updates itself and for managers
+/// with no single command (a `.deb` from the release page).
+pub fn package_manager_hint(dir: &Path) -> Option<&'static str> {
+    match brew_owned(dir) {
+        Some(Brew::Formula) => Some("brew upgrade ja7ad/tap/hydra"),
+        Some(Brew::Cask) => Some("brew upgrade --cask ja7ad/tap/hydra"),
+        None if cfg!(target_os = "macos")
+            && dir.starts_with("/Applications")
+            && cask_installed() =>
+        {
+            Some("brew upgrade --cask ja7ad/tap/hydra")
+        }
+        None => None,
     }
 }
 
@@ -660,18 +741,34 @@ pub async fn check_latest_at(base: &str, repo: &str, user_agent: &str) -> io::Re
     let url = format!("{base}/repos/{repo}/releases/latest");
     // Release JSON with notes and a dozen assets runs tens of KB; 4 MB is a
     // refusal threshold, not a size expectation.
-    let body = http::get_bytes(&url, user_agent, 4 * 1024 * 1024).await?;
+    let body = http::get_json(&url, user_agent, 4 * 1024 * 1024).await?;
     serde_json::from_slice(&body)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("release JSON: {e}")))
 }
 
+/// The most recent releases, newest first as GitHub lists them.
+async fn release_list(base: &str, repo: &str, user_agent: &str) -> io::Result<Vec<Release>> {
+    let url = format!("{base}/repos/{repo}/releases?per_page=30");
+    let body = http::get_json(&url, user_agent, 8 * 1024 * 1024).await?;
+    serde_json::from_slice(&body).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("release list JSON: {e}"),
+        )
+    })
+}
+
 /// Fetch the release the given channel should offer.
 ///
-/// Stable (`beta == false`) is exactly [`check_latest`]: `/releases/latest`,
-/// where GitHub never lists pre-releases. The beta channel additionally
-/// scans the release list for the newest `-rc` pre-release and offers it
-/// only while it is ahead of the stable release — once stable catches up
-/// (`0.3.0` after `0.3.0-rc2`), beta serves the stable release again.
+/// Stable (`beta == false`) is [`check_latest`]: `/releases/latest`, where
+/// GitHub lists no release flagged pre-release. The flag is the only thing
+/// it goes by, so an `-rc` tag published without it IS `latest` — the stable
+/// channel then looks past it to the newest stable release in the list
+/// rather than offer a candidate to people who chose not to get them. The
+/// beta channel additionally scans the release list for the newest `-rc`
+/// pre-release and offers it only while it is ahead of the stable release —
+/// once stable catches up (`0.3.0` after `0.3.0-rc2`), beta serves the
+/// stable release again.
 pub async fn check_channel(user_agent: &str, beta: bool) -> io::Result<Release> {
     check_channel_at(&api_base(), REPO, user_agent, beta).await
 }
@@ -686,18 +783,23 @@ pub async fn check_channel_at(
 ) -> io::Result<Release> {
     let latest = check_latest_at(base, repo, user_agent).await;
     if !beta {
-        return latest;
+        return match latest {
+            Ok(r) if r.is_prerelease() => {
+                release_list(base, repo, user_agent).await.and_then(|list| {
+                    newest_stable(list)
+                        .ok_or_else(|| io::Error::other("no stable release published yet"))
+                })
+            }
+            other => other,
+        };
     }
-    let url = format!("{base}/repos/{repo}/releases?per_page=30");
     // A failed or unparsable list degrades beta to stable behaviour rather
     // than blocking updates: the pre-release is an extra offer, not a
     // dependency.
-    let pre = match http::get_bytes(&url, user_agent, 8 * 1024 * 1024).await {
-        Ok(body) => serde_json::from_slice::<Vec<Release>>(&body)
-            .ok()
-            .and_then(newest_prerelease),
-        Err(_) => None,
-    };
+    let pre = release_list(base, repo, user_agent)
+        .await
+        .ok()
+        .and_then(newest_prerelease);
     match (latest, pre) {
         (Ok(stable), Some(pre)) if is_newer(pre.version(), stable.version()) => Ok(pre),
         (Ok(stable), _) => Ok(stable),
@@ -712,12 +814,20 @@ pub async fn check_channel_at(
 /// authoritative; a `-rc` tag counts too, so a release someone forgot to
 /// mark pre-release still reaches the beta channel.
 fn newest_prerelease(list: Vec<Release>) -> Option<Release> {
-    list.into_iter()
-        .filter(|r| r.prerelease || r.version().contains("-rc"))
-        .fold(None::<Release>, |best, r| match best {
-            Some(b) if !is_newer(r.version(), b.version()) => Some(b),
-            _ => Some(r),
-        })
+    newest(list.into_iter().filter(Release::is_prerelease))
+}
+
+/// The highest-versioned release in the list that is a pre-release by
+/// neither flag nor tag.
+fn newest_stable(list: Vec<Release>) -> Option<Release> {
+    newest(list.into_iter().filter(|r| !r.is_prerelease()))
+}
+
+fn newest(releases: impl Iterator<Item = Release>) -> Option<Release> {
+    releases.fold(None::<Release>, |best, r| match best {
+        Some(b) if !is_newer(r.version(), b.version()) => Some(b),
+        _ => Some(r),
+    })
 }
 
 /// Release notes with HTML comments stripped and repeated sections dropped.
@@ -839,6 +949,46 @@ pub fn sum_for(sums: &str, asset_name: &str) -> Option<String> {
     None
 }
 
+/// How a downloaded archive stood up to the release's published checksums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verification {
+    /// The archive's digest matches the published one.
+    Verified,
+    /// The release publishes no checksum file at all. The archive was
+    /// accepted on transport security alone; the caller should say so.
+    Unpublished,
+}
+
+/// Check `archive` (published as `asset_name`) against `sums`, the body of
+/// the release's `SHA256SUMS.txt` when it has one.
+///
+/// A sums file that exists but lists no entry for this asset is a refusal,
+/// not a pass: it is exactly what a mislabelled or tampered release looks
+/// like, and quietly accepting the archive was the gap. Whatever fails, the
+/// archive is removed so a retry starts clean.
+pub fn verify_archive(
+    archive: &Path,
+    asset_name: &str,
+    sums: Option<&str>,
+) -> io::Result<Verification> {
+    let Some(sums) = sums else {
+        return Ok(Verification::Unpublished);
+    };
+    let refuse = |msg: String| {
+        let _ = std::fs::remove_file(archive);
+        Err(io::Error::new(io::ErrorKind::InvalidData, msg))
+    };
+    let Some(want) = sum_for(sums, asset_name) else {
+        return refuse(format!(
+            "SHA256SUMS.txt has no entry for {asset_name} — the archive was discarded"
+        ));
+    };
+    if file_sha256(archive)? != want {
+        return refuse("checksum mismatch — the downloaded archive was discarded".to_string());
+    }
+    Ok(Verification::Verified)
+}
+
 /// sha256 of a file, lowercase hex.
 pub fn file_sha256(path: &Path) -> io::Result<String> {
     use sha2::{Digest, Sha256};
@@ -938,12 +1088,14 @@ pub fn apply(src_root: &Path, install_dir: &Path) -> io::Result<ApplyReport> {
 /// bundle then has its `Info.plist` version rewritten and is re-signed, so
 /// what macOS reports about the app matches what is inside it.
 ///
-/// Each replacement retries with backoff for up to ~20 s per file: on
-/// Windows the old process's executable stays locked until it has fully
-/// exited, and the retry loop IS the "wait for exit" mechanism — no PID
-/// polling required. Locked-but-replaceable executables are handled with the
-/// classic rename dance: the running file may not be overwritten, but it may
-/// be renamed away, and a fresh copy takes its name.
+/// The swap is all or none ([`replace_all`]): every old file is renamed
+/// aside before any new one is copied in, and a failure part-way puts the
+/// renamed files back, so the install is never left as half of each version.
+/// Each rename retries with backoff for up to ~20 s: on Windows the old
+/// process's executable stays locked until it has fully exited, and the retry
+/// loop IS the "wait for exit" mechanism — no PID polling required. The
+/// running file may not be overwritten, but it may be renamed away, and a
+/// fresh copy takes its name.
 pub fn apply_with(
     src_root: &Path,
     install_dir: &Path,
@@ -952,6 +1104,7 @@ pub fn apply_with(
     let mut report = ApplyReport::default();
     let bundle = app_bundle_root(install_dir);
     let exec_name = bundle.as_deref().map(bundle_exec_name);
+    let mut plan: Vec<(PathBuf, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(src_root)? {
         let entry = entry?;
         let path = entry.path();
@@ -970,10 +1123,14 @@ pub fn apply_with(
             report.skipped.push(name.to_string_lossy().into_owned());
             continue;
         };
-        replace_file(&path, &dest)?;
+        plan.push((path, dest));
+    }
+    replace_all(&plan)?;
+    for (src, dest) in &plan {
+        let name = src.file_name().unwrap_or_default();
         report.replaced.push(name.to_string_lossy().into_owned());
         if name == cli_file_name() {
-            match refresh_cli_alias(&dest) {
+            match refresh_cli_alias(dest) {
                 Ok(true) => report.notes.push(format!("{CLI_ALIAS} refreshed")),
                 Ok(false) => {}
                 Err(e) => report
@@ -1075,6 +1232,33 @@ fn finish_bundle(bundle: &Path, version: Option<&str>, report: &mut ApplyReport)
         Ok(false) => {}
         Err(e) => report.notes.push(format!("codesign failed: {e}")),
     }
+    // A bundle that was downloaded carries the quarantine attribute, and an
+    // ad-hoc signature is not a notarised one: Gatekeeper reports the pair
+    // as "damaged and can't be opened". The user chose to run this app when
+    // they installed it; the update does not get to ask again.
+    match strip_quarantine(bundle) {
+        Ok(true) => report.notes.push("quarantine attribute removed".into()),
+        Ok(false) => {}
+        Err(e) => report.notes.push(format!("xattr failed: {e}")),
+    }
+}
+
+/// Remove `com.apple.quarantine` from everything under `bundle`. `Ok(false)`
+/// when the platform has no `xattr`.
+fn strip_quarantine(bundle: &Path) -> io::Result<bool> {
+    if !cfg!(target_os = "macos") || !Path::new("/usr/bin/xattr").exists() {
+        return Ok(false);
+    }
+    // `-d` complains about every file that does not carry the attribute
+    // and exits non-zero for it; with `-r` it still visits the rest, so the
+    // exit status says nothing about whether the flagged files were cleared.
+    std::process::Command::new("/usr/bin/xattr")
+        .args(["-r", "-d", "com.apple.quarantine"])
+        .arg(bundle)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    Ok(true)
 }
 
 /// Rewrite `CFBundleVersion` and `CFBundleShortVersionString` in a bundle's
@@ -1142,16 +1326,73 @@ fn plist_string<'a>(xml: &'a str, key: &str) -> Option<&'a str> {
     plist_string_range(xml, key).map(|r| &xml[r])
 }
 
-/// Replace `dest` with `src`, retrying while `dest` is still locked by the
-/// exiting process.
+/// Replace `dest` with `src`: [`replace_all`] for one file.
 fn replace_file(src: &Path, dest: &Path) -> io::Result<()> {
+    replace_all(&[(src.to_path_buf(), dest.to_path_buf())])
+}
+
+/// Replace every `(src, dest)` pair, all or none.
+///
+/// Every old file is renamed aside first, then every new one is copied in,
+/// and only then are the old copies deleted. A failure at any point removes
+/// what was copied and puts back what was renamed, so an update that dies
+/// on its third file leaves the first two as they were — an install made of
+/// two versions at once is one that may not start at all.
+fn replace_all(pairs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    let mut aside: Vec<(PathBuf, &Path)> = Vec::new();
+    let mut copied: Vec<&Path> = Vec::new();
+    let mut swap = || -> io::Result<()> {
+        for (_, dest) in pairs {
+            aside.push((rename_aside(dest)?, dest));
+        }
+        for ((src, dest), (old, _)) in pairs.iter().zip(&aside) {
+            copy_in(src, dest, old)?;
+            copied.push(dest);
+        }
+        Ok(())
+    };
+    if let Err(e) = swap() {
+        for dest in copied {
+            let _ = std::fs::remove_file(dest);
+        }
+        for (old, dest) in aside.iter().rev() {
+            let _ = std::fs::rename(old, dest);
+        }
+        return Err(e);
+    }
+    // Best effort: on Windows the old exe may stay locked until process
+    // teardown completes; the leftover `.old` is harmless and swept on the
+    // next start.
+    for (old, _) in &aside {
+        let _ = std::fs::remove_file(old);
+    }
+    Ok(())
+}
+
+/// The name a file is renamed to while it is being replaced.
+fn old_name(dest: &Path) -> PathBuf {
+    dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{ext}.old"),
+        None => "old".to_string(),
+    })
+}
+
+/// Move `dest` out of its name, retrying while it is still locked by the
+/// exiting process; the path it went to comes back.
+///
+/// Overwriting a running executable fails on Windows, but renaming it
+/// succeeds — and the renamed file is the rollback copy until the swap is
+/// through.
+fn rename_aside(dest: &Path) -> io::Result<PathBuf> {
+    let old = old_name(dest);
+    let _ = std::fs::remove_file(&old);
     let mut last = None;
     for attempt in 0..40u32 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(500));
         }
-        match try_replace(src, dest) {
-            Ok(()) => return Ok(()),
+        match std::fs::rename(dest, &old) {
+            Ok(()) => return Ok(old),
             // On Unix a permission error is the directory's owner, not a
             // lock that will clear: /usr/bin from a deb or rpm install can
             // never be rewritten by the user's own process, and retrying it
@@ -1162,37 +1403,23 @@ fn replace_file(src: &Path, dest: &Path) -> io::Result<()> {
             Err(e) => last = Some(e),
         }
     }
-    Err(last.unwrap_or_else(|| io::Error::other("replace failed")))
+    Err(last.unwrap_or_else(|| io::Error::other("rename failed")))
 }
 
-fn try_replace(src: &Path, dest: &Path) -> io::Result<()> {
-    // Move the old file aside first: overwriting a running executable fails
-    // on Windows, but renaming it succeeds — and on Unix the rename keeps a
-    // rollback copy an interrupted update can be recovered from by hand.
-    let old = dest.with_extension(match dest.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.old"),
-        None => "old".to_string(),
-    });
-    let _ = std::fs::remove_file(&old);
-    std::fs::rename(dest, &old)?;
-    if let Err(e) = std::fs::copy(src, dest) {
-        // Roll the rename back so a failed copy leaves the install runnable.
-        let _ = std::fs::rename(&old, dest);
-        return Err(e);
-    }
+/// Copy `src` to `dest`, which no longer exists, giving it the mode the
+/// file it replaces (`old`) had.
+fn copy_in(src: &Path, dest: &Path, old: &Path) -> io::Result<()> {
+    std::fs::copy(src, dest)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&old) {
-            let _ = std::fs::set_permissions(dest, meta.permissions());
-        } else {
-            let _ = std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755));
-        }
+        let mode = std::fs::metadata(old)
+            .map(|m| m.permissions())
+            .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(dest, mode);
     }
-    // Best effort: on Windows the old exe may stay locked until process
-    // teardown completes; the leftover `.old` is harmless and replaced on
-    // the next update.
-    let _ = std::fs::remove_file(&old);
+    #[cfg(not(unix))]
+    let _ = old;
     Ok(())
 }
 
@@ -1205,10 +1432,7 @@ fn try_replace(src: &Path, dest: &Path) -> io::Result<()> {
 /// else's directory. Only the file this updater itself would have created is
 /// removed.
 pub fn sweep_appimage_leftover(image: &Path) {
-    let old = image.with_extension(match image.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.old"),
-        None => "old".to_string(),
-    });
+    let old = old_name(image);
     if old != image {
         let _ = std::fs::remove_file(old);
     }
@@ -1227,10 +1451,60 @@ pub fn sweep_old_files(install_dir: &Path) {
     }
 }
 
-/// Directory downloads and extractions are staged in:
-/// `<os temp>/hydra-update`.
+/// Directory downloads and extractions are staged in, created on the way
+/// out and, on Unix, made private to this user.
+///
+/// Not the OS temp directory: on Linux `/tmp` is shared by every account on
+/// the machine and the name is predictable, so another user could plant the
+/// archive — or the finisher binary the GUI copies there and then runs —
+/// before this process does. `$XDG_RUNTIME_DIR` is per user by contract;
+/// failing that, the user's own cache directory with mode 0700. Windows'
+/// `%TEMP%` is already per user.
 pub fn staging_dir() -> PathBuf {
-    std::env::temp_dir().join("hydra-update")
+    let dir = staging_dir_under(
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        cache_home(),
+    );
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    dir
+}
+
+/// `$XDG_RUNTIME_DIR/hydra-update` when the runtime directory is there, else
+/// `<cache>/hydra/update`; Windows keeps `%TEMP%\hydra-update`.
+fn staging_dir_under(runtime: Option<PathBuf>, cache: Option<PathBuf>) -> PathBuf {
+    if cfg!(windows) {
+        return std::env::temp_dir().join("hydra-update");
+    }
+    match (runtime.filter(|r| r.is_dir()), cache) {
+        (Some(r), _) => r.join("hydra-update"),
+        (None, Some(c)) => c.join("hydra").join("update"),
+        (None, None) => std::env::temp_dir().join(format!("hydra-update-{}", user_id())),
+    }
+}
+
+/// The user's cache directory: `~/Library/Caches` on macOS, `$XDG_CACHE_HOME`
+/// or `~/.cache` elsewhere. `None` without a home.
+fn cache_home() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return Some(PathBuf::from(std::env::var_os("HOME")?).join("Library/Caches"));
+    }
+    if let Some(x) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(x));
+    }
+    Some(PathBuf::from(std::env::var_os("HOME")?).join(".cache"))
+}
+
+/// Something per user for a temp-dir fallback name, when there is no home
+/// to be private in.
+fn user_id() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| std::process::id().to_string())
 }
 
 #[cfg(test)]
@@ -1739,6 +2013,271 @@ mod tests {
         assert_eq!(r.version(), "0.2.4");
         assert_eq!(r.assets.len(), 1);
         assert!(r.asset("hydra-0.2.4-macos-arm64.tar.gz").is_some());
+    }
+
+    #[test]
+    fn an_insecure_api_override_is_refused_off_loopback() {
+        // The mock flow: plain http on this machine is fine.
+        assert_eq!(
+            accepted_api_base("http://127.0.0.1:8642/"),
+            Some("http://127.0.0.1:8642".into())
+        );
+        assert_eq!(
+            accepted_api_base(" http://localhost:8642 "),
+            Some("http://localhost:8642".into())
+        );
+        assert_eq!(
+            accepted_api_base("https://mirror.example/api"),
+            Some("https://mirror.example/api".into())
+        );
+        // A cleartext base anywhere else is a downgrade nobody asked for.
+        assert_eq!(accepted_api_base("http://mirror.example/api"), None);
+        assert_eq!(accepted_api_base("http://10.0.0.7:8642"), None);
+        assert_eq!(accepted_api_base(""), None);
+        assert_eq!(accepted_api_base("ftp://x"), None);
+    }
+
+    #[test]
+    fn a_release_is_prerelease_by_flag_or_by_tag() {
+        assert!(rel("v0.3.0-rc1", false).is_prerelease());
+        assert!(rel("v0.3.0", true).is_prerelease());
+        assert!(rel("v0.3.0-beta.2", false).is_prerelease());
+        assert!(!rel("v0.3.0", false).is_prerelease());
+        assert!(!rel("v1.0.0+build7", false).is_prerelease());
+        // The stable channel's fallback: the newest release that is stable
+        // both ways, whatever order GitHub lists them in.
+        let list = vec![
+            rel("v1.0.0-rc", false), // an rc published without the flag
+            rel("v0.9.0", false),
+            rel("v0.9.1", false),
+            rel("v0.9.2", true),
+        ];
+        assert_eq!(
+            newest_stable(list).map(|r| r.tag_name),
+            Some("v0.9.1".into())
+        );
+        assert!(newest_stable(vec![rel("v1.0.0-rc", true)]).is_none());
+    }
+
+    #[test]
+    fn homebrew_installs_belong_to_brew() {
+        // A keg, a cask payload, and linuxbrew's prefix are brew's to
+        // rewrite; a dragged app and a hand-unpacked tarball are not.
+        for (dir, want) in [
+            ("/opt/homebrew/Cellar/hydra/1.0.0/bin", Some(Brew::Formula)),
+            ("/usr/local/Cellar/hydra/1.0.0/bin", Some(Brew::Formula)),
+            (
+                "/opt/homebrew/Caskroom/hydra/1.0.0/Hydra Download Manager.app/Contents/MacOS",
+                Some(Brew::Cask),
+            ),
+            ("/usr/local/Caskroom/hydra/1.0.0", Some(Brew::Cask)),
+            (
+                "/home/linuxbrew/.linuxbrew/Cellar/hydra/1.0.0/bin",
+                Some(Brew::Formula),
+            ),
+            ("/home/linuxbrew/.linuxbrew/bin", Some(Brew::Formula)),
+            ("/usr/local/bin", None),
+            (
+                "/Applications/Hydra Download Manager.app/Contents/MacOS",
+                None,
+            ),
+            ("/home/j/.local/bin", None),
+        ] {
+            assert_eq!(brew_owned(Path::new(dir)), want, "{dir}");
+        }
+        assert_eq!(
+            package_manager_hint(Path::new("/opt/homebrew/Cellar/hydra/1.0.0/bin")),
+            Some("brew upgrade ja7ad/tap/hydra")
+        );
+        assert_eq!(
+            package_manager_hint(Path::new("/usr/local/Caskroom/hydra/1.0.0")),
+            Some("brew upgrade --cask ja7ad/tap/hydra")
+        );
+        assert_eq!(package_manager_hint(Path::new("/home/j/.local/bin")), None);
+        // Whatever the ownership probe says about the directory, brew's own
+        // tree is a package install and never updated in place.
+        assert!(package_managed(Path::new(
+            "/usr/local/Cellar/hydra/1.0.0/bin"
+        )));
+        assert!(!package_managed(Path::new("/home/j/.local/bin")) || is_flatpak());
+    }
+
+    #[test]
+    fn a_sums_file_without_the_asset_refuses_the_archive() {
+        let dir = std::env::temp_dir().join(format!("hydra-verify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("hydra-1.0.0-linux-amd64.tar.gz");
+        let write = || std::fs::write(&archive, b"archive bytes").unwrap();
+        write();
+        let digest = file_sha256(&archive).unwrap();
+        let listed = format!("{digest}  hydra-1.0.0-linux-amd64.tar.gz\n");
+        assert_eq!(
+            verify_archive(&archive, "hydra-1.0.0-linux-amd64.tar.gz", Some(&listed)).unwrap(),
+            Verification::Verified
+        );
+        assert!(archive.exists(), "a verified archive stays");
+
+        // Published sums that do not mention this file are not a pass.
+        let other = format!("{digest}  hydra-1.0.0-macos-arm64.tar.gz\n");
+        let err =
+            verify_archive(&archive, "hydra-1.0.0-linux-amd64.tar.gz", Some(&other)).unwrap_err();
+        assert!(err.to_string().contains("no entry"), "{err}");
+        assert!(!archive.exists(), "a refused archive is removed");
+
+        write();
+        let wrong = format!("{}  hydra-1.0.0-linux-amd64.tar.gz\n", "0".repeat(64));
+        let err =
+            verify_archive(&archive, "hydra-1.0.0-linux-amd64.tar.gz", Some(&wrong)).unwrap_err();
+        assert!(err.to_string().contains("mismatch"), "{err}");
+        assert!(!archive.exists());
+
+        // No sums published at all: accepted, and said so.
+        write();
+        assert_eq!(
+            verify_archive(&archive, "hydra-1.0.0-linux-amd64.tar.gz", None).unwrap(),
+            Verification::Unpublished
+        );
+        assert!(archive.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_is_private_to_the_user() {
+        let base = std::env::temp_dir().join(format!("hydra-staging-{}", std::process::id()));
+        let runtime = base.join("run");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&runtime).unwrap();
+        if cfg!(windows) {
+            assert!(staging_dir_under(Some(runtime), Some(cache)).ends_with("hydra-update"));
+            return;
+        }
+        // The runtime directory wins while it is there; a runtime directory
+        // that is not (the variable outliving the session) is ignored.
+        assert_eq!(
+            staging_dir_under(Some(runtime.clone()), Some(cache.clone())),
+            runtime.join("hydra-update")
+        );
+        assert_eq!(
+            staging_dir_under(Some(base.join("gone")), Some(cache.clone())),
+            cache.join("hydra").join("update")
+        );
+        assert_eq!(
+            staging_dir_under(None, Some(cache.clone())),
+            cache.join("hydra").join("update")
+        );
+        // Never the bare shared temp directory.
+        let fallback = staging_dir_under(None, None);
+        assert_ne!(fallback, std::env::temp_dir().join("hydra-update"));
+        assert!(fallback.starts_with(std::env::temp_dir()));
+
+        // The real one is created with mode 0700.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = staging_dir();
+            assert!(dir.is_dir());
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_swap_puts_every_file_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("hydra-rollback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(src.join("hydra-gui"), b"new gui").unwrap();
+        std::fs::write(src.join("hydra"), b"new cli").unwrap();
+        std::fs::write(src.join("hydra-host"), b"new host").unwrap();
+        // The middle file cannot be read, so its copy fails after another
+        // file has already been swapped.
+        std::fs::set_permissions(src.join("hydra"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        if std::fs::read(src.join("hydra")).is_ok() {
+            // Running as root: the mode does not bite, and neither does the scenario.
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        }
+        for name in ["hydra-gui", "hydra", "hydra-host"] {
+            std::fs::write(bin.join(name), format!("old {name}")).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let err = apply(&src, &bin).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        for name in ["hydra-gui", "hydra", "hydra-host"] {
+            assert_eq!(
+                std::fs::read_to_string(bin.join(name)).unwrap(),
+                format!("old {name}"),
+                "{name} is as it was"
+            );
+            assert!(
+                !bin.join(format!("{name}.old")).exists(),
+                "no {name}.old left behind"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&bin).unwrap().count(),
+            3,
+            "nothing extra in the install"
+        );
+
+        // Once every source is readable the same swap goes through whole,
+        // keeps the executable bit, and leaves no `.old` behind.
+        std::fs::set_permissions(src.join("hydra"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let report = apply(&src, &bin).unwrap();
+        assert_eq!(report.replaced.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(bin.join("hydra")).unwrap(),
+            "new cli"
+        );
+        assert_eq!(
+            std::fs::metadata(bin.join("hydra"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0o111
+        );
+        assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 3);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_swapped_bundle_loses_its_quarantine_flag() {
+        let tmp = std::env::temp_dir().join(format!("hydra-quarantine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let bundle = fake_bundle(&tmp, "Hydra Download Manager", "0.9.0");
+        let exe = bundle_bin_dir(&bundle).join("Hydra Download Manager");
+        let flag = |path: &Path| {
+            std::process::Command::new("/usr/bin/xattr")
+                .args(["-p", "com.apple.quarantine"])
+                .arg(path)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let ok = std::process::Command::new("/usr/bin/xattr")
+            .args(["-w", "com.apple.quarantine", "0083;00000000;Safari;"])
+            .arg(&exe)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok && flag(&exe), "the fixture carries the flag");
+        assert!(strip_quarantine(&bundle).unwrap());
+        assert!(!flag(&exe), "the flag is gone from the executable");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -26,8 +26,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-// ------------------------------------------------------------------ protocol
-
 #[derive(Clone, Debug)]
 pub struct StartSpec {
     pub id: DlId,
@@ -277,8 +275,6 @@ pub enum Event {
     },
 }
 
-// ------------------------------------------------------------------ handles
-
 struct Live {
     cancel: Arc<AtomicBool>,
     /// This transfer's own cap, the one `SetLimit` moves. The Speed Limiter's
@@ -381,11 +377,27 @@ fn describe_limit(reason: hya_core::LimitReason, budget: usize) -> Option<String
     }
 }
 
+/// Time constant of the displayed rate: long enough that a segment boundary
+/// or a stolen range does not read as a collapse, short enough to follow a
+/// real change within a couple of seconds.
+const RATE_TAU: f64 = 1.5;
+
+static PROGRESS_WINDOW: AtomicBool = AtomicBool::new(false);
+
+/// Every window is repainted on every event, so progress is published at the
+/// rate a progress dialog needs only while one is open; the list alone gets
+/// a quarter of that.
+pub fn set_progress_window_open(open: bool) {
+    PROGRESS_WINDOW.store(open, Ordering::Relaxed);
+}
+
 fn emit_interval_ms() -> u128 {
     if POWER_SAVE.load(Ordering::Relaxed) {
         500
-    } else {
+    } else if PROGRESS_WINDOW.load(Ordering::Relaxed) {
         100
+    } else {
+        250
     }
 }
 
@@ -705,8 +717,6 @@ fn target_via(
     base.with_headers(headers, Some(user_agent.to_string()))
 }
 
-// ---------------------------------------------------------------- zip peek
-
 /// List what is inside a remote ZIP archive without downloading it.
 ///
 /// ZIP's index lives at the end of the file, so one ranged GET for the tail
@@ -790,8 +800,6 @@ pub async fn peek_zip(
     }
     Err(tr("The server did not answer."))
 }
-
-// ------------------------------------------------------------------ metalink
 
 /// One file a Metalink document describes, resolved into what an item needs.
 #[derive(Clone, Debug)]
@@ -1148,65 +1156,12 @@ pub fn url_file_name(url: &str) -> Option<String> {
         .rsplit('/')
         .next()
         .unwrap_or("");
-    let name = percent_decode(seg);
+    let name = hya_net::url::percent_decode(seg);
     (!name.is_empty()).then_some(name)
 }
 
 pub fn file_name_from_url(url: &str) -> String {
     url_file_name(url).unwrap_or_else(|| "index.html".into())
-}
-
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// Whether a `BROWSER[:PROFILE]` setting can actually be read, and from where.
@@ -1281,7 +1236,7 @@ pub fn request_headers(
     if let Some((user, pass)) = auth {
         headers.push(format!(
             "Authorization: Basic {}",
-            base64(format!("{user}:{pass}").as_bytes())
+            hya_net::basic_auth(user, pass)
         ));
     }
     if let Some(c) = cookies.map(str::trim).filter(|c| !c.is_empty()) {
@@ -1317,6 +1272,23 @@ fn named_target(spec: &StartSpec, route: &Route) -> Result<Target, String> {
     Ok(target_via(route.http(), &u, Vec::new(), &spec.user_agent))
 }
 
+/// What the primary probe established, for [`plan_sources`] to admit mirrors
+/// against: the seated source, its probe, and the connection budget.
+#[derive(Clone, Copy)]
+struct SourceProbe<'a> {
+    spec: &'a StartSpec,
+    /// The address the user named, which decides which requests may carry
+    /// their login and cookies.
+    first: &'a Target,
+    primary_url: &'a ParsedUrl,
+    primary_target: &'a Target,
+    primary_probe: &'a Probe,
+    size: u64,
+    /// Per-request setup estimate, seconds.
+    delta: f64,
+    /// Connections the transfer may open in total.
+    budget: usize,
+}
 /// Probe the mirror list and decide who fetches, who waits, and with how many
 /// connections.
 ///
@@ -1338,20 +1310,22 @@ fn named_target(spec: &StartSpec, route: &Route) -> Result<Target, String> {
 /// Returns `(targets, connections per target, reserve bench, scheduler
 /// sources)`. With no mirrors this is exactly the single-source tuple the
 /// transfer used before mirror lists existed.
-#[allow(clippy::too_many_arguments)]
 async fn plan_sources(
-    spec: &StartSpec,
-    first: &Target,
-    primary_url: &ParsedUrl,
-    primary_target: &Target,
-    primary_probe: &Probe,
-    size: u64,
-    delta: f64,
-    budget: usize,
+    primary: &SourceProbe<'_>,
     connector: &Arc<TlsCapableConnector>,
     route: &Route,
-    id: DlId,
 ) -> (Vec<Target>, Vec<usize>, hya_net::Bench, Vec<Source>) {
+    let SourceProbe {
+        spec,
+        first,
+        primary_url,
+        primary_target,
+        primary_probe,
+        size,
+        delta,
+        budget,
+    } = *primary;
+    let id = spec.id;
     let caps_for = |pr: &Probe| {
         if spec.attested_size.is_some() || !(pr.weak_validator || pr.validator.is_none()) {
             // A document that states the size and a content digest establishes
@@ -1479,33 +1453,15 @@ async fn plan_sources(
             ))
         });
     }
-    // Collected in RANK order rather than in completion order: which mirror is
-    // seated and which waits on the bench must not depend on which handshake
-    // happened to finish first, or two runs against the same document choose
-    // different mirrors and neither can be debugged from its log.
+    // Collected in RANK order rather than in completion order, so which
+    // mirror is seated and which waits on the bench does not depend on which
+    // handshake finished first.
     //
-    // And a mirror too slow to answer a HEAD is not one worth waiting for. The
-    // probe phase is paid entirely before the first byte, so its cost is the
-    // SLOWEST mirror in the list rather than the average: measured on the CLI
-    // against a real Fedora document, one host taking eleven seconds to answer
-    // held up a transfer that already had eleven other sources ready. Waiting
-    // buys a source that, on that evidence, will be the first one repair takes
-    // work away from.
-    //
-    // The window is relative rather than fixed, because "slow" is a property of
-    // the path: three times the fastest mirror's own round trip, floored so a
-    // fast first answer cannot make it unreasonably tight and capped so a
-    // pathological one cannot reintroduce the wait. The primary is already
-    // probed and admitted, so abandoning stragglers can never leave the
-    // transfer with no source.
-    // The window is short and it costs nothing to lose: a mirror that misses
-    // it is not abandoned any more — it keeps probing in the background and
-    // joins the reserve bench when it answers. All the window decides is how
-    // long the transfer holds still hoping for one more SEAT, and the loop
-    // stops on its own the moment the connection budget's worth of mirrors
-    // have been admitted. (Unlike the CLI's loop, the clock here may arm
-    // before any secondary has answered — the PRIMARY is already probed and
-    // seated, so a bounded wait can never leave the transfer with nothing.)
+    // The wait for one more seat is bounded — three times the fastest mirror's
+    // own round trip, clamped — and costs nothing to lose: a mirror that
+    // misses it keeps probing in the background and joins the reserve bench
+    // when it answers. The primary is already seated, so the transfer never
+    // waits on an empty source list.
     const GRACE_MULTIPLE: f64 = 3.0;
     const GRACE_MIN: std::time::Duration = std::time::Duration::from_millis(600);
     const GRACE_MAX: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1822,8 +1778,6 @@ fn digest_file(path: &str, algo: hya_net::digest::Algo) -> Option<String> {
     }))
 }
 
-// ------------------------------------------------------------------ transfer
-
 /// Await `fut`, giving up as soon as the stop flag goes up.
 ///
 /// Returns `None` when the download was stopped. The cancellation IS the drop:
@@ -1865,6 +1819,329 @@ fn loop_reason(p: &Probe) -> String {
         crate::i18n::tr("Redirect loop (the server expects a cookie)")
     } else {
         crate::i18n::tr("Redirect loop")
+    }
+}
+
+/// What the probe chain settled on: the object's address after redirects
+/// and dead-mirror fallbacks, its probe, and the per-request setup estimate
+/// the scheduler's stall timeout is derived from.
+struct Primary {
+    url: String,
+    parsed: ParsedUrl,
+    probe: Probe,
+    delta: f64,
+}
+
+/// Probe `spec.url`, following header and HTML redirects and falling forward
+/// through the mirror list when a lead mirror cannot be reached at all. A
+/// dead mirror is removed from `spec.mirrors` so nothing probes it again.
+///
+/// `None` when the transfer is over: the failure or stop has been reported.
+async fn resolve_primary(
+    spec: &mut StartSpec,
+    first: &Target,
+    route: &Route,
+    connector: &Arc<TlsCapableConnector>,
+    cancel: &AtomicBool,
+    tx: &UnboundedSender<Event>,
+) -> Option<Primary> {
+    let id = spec.id;
+    let ev = |e: Event| {
+        let _ = tx.send(e);
+    };
+    let mut url = spec.url.clone();
+    // The mirror the CURRENT attempt started from, as the document spells it.
+    //
+    // Distinct from `url`, which redirects rewrite: when mirror A answers 302
+    // and the redirect target cannot be reached, the dead entry in
+    // `spec.mirrors` is A — and removing by the post-redirect `url` removes
+    // nothing, so `plan_sources` would probe the dead chain a second time.
+    let mut attempt = url.clone();
+    // Where this chain has already been. A budget alone cannot tell a long
+    // chain from one that never moves: a mirror that answers with a `Location`
+    // naming the request just made spent the whole budget and then reported
+    // "Too many redirects", which names the budget rather than the loop.
+    let mut chain = hya_net::polite::RedirectChain::new(&url);
+    let mut probed: Option<(ParsedUrl, Probe)> = None;
+    // Mirrors to fall forward to when the one being probed cannot be reached at
+    // all, best-ranked first and excluding the one already being tried.
+    //
+    // Surviving a dead LEAD mirror is the whole point of a mirror list, and it
+    // is the case a publisher's ranking is least able to help with: a document
+    // says which mirrors it EXPECTS to serve well, and a host that no longer
+    // resolves was expected to serve well right up until it stopped existing.
+    // Without this the transfer fails at the first probe while holding a dozen
+    // working URLs — which is exactly the failure the reserve bench was built
+    // to remove, arriving one step before the bench exists.
+    let mut fallback: std::collections::VecDeque<String> = spec
+        .mirrors
+        .iter()
+        .map(|m| m.url.clone())
+        .filter(|u| *u != spec.url)
+        .collect();
+    // Per-request setup estimate for the scheduler. Timed on the FINAL probe
+    // hop only: the old whole-loop measurement folded every redirect hop in,
+    // so the origins most in need of fast repair decisions (long redirect
+    // chains) got the slowest ones. Floored at the CLI's 0.05 s prior so a
+    // pooled-connection probe cannot make repairs look free.
+    let mut delta = 0.05f64;
+    // Redirect hops PLUS one attempt per mirror: a dead lead mirror must not
+    // eat the budget a redirect chain needs, and a dozen dead mirrors must
+    // still terminate.
+    for _ in 0..(10 + fallback.len()) {
+        let u = match parse_url(&url) {
+            Ok(u) => u,
+            Err(e) => {
+                ev(Event::Failed {
+                    id,
+                    error: e,
+                    done: 0,
+                    held: spec.held.clone(),
+                    permission_denied: false,
+                });
+                return None;
+            }
+        };
+        let t = target_for(&u, spec, route, first);
+        let t_hop = std::time::Instant::now();
+        // Stop has to reach a download that is still CONNECTING, not only one
+        // that is already moving bytes. A plain await here read the flag never:
+        // against an origin that accepts a request and then says nothing, the
+        // row sat in "Connecting..." and Stop All left it there, still holding
+        // its socket. Dropping the probe future is what closes that socket.
+        let answer = match cancellable(probe_resilient(connector.as_ref(), &t), cancel).await {
+            Some(a) => a,
+            None => {
+                ev(Event::Stopped {
+                    id,
+                    done: 0,
+                    held: spec.held.clone(),
+                });
+                return None;
+            }
+        };
+        match answer {
+            Ok(p) if p.is_redirect() => {
+                let loc = p.location.clone().unwrap_or_default();
+                crate::log::debug(&format!(
+                    "#{id} redirect {} -> {}",
+                    p.status,
+                    crate::log::redact(&loc)
+                ));
+                match join_url(&u, &loc) {
+                    Some(next) if chain.advance(&next) => url = next,
+                    Some(next) => {
+                        ev(Event::Failed {
+                            id,
+                            error: format!("{}: {next}", loop_reason(&p)),
+                            done: 0,
+                            held: spec.held.clone(),
+                            permission_denied: false,
+                        });
+                        return None;
+                    }
+                    None => {
+                        ev(Event::Failed {
+                            id,
+                            error: format!("{}: {loc}", crate::i18n::tr("Unusable redirect")),
+                            done: 0,
+                            held: spec.held.clone(),
+                            permission_denied: false,
+                        });
+                        return None;
+                    }
+                }
+            }
+            Ok(p) => {
+                // A redirect the server expressed in HTML rather than in a
+                // header: a referrer stripper or link filter answering `200`
+                // with a page whose whole content is "go here instead".
+                // Without this hop the saved file IS that page — the
+                // one-kilobyte `index.html` this resolves. Charged to the same
+                // hop budget as a `3xx`, since a pair of such pages pointing at
+                // each other is a loop like any other.
+                let hop_to = if p.maybe_redirector() {
+                    match cancellable(hya_net::html_redirect(connector.as_ref(), &t), cancel).await
+                    {
+                        Some(loc) => loc.and_then(|loc| join_url(&u, &loc)),
+                        None => {
+                            ev(Event::Stopped {
+                                id,
+                                done: 0,
+                                held: spec.held.clone(),
+                            });
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(next) = hop_to {
+                    if !chain.advance(&next) {
+                        ev(Event::Failed {
+                            id,
+                            error: format!("{}: {next}", loop_reason(&p)),
+                            done: 0,
+                            held: spec.held.clone(),
+                            permission_denied: false,
+                        });
+                        return None;
+                    }
+                    crate::log::debug(&format!(
+                        "#{id} html redirect -> {}",
+                        crate::log::redact(&next)
+                    ));
+                    url = next;
+                } else {
+                    crate::log::debug(&format!(
+                        "#{id} probe: status={} size={} ranges={} type={:?}",
+                        p.status, p.size, p.ranges, p.content_type
+                    ));
+                    delta = t_hop.elapsed().as_secs_f64().clamp(0.05, 45.0);
+                    probed = Some((u, p));
+                    break;
+                }
+            }
+            Err(e) => match fallback.pop_front() {
+                Some(next) => {
+                    crate::log::warn(&format!(
+                        "#{id} mirror {} could not be reached ({e}); trying the next one",
+                        u.host
+                    ));
+                    // The failed mirror is out of this run entirely: it stays
+                    // out of the source list AND out of the reserve bench, so
+                    // `plan_sources` does not probe it again and a substitution
+                    // cannot pick it later. Removed by the URL the ATTEMPT
+                    // started from, not the one it died at — a mirror that
+                    // redirects before failing dies at an address the document
+                    // never listed.
+                    spec.mirrors.retain(|m| m.url != attempt);
+                    url = next;
+                    // A different mirror is a different chain: the addresses
+                    // the dead one walked say nothing about this one, and a
+                    // mirror list that names the same URL twice would
+                    // otherwise read as a loop.
+                    chain = hya_net::polite::RedirectChain::new(&url);
+                    attempt.clone_from(&url);
+                    spec.url.clone_from(&url);
+                }
+                None => {
+                    crate::log::error(&format!("#{id} probe failed: {e}"));
+                    ev(Event::Failed {
+                        id,
+                        error: e.to_string(),
+                        done: 0,
+                        held: spec.held.clone(),
+                        permission_denied: false,
+                    });
+                    return None;
+                }
+            },
+        }
+        if cancel.load(Ordering::Relaxed) {
+            ev(Event::Stopped {
+                id,
+                done: 0,
+                held: spec.held.clone(),
+            });
+            return None;
+        }
+    }
+    let Some((u, p)) = probed else {
+        ev(Event::Failed {
+            id,
+            error: crate::i18n::tr("Too many redirects"),
+            done: 0,
+            held: spec.held.clone(),
+            permission_denied: false,
+        });
+        return None;
+    };
+    crate::log::debug(&format!("#{id} probe delta {delta:.3}s"));
+    Some(Primary {
+        url,
+        parsed: u,
+        probe: p,
+        delta,
+    })
+}
+
+/// The probed address served a Metalink document instead of the object:
+/// fetch it and adopt its sources, name and size into `spec`. `false` when
+/// the transfer is over — the stop or failure has already been reported.
+async fn follow_metalink_hop(
+    spec: &mut StartSpec,
+    u: &ParsedUrl,
+    url: &str,
+    route: &Route,
+    cancel: &AtomicBool,
+    final_path: &Arc<Mutex<String>>,
+    tx: &UnboundedSender<Event>,
+) -> bool {
+    let id = spec.id;
+    let ev = |e: Event| {
+        let _ = tx.send(e);
+    };
+    crate::log::info(&format!("#{id} {} serves a Metalink document", u.host));
+    let doc = match cancellable(fetch_metalink(url, &spec.user_agent, route), cancel).await {
+        Some(d) => d,
+        None => {
+            ev(Event::Stopped {
+                id,
+                done: 0,
+                held: spec.held.clone(),
+            });
+            return false;
+        }
+    };
+    match doc {
+        Ok(doc) => match adopt_metalink(&doc, spec, id) {
+            Ok((name, size)) => {
+                // The destination the finisher renames to is held behind a
+                // lock — File Info can retarget it while a transfer runs —
+                // so the document's name has to be written THERE and not
+                // only on the spec, or the object lands under the
+                // redirector's name after all.
+                if let Ok(mut g) = final_path.lock() {
+                    g.clone_from(&spec.final_path);
+                }
+                // Tell the list what it is really about to receive. The
+                // user typed one address and is getting a differently named
+                // file of a very different size; a row that keeps showing
+                // "metalink" and no size leaves that as a mystery.
+                ev(Event::Probed {
+                    id,
+                    size,
+                    ranges: true,
+                    file_name: Some(name),
+                });
+                ev(Event::Status {
+                    id,
+                    line: crate::i18n::tr("Reading the mirror list..."),
+                });
+                true
+            }
+            Err(e) => {
+                ev(Event::Failed {
+                    id,
+                    error: e,
+                    done: 0,
+                    held: spec.held.clone(),
+                    permission_denied: false,
+                });
+                false
+            }
+        },
+        Err(e) => {
+            ev(Event::Failed {
+                id,
+                error: e,
+                done: 0,
+                held: spec.held.clone(),
+                permission_denied: false,
+            });
+            false
+        }
     }
 }
 
@@ -1922,11 +2199,8 @@ async fn run_download(
         }
     };
 
-    // ---- ftp://: single-connection fetch ---------------------------------
-    //
-    // Deliberately ONE connection: FTP range preemption costs
-    // control-channel round trips that HTTP pays nothing for, so the
-    // object streams sequentially from one source.
+    // FTP takes ONE connection: range preemption costs control-channel round
+    // trips that HTTP pays nothing for, so the object streams sequentially.
     if let Ok(u) = parse_url(&spec.url) {
         if u.ftp {
             run_ftp_download(&spec, &u, &cancel, &pace, &connector, &route, &tx).await;
@@ -1934,7 +2208,6 @@ async fn run_download(
         }
     }
 
-    // ---- probe, following redirects --------------------------------------
     ev(Event::Status {
         id,
         line: crate::i18n::tr("Connecting..."),
@@ -1955,215 +2228,15 @@ async fn run_download(
             return;
         }
     };
-    let mut url = spec.url.clone();
-    // The mirror the CURRENT attempt started from, as the document spells it.
-    //
-    // Distinct from `url`, which redirects rewrite: when mirror A answers 302
-    // and the redirect target cannot be reached, the dead entry in
-    // `spec.mirrors` is A — and removing by the post-redirect `url` removes
-    // nothing, so `plan_sources` would probe the dead chain a second time.
-    let mut attempt = url.clone();
-    // Where this chain has already been. A budget alone cannot tell a long
-    // chain from one that never moves: a mirror that answers with a `Location`
-    // naming the request just made spent the whole budget and then reported
-    // "Too many redirects", which names the budget rather than the loop.
-    let mut chain = hya_net::polite::RedirectChain::new(&url);
-    let mut probed: Option<(ParsedUrl, Probe)> = None;
-    // Mirrors to fall forward to when the one being probed cannot be reached at
-    // all, best-ranked first and excluding the one already being tried.
-    //
-    // Surviving a dead LEAD mirror is the whole point of a mirror list, and it
-    // is the case a publisher's ranking is least able to help with: a document
-    // says which mirrors it EXPECTS to serve well, and a host that no longer
-    // resolves was expected to serve well right up until it stopped existing.
-    // Without this the transfer fails at the first probe while holding a dozen
-    // working URLs — which is exactly the failure the reserve bench was built
-    // to remove, arriving one step before the bench exists.
-    let mut fallback: std::collections::VecDeque<String> = spec
-        .mirrors
-        .iter()
-        .map(|m| m.url.clone())
-        .filter(|u| *u != spec.url)
-        .collect();
-    // Per-request setup estimate for the scheduler. Timed on the FINAL probe
-    // hop only: the old whole-loop measurement folded every redirect hop in,
-    // so the origins most in need of fast repair decisions (long redirect
-    // chains) got the slowest ones. Floored at the CLI's 0.05 s prior so a
-    // pooled-connection probe cannot make repairs look free.
-    let mut delta = 0.05f64;
-    // Redirect hops PLUS one attempt per mirror: a dead lead mirror must not
-    // eat the budget a redirect chain needs, and a dozen dead mirrors must
-    // still terminate.
-    for _ in 0..(10 + fallback.len()) {
-        let u = match parse_url(&url) {
-            Ok(u) => u,
-            Err(e) => {
-                ev(Event::Failed {
-                    id,
-                    error: e,
-                    done: 0,
-                    held: spec.held.clone(),
-                    permission_denied: false,
-                });
-                return;
-            }
-        };
-        let t = target_for(&u, &spec, &route, &first);
-        let t_hop = std::time::Instant::now();
-        // Stop has to reach a download that is still CONNECTING, not only one
-        // that is already moving bytes. A plain await here read the flag never:
-        // against an origin that accepts a request and then says nothing, the
-        // row sat in "Connecting..." and Stop All left it there, still holding
-        // its socket. Dropping the probe future is what closes that socket.
-        let answer = match cancellable(probe_resilient(connector.as_ref(), &t), &cancel).await {
-            Some(a) => a,
-            None => {
-                ev(Event::Stopped {
-                    id,
-                    done: 0,
-                    held: spec.held.clone(),
-                });
-                return;
-            }
-        };
-        match answer {
-            Ok(p) if p.is_redirect() => {
-                let loc = p.location.clone().unwrap_or_default();
-                crate::log::debug(&format!(
-                    "#{id} redirect {} -> {}",
-                    p.status,
-                    crate::log::redact(&loc)
-                ));
-                match join_url(&u, &loc) {
-                    Some(next) if chain.advance(&next) => url = next,
-                    Some(next) => {
-                        ev(Event::Failed {
-                            id,
-                            error: format!("{}: {next}", loop_reason(&p)),
-                            done: 0,
-                            held: spec.held.clone(),
-                            permission_denied: false,
-                        });
-                        return;
-                    }
-                    None => {
-                        ev(Event::Failed {
-                            id,
-                            error: format!("{}: {loc}", crate::i18n::tr("Unusable redirect")),
-                            done: 0,
-                            held: spec.held.clone(),
-                            permission_denied: false,
-                        });
-                        return;
-                    }
-                }
-            }
-            Ok(p) => {
-                // A redirect the server expressed in HTML rather than in a
-                // header: a referrer stripper or link filter answering `200`
-                // with a page whose whole content is "go here instead".
-                // Without this hop the saved file IS that page — the
-                // one-kilobyte `index.html` this resolves. Charged to the same
-                // hop budget as a `3xx`, since a pair of such pages pointing at
-                // each other is a loop like any other.
-                let hop_to = if p.maybe_redirector() {
-                    match cancellable(hya_net::html_redirect(connector.as_ref(), &t), &cancel).await
-                    {
-                        Some(loc) => loc.and_then(|loc| join_url(&u, &loc)),
-                        None => {
-                            ev(Event::Stopped {
-                                id,
-                                done: 0,
-                                held: spec.held.clone(),
-                            });
-                            return;
-                        }
-                    }
-                } else {
-                    None
-                };
-                if let Some(next) = hop_to {
-                    if !chain.advance(&next) {
-                        ev(Event::Failed {
-                            id,
-                            error: format!("{}: {next}", loop_reason(&p)),
-                            done: 0,
-                            held: spec.held.clone(),
-                            permission_denied: false,
-                        });
-                        return;
-                    }
-                    crate::log::debug(&format!(
-                        "#{id} html redirect -> {}",
-                        crate::log::redact(&next)
-                    ));
-                    url = next;
-                } else {
-                    crate::log::debug(&format!(
-                        "#{id} probe: status={} size={} ranges={} type={:?}",
-                        p.status, p.size, p.ranges, p.content_type
-                    ));
-                    delta = t_hop.elapsed().as_secs_f64().clamp(0.05, 45.0);
-                    probed = Some((u, p));
-                    break;
-                }
-            }
-            Err(e) => match fallback.pop_front() {
-                Some(next) => {
-                    crate::log::warn(&format!(
-                        "#{id} mirror {} could not be reached ({e}); trying the next one",
-                        u.host
-                    ));
-                    // The failed mirror is out of this run entirely: it stays
-                    // out of the source list AND out of the reserve bench, so
-                    // `plan_sources` does not probe it again and a substitution
-                    // cannot pick it later. Removed by the URL the ATTEMPT
-                    // started from, not the one it died at — a mirror that
-                    // redirects before failing dies at an address the document
-                    // never listed.
-                    spec.mirrors.retain(|m| m.url != attempt);
-                    url = next;
-                    // A different mirror is a different chain: the addresses
-                    // the dead one walked say nothing about this one, and a
-                    // mirror list that names the same URL twice would
-                    // otherwise read as a loop.
-                    chain = hya_net::polite::RedirectChain::new(&url);
-                    attempt.clone_from(&url);
-                    spec.url.clone_from(&url);
-                }
-                None => {
-                    crate::log::error(&format!("#{id} probe failed: {e}"));
-                    ev(Event::Failed {
-                        id,
-                        error: e.to_string(),
-                        done: 0,
-                        held: spec.held.clone(),
-                        permission_denied: false,
-                    });
-                    return;
-                }
-            },
-        }
-        if cancel.load(Ordering::Relaxed) {
-            ev(Event::Stopped {
-                id,
-                done: 0,
-                held: spec.held.clone(),
-            });
-            return;
-        }
-    }
-    let Some((u, p)) = probed else {
-        ev(Event::Failed {
-            id,
-            error: crate::i18n::tr("Too many redirects"),
-            done: 0,
-            held: spec.held.clone(),
-            permission_denied: false,
-        });
+    let Some(Primary {
+        url,
+        parsed: u,
+        probe: p,
+        delta,
+    }) = resolve_primary(&mut spec, &first, &route, &connector, &cancel, &tx).await
+    else {
         return;
     };
-    crate::log::debug(&format!("#{id} probe delta {delta:.3}s"));
 
     // The date to stamp the finished file with, resolved once here while the
     // probe headers are still in hand.
@@ -2181,8 +2254,7 @@ async fn run_download(
         ));
     }
 
-    // ---- the URL is a MIRROR LIST, not the object -------------------------
-    //
+    // The URL may be a mirror list rather than the object.
     // `https://mirrors.fedoraproject.org/metalink?repo=fedora-41` has no
     // extension, so nothing the dialog could read told it what this was. The
     // probe has already happened and already carries the `Content-Type`, so
@@ -2197,70 +2269,13 @@ async fn run_download(
     // document that names itself, or a mirror that answers with another mirror
     // list, then costs one wasted fetch rather than an unbounded chain.
     if spec.mirrors.is_empty() && p.serves_metalink() {
-        crate::log::info(&format!("#{id} {} serves a Metalink document", u.host));
-        let doc = match cancellable(fetch_metalink(&url, &spec.user_agent, &route), &cancel).await {
-            Some(d) => d,
-            None => {
-                ev(Event::Stopped {
-                    id,
-                    done: 0,
-                    held: spec.held.clone(),
-                });
-                return;
-            }
-        };
-        match doc {
-            Ok(doc) => match adopt_metalink(&doc, &mut spec, id) {
-                Ok((name, size)) => {
-                    // The destination the finisher renames to is held behind a
-                    // lock — File Info can retarget it while a transfer runs —
-                    // so the document's name has to be written THERE and not
-                    // only on the spec, or the object lands under the
-                    // redirector's name after all.
-                    if let Ok(mut g) = final_path.lock() {
-                        g.clone_from(&spec.final_path);
-                    }
-                    // Tell the list what it is really about to receive. The
-                    // user typed one address and is getting a differently named
-                    // file of a very different size; a row that keeps showing
-                    // "metalink" and no size leaves that as a mystery.
-                    ev(Event::Probed {
-                        id,
-                        size,
-                        ranges: true,
-                        file_name: Some(name),
-                    });
-                    ev(Event::Status {
-                        id,
-                        line: crate::i18n::tr("Reading the mirror list..."),
-                    });
-                    // Re-enter with the document's sources in hand. Boxed
-                    // because this is a recursive `async fn` and its future
-                    // would otherwise have to contain itself.
-                    return Box::pin(run_download(spec, cancel, pace, final_path, tx)).await;
-                }
-                Err(e) => {
-                    ev(Event::Failed {
-                        id,
-                        error: e,
-                        done: 0,
-                        held: spec.held.clone(),
-                        permission_denied: false,
-                    });
-                    return;
-                }
-            },
-            Err(e) => {
-                ev(Event::Failed {
-                    id,
-                    error: e,
-                    done: 0,
-                    held: spec.held.clone(),
-                    permission_denied: false,
-                });
-                return;
-            }
+        if !follow_metalink_hop(&mut spec, &u, &url, &route, &cancel, &final_path, &tx).await {
+            return;
         }
+        // Re-enter with the document's sources in hand. Boxed because this
+        // is a recursive `async fn` and its future would otherwise have to
+        // contain itself.
+        return Box::pin(run_download(spec, cancel, pace, final_path, tx)).await;
     }
 
     // An answer is not a file. `status < 300` lets through the whole of 2xx,
@@ -2290,16 +2305,9 @@ async fn run_download(
         file_name,
     });
 
-    // A signed URL is a CREDENTIAL, not an address. `data.dtu.dk` mints one
-    // good for ten seconds, so the URL this probe resolved to is dead long
-    // before a 22 GB transfer has finished asking for ranges — every request
-    // after the first few came back 403 and the download stopped.
-    //
-    // So fetch from the address the user gave and let each request re-resolve:
-    // `fetch_range_following` follows the hop per request, which is what keeps
-    // every one of them authorised. The probe's findings describe the OBJECT
-    // and stand either way, and the file name still comes from the resolved
-    // URL, which is the half that carries it.
+    // A signed URL is a credential that can expire within seconds (`data.dtu.dk`
+    // mints ten-second ones): fetch from the address the user gave, so each
+    // request re-resolves the hop and stays authorised.
     let u = match crate::app::expiring_soon(&url) {
         true if url != spec.url => match parse_url(&spec.url) {
             Ok(orig) => {
@@ -2321,7 +2329,6 @@ async fn run_download(
         ensure_writable_dir(dir);
     }
 
-    // ---- no-range / unknown-size fallback: one streaming GET -------------
     let Some(size) = known_size.filter(|_| p.ranges) else {
         crate::log::info(&format!(
             "#{id} no range support / unknown size: single stream"
@@ -2346,8 +2353,7 @@ async fn run_download(
             &pace,
         );
         tokio::pin!(fut);
-        let mut sm_rate = 0.0f64;
-        let mut rate_mark: Option<(u64, std::time::Instant)> = None;
+        let mut speed = hya_core::RateMeter::new(RATE_TAU);
         loop {
             tokio::select! {
                 r = &mut fut => {
@@ -2388,20 +2394,11 @@ async fn run_download(
                         return;
                     }
                     let done = written.load(Ordering::Relaxed);
-                    let now = std::time::Instant::now();
-                    if let Some((prev_done, prev_t)) = rate_mark {
-                        let dt = now.duration_since(prev_t).as_secs_f64();
-                        if dt > 0.0 {
-                            let inst = done.saturating_sub(prev_done) as f64 / dt;
-                            let alpha = (-dt / 1.5f64).exp();
-                            sm_rate = sm_rate * alpha + inst * (1.0 - alpha);
-                        }
-                    }
-                    rate_mark = Some((done, now));
+                    let rate = speed.sample(t0.elapsed().as_secs_f64(), done);
                     ev(Event::Progress {
                         id,
                         done,
-                        rate: sm_rate,
+                        rate,
                         // No size to subtract from: this path exists because the
                         // server would not state one, so any ETA would be invented.
                         eta: None,
@@ -2417,15 +2414,21 @@ async fn run_download(
         }
     };
 
-    // ---- scheduler path ---------------------------------------------------
-    let n = spec.conns.clamp(1, 32);
+    let n = spec.conns.clamp(1, 32).min(conns_for_size(size));
     // A mirror list turns this into a multi-source transfer. Everything below
     // degenerates to exactly the previous single-source behaviour when
     // `spec.mirrors` is empty, which is what every non-Metalink caller passes.
-    let (targets, per, bench, sources) = plan_sources(
-        &spec, &first, &u, &target, &p, size, delta, n, &connector, &route, id,
-    )
-    .await;
+    let primary = SourceProbe {
+        spec: &spec,
+        first: &first,
+        primary_url: &u,
+        primary_target: &target,
+        primary_probe: &p,
+        size,
+        delta,
+        budget: n,
+    };
+    let (targets, per, bench, sources) = plan_sources(&primary, &connector, &route).await;
     let mut sched =
         Scheduler::new(size, sources, &per).with_stall_timeout((12.0 * delta).clamp(4.0, 45.0));
     // Adaptive: open the budget but start ONE connection active; the ramp
@@ -2490,8 +2493,8 @@ async fn run_download(
     // an internal control signal and twitch by design; a readout built on
     // them made the speed and ETA jump every refresh. Bytes-over-wall-clock
     // through a ~1.5 s time constant reads as a steady counter.
-    let mut sm_rate = 0.0f64;
-    let mut rate_mark: Option<(u64, std::time::Instant)> = None;
+    let mut speed = hya_core::RateMeter::new(RATE_TAU);
+    let clock = std::time::Instant::now();
     // The last concurrency decision reported, so each is announced once.
     let mut last_reason = hya_core::LimitReason::None;
     // While set, the status line is showing a verdict and is owed its normal
@@ -2545,18 +2548,7 @@ async fn run_download(
             if let Ok(mut g) = snap_obs.lock() {
                 *g = (done, held.clone());
             }
-            let now = std::time::Instant::now();
-            if let Some((prev_done, prev_t)) = rate_mark {
-                let dt = now.duration_since(prev_t).as_secs_f64();
-                if dt > 0.0 {
-                    let inst = done.saturating_sub(prev_done) as f64 / dt;
-                    // alpha from dt so the time constant is independent of
-                    // emit cadence: tau = 1.5 s.
-                    let alpha = (-dt / 1.5f64).exp();
-                    sm_rate = sm_rate * alpha + inst * (1.0 - alpha);
-                }
-            }
-            rate_mark = Some((done, now));
+            let sm_rate = speed.sample(clock.elapsed().as_secs_f64(), done);
             let conns: Vec<ConnRow> = (0..s.n_conns())
                 .map(|j| {
                     let r = s.conn_rate(j);
@@ -2583,14 +2575,7 @@ async fn run_download(
                     }
                 })
                 .collect();
-            // ETA from the smoothed rate, and only once it has warmed past
-            // 1 KB/s — an ETA computed from startup noise counts down from
-            // nonsense values.
-            let eta = if sm_rate > 1024.0 {
-                Some(((size - done.min(size)) as f64 / sm_rate) as u64)
-            } else {
-                None
-            };
+            let eta = speed.eta_secs(size - done.min(size)).map(|s| s as u64);
             let _ = tx_obs.send(Event::Progress {
                 id,
                 done,
@@ -2841,8 +2826,8 @@ async fn run_ftp_download(
     let fut = fetcher.fetch_range(&ep, start, size, sink.clone());
     tokio::pin!(fut);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
-    let mut sm_rate = 0.0f64;
-    let mut last = (start, std::time::Instant::now());
+    let mut speed = hya_core::RateMeter::new(RATE_TAU);
+    speed.sample(0.0, start);
     let result = loop {
         tokio::select! {
             res = &mut fut => break Some(res),
@@ -2851,19 +2836,12 @@ async fn run_ftp_download(
                     break None;
                 }
                 let done = start + sink.written.load(Ordering::Relaxed);
-                let dt = last.1.elapsed().as_secs_f64();
-                if dt > 0.0 {
-                    let inst = done.saturating_sub(last.0) as f64 / dt;
-                    let alpha = (-dt / 1.5f64).exp();
-                    sm_rate = sm_rate * alpha + inst * (1.0 - alpha);
-                }
-                last = (done, std::time::Instant::now());
-                let eta = (sm_rate > 1024.0)
-                    .then(|| ((size - done.min(size)) as f64 / sm_rate) as u64);
+                let rate = speed.sample(t0.elapsed().as_secs_f64(), done);
+                let eta = speed.eta_secs(size - done.min(size)).map(|s| s as u64);
                 let _ = tx.send(Event::Progress {
                     id,
                     done,
-                    rate: sm_rate,
+                    rate,
                     eta,
                     conns: vec![ConnRow {
                         downloaded: done - start,
@@ -3597,13 +3575,6 @@ mod tests {
         assert_eq!(j("  "), None);
     }
 
-    #[test]
-    fn base64_rfc() {
-        assert_eq!(base64(b"user:pass"), "dXNlcjpwYXNz");
-        assert_eq!(base64(b"a"), "YQ==");
-        assert_eq!(base64(b"ab"), "YWI=");
-    }
-
     /// A/B throughput check: download the same URL twice in one process —
     /// run 1 cold, run 2 over the warm shared pool — and print both rates.
     /// Opt-in via HYDRA_GUI_LIVE_AB=<url>; read logs/gui.log (debug) for the
@@ -3960,7 +3931,70 @@ mod tests {
     }
 }
 
-// ------------------------------------------------------------ streams
+/// Bytes of object per connection: below this a further connection costs a
+/// handshake and a range request it cannot pay back, so a 50 KB file is one
+/// request rather than eight.
+const BYTES_PER_CONN: u64 = 256 * 1024;
+
+/// How many connections an object of `size` bytes can use profitably.
+pub fn conns_for_size(size: u64) -> usize {
+    usize::try_from(size / BYTES_PER_CONN)
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
+/// The browser session a stream was captured with.
+///
+/// The extension assembled the cookie string for the manifest's origin, so
+/// that is the only host it is sent to: a segment, key or variant served
+/// from a CDN on another host gets the referer and agent, never a session
+/// that was not issued for it — the same host-scoped rule the CLI's jar
+/// applies.
+#[derive(Clone, Debug)]
+pub struct StreamSession {
+    cookies: Option<String>,
+    referer: Option<String>,
+    agent: String,
+    /// The manifest's host, lowercased; empty when it could not be parsed,
+    /// which sends the cookies nowhere.
+    host: String,
+}
+
+impl StreamSession {
+    pub fn new(
+        manifest: &str,
+        cookies: Option<String>,
+        referer: Option<String>,
+        agent: String,
+    ) -> Self {
+        let host = parse_url(manifest)
+            .map(|u| u.host.to_ascii_lowercase())
+            .unwrap_or_default();
+        StreamSession {
+            cookies: cookies.filter(|c| !c.trim().is_empty()),
+            referer: referer.filter(|r| !r.trim().is_empty()),
+            agent,
+            host,
+        }
+    }
+
+    fn cookies_for(&self, host: &str) -> Option<&str> {
+        self.cookies
+            .as_deref()
+            .filter(|_| !self.host.is_empty() && host.eq_ignore_ascii_case(&self.host))
+    }
+}
+
+impl StreamSpec {
+    fn session(&self) -> StreamSession {
+        StreamSession::new(
+            &self.manifest,
+            self.cookies.clone(),
+            self.referer.clone(),
+            self.user_agent.clone(),
+        )
+    }
+}
 
 /// Build a `Target` for one URL, carrying the browser's session with it.
 ///
@@ -3969,25 +4003,29 @@ mod tests {
 /// extension already collected them for the manifest's origin.
 fn stream_target(
     seg: &hya_stream::Segment,
-    cookies: Option<&str>,
-    referer: Option<&str>,
-    agent: &str,
+    session: &StreamSession,
     route: &Route,
 ) -> Result<Target, String> {
     let u = parse_url(&seg.url)?;
-    let mut headers = Vec::new();
-    if let Some(c) = cookies.filter(|c| !c.is_empty()) {
-        headers.push(format!("Cookie: {c}"));
-    }
-    if let Some(r) = referer.filter(|r| !r.is_empty()) {
-        headers.push(format!("Referer: {r}"));
-    }
+    let mut headers = request_headers(
+        None,
+        session.cookies_for(&u.host),
+        session.referer.as_deref(),
+    );
     // A playlist may carve every segment out of ONE file; without this the
     // whole file is fetched once per segment.
     if let Some(range) = seg.range_header() {
         headers.push(format!("Range: {range}"));
     }
-    Ok(target_via(route.http(), &u, headers, agent))
+    Ok(target_via(route.http(), &u, headers, &session.agent))
+}
+
+/// A manifest body as text. Some origins put a byte-order mark in front of
+/// `#EXTM3U`, and `trim_start` does not strip it.
+fn manifest_text(body: &[u8]) -> String {
+    String::from_utf8_lossy(body)
+        .trim_start_matches('\u{feff}')
+        .to_owned()
 }
 
 /// Fetch one bounded body with the stream's session headers.
@@ -4015,26 +4053,17 @@ const MAX_REDIRECTS: usize = 5;
 /// from — every relative URI inside resolves against THAT, so parsing
 /// against the address originally asked for would aim every segment at the
 /// wrong host.
-#[allow(clippy::too_many_arguments)]
 async fn stream_get_at(
     connector: &Arc<TlsCapableConnector>,
     url: &str,
-    cookies: Option<&str>,
-    referer: Option<&str>,
-    agent: &str,
+    session: &StreamSession,
     route: &Route,
     cap: usize,
 ) -> std::io::Result<(Vec<u8>, String)> {
     let mut at = url.to_string();
     for _ in 0..MAX_REDIRECTS {
-        let t = stream_target(
-            &hya_stream::Segment::new(&at),
-            cookies,
-            referer,
-            agent,
-            route,
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let t = stream_target(&hya_stream::Segment::new(&at), session, route)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         match hya_net::fetch_small(connector.as_ref(), &t, cap).await {
             Ok(body) => return Ok((body, at)),
             Err(e) => {
@@ -4053,17 +4082,14 @@ async fn stream_get_at(
     Err(std::io::Error::other("too many redirects"))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn stream_get(
     connector: &Arc<TlsCapableConnector>,
     url: &str,
-    cookies: Option<&str>,
-    referer: Option<&str>,
-    agent: &str,
+    session: &StreamSession,
     route: &Route,
     cap: usize,
 ) -> std::io::Result<Vec<u8>> {
-    stream_get_at(connector, url, cookies, referer, agent, route, cap)
+    stream_get_at(connector, url, session, route, cap)
         .await
         .map(|(body, _)| body)
 }
@@ -4073,7 +4099,6 @@ async fn stream_get(
 /// `total_segments` is `None` for a recording: a live stream has no total, so
 /// there is no percentage and no ETA to compute, and claiming one would be a
 /// lie that only gets more wrong the longer it runs.
-#[allow(clippy::too_many_arguments)]
 fn spawn_ticker(
     id: DlId,
     meter: &Arc<hya_stream::hls::Meter>,
@@ -4088,10 +4113,11 @@ fn spawn_ticker(
 ) -> tokio::task::JoinHandle<()> {
     let (meter, tx, cancel) = (meter.clone(), tx.clone(), cancel.clone());
     tokio::spawn(async move {
-        let mut last_bytes = 0u64;
-        let mut last_at = std::time::Instant::now();
+        let clock = std::time::Instant::now();
+        let mut last_at = clock;
+        let mut speed = hya_core::RateMeter::new(RATE_TAU);
+        speed.sample(0.0, 0);
         let mut last_line = String::new();
-        let mut smoothed = 0.0f64;
         let mut announced = estimated;
         // A projection that is itself smoothed. The raw one moves in steps —
         // it only changes when a whole segment settles — and a bar drawn
@@ -4118,14 +4144,11 @@ fn spawn_ticker(
             let (bytes, segs) = meter.totals();
             let now = std::time::Instant::now();
             let dt = now.duration_since(last_at).as_secs_f64().max(0.001);
-            let instant = bytes.saturating_sub(last_bytes) as f64 / dt;
-            last_bytes = bytes;
             last_at = now;
-            // A time-constant EMA (~1.5 s), not a per-tick one: the rate then
-            // means the same thing whatever the tick rate is, and a segment
-            // boundary no longer reads as a collapse to zero.
-            let alpha = 1.0 - (-dt / 1.5).exp();
-            smoothed += alpha * (instant - smoothed);
+            let smoothed = speed.sample(clock.elapsed().as_secs_f64(), bytes);
+            // The size projection below is smoothed through the rate's own
+            // time constant, so size and speed settle together.
+            let alpha = 1.0 - (-dt / RATE_TAU).exp();
 
             // Once segments have landed, MEASURED bytes-per-segment beats the
             // manifest's bitrate estimate, so the size converges on the truth
@@ -4138,8 +4161,6 @@ fn spawn_ticker(
                 Some(_) => estimated as f64,
                 None => bytes as f64,
             };
-            // Same time constant as the rate, so size and speed settle
-            // together rather than one chasing the other.
             if smooth_total <= 0.0 {
                 smooth_total = measured;
             } else {
@@ -4161,8 +4182,10 @@ fn spawn_ticker(
                     file_name: None,
                 });
             }
-            let eta = (total_segments.is_some() && smoothed > 512.0 && projected > bytes)
-                .then(|| ((projected - bytes) as f64 / smoothed) as u64);
+            let eta = match total_segments {
+                Some(_) if projected > bytes => speed.eta_secs(projected - bytes).map(|s| s as u64),
+                _ => None,
+            };
             // The status line changes at segment granularity; re-sending it
             // a hundred times a second would be a hundred redraws saying the
             // same thing.
@@ -4251,21 +4274,17 @@ fn segment_fetcher(
     cancel: &Arc<AtomicBool>,
     route: &Route,
 ) -> impl hya_stream::Fetcher {
-    let (connector, ck, rf, ua, pace, cancel, route) = (
+    let (connector, session, pace, cancel, route) = (
         connector.clone(),
-        spec.cookies.clone(),
-        spec.referer.clone(),
-        spec.user_agent.clone(),
+        spec.session(),
         pace.clone(),
         cancel.clone(),
         route.clone(),
     );
     move |seg: hya_stream::Segment, dest: String, counter: Arc<AtomicU64>| -> hya_stream::FetchSeg {
-        let (connector, ck, rf, ua, pace, cancel, route) = (
+        let (connector, session, pace, cancel, route) = (
             connector.clone(),
-            ck.clone(),
-            rf.clone(),
-            ua.clone(),
+            session.clone(),
             pace.clone(),
             cancel.clone(),
             route.clone(),
@@ -4274,7 +4293,7 @@ fn segment_fetcher(
             // A CDN may bounce a segment to a regional edge; follow it.
             let mut seg = seg;
             for hop in 0..=MAX_REDIRECTS {
-                let t = stream_target(&seg, ck.as_deref(), rf.as_deref(), &ua, &route)
+                let t = stream_target(&seg, &session, &route)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 // Streamed to a staging file rather than buffered: memory stays
                 // flat whatever the segment size, and `counter` can be read while
@@ -4333,6 +4352,8 @@ enum LiveSource {
     Hls {
         url: String,
         audio_url: Option<String>,
+        /// The master's `#EXT-X-DEFINE` variables, for every re-read.
+        imported: Vec<(String, String)>,
     },
     /// A dynamic MPD, re-read for new `$Number$` entries. The Representation
     /// ids are pinned so a refresh cannot silently switch rendition.
@@ -4362,24 +4383,29 @@ impl Window {
 }
 
 /// Fetch a playlist and parse it against the URL it actually came from.
+/// Fetch a playlist and parse it against the URL it came from, with the
+/// master's `#EXT-X-DEFINE` variables available to `IMPORT`.
 async fn hls_playlist(
     connector: &Arc<TlsCapableConnector>,
     url: &str,
     spec: &StreamSpec,
     route: &Route,
+    imported: &[(String, String)],
 ) -> Result<hya_stream::hls::Playlist, String> {
     let body = stream_get(
         connector,
         url,
-        spec.cookies.as_deref(),
-        spec.referer.as_deref(),
-        &spec.user_agent,
+        &spec.session(),
         route,
         hya_stream::hls::playlist_cap(),
     )
     .await
     .map_err(|e| e.to_string())?;
-    Ok(hya_stream::hls::parse(&String::from_utf8_lossy(&body), url))
+    Ok(hya_stream::hls::parse_with_variables(
+        &String::from_utf8_lossy(&body),
+        url,
+        imported,
+    ))
 }
 
 /// Re-read the source and report each track's current window, whether the
@@ -4390,18 +4416,22 @@ async fn live_windows(
     spec: &StreamSpec,
     route: &Route,
 ) -> Result<(Vec<Window>, bool, std::time::Duration), String> {
-    let (ck, rf, ua) = (
-        spec.cookies.as_deref(),
-        spec.referer.as_deref(),
-        spec.user_agent.as_str(),
-    );
+    let session = spec.session();
     let cap = hya_stream::hls::playlist_cap();
     match source {
-        LiveSource::Hls { url, audio_url } => {
-            let body = stream_get(connector, url, ck, rf, ua, route, cap)
+        LiveSource::Hls {
+            url,
+            audio_url,
+            imported,
+        } => {
+            let body = stream_get(connector, url, &session, route, cap)
                 .await
                 .map_err(|e| format!("could not re-read the playlist: {e}"))?;
-            let pl = hya_stream::hls::parse(&String::from_utf8_lossy(&body), url);
+            let pl = hya_stream::hls::parse_with_variables(
+                &String::from_utf8_lossy(&body),
+                url,
+                imported,
+            );
             if let Some(d) = &pl.drm {
                 return Err(drm_refusal(d));
             }
@@ -4414,7 +4444,7 @@ async fn live_windows(
                 // The track count was fixed when the recording started, so a
                 // window that cannot be read now has to stop the recording
                 // rather than quietly leave the audio file behind the video.
-                let apl = hls_playlist(connector, au, spec, route)
+                let apl = hls_playlist(connector, au, spec, route, imported)
                     .await
                     .map_err(|e| format!("could not re-read the audio playlist: {e}"))?;
                 windows.push(Window::of(&apl));
@@ -4426,7 +4456,7 @@ async fn live_windows(
             video_id,
             audio_id,
         } => {
-            let body = stream_get(connector, url, ck, rf, ua, route, cap)
+            let body = stream_get(connector, url, &session, route, cap)
                 .await
                 .map_err(|e| format!("could not re-read the manifest: {e}"))?;
             let mf = hya_stream::dash::parse(&String::from_utf8_lossy(&body), url);
@@ -4471,7 +4501,6 @@ async fn live_windows(
 /// Stopping is a SUCCESS, not a cancellation. Someone recording a live stream
 /// and pressing Stop wants the file they have, and there is nothing to resume
 /// into later: the bytes they did not take are gone from the origin.
-#[allow(clippy::too_many_arguments)]
 async fn record_live(
     spec: &StreamSpec,
     source: LiveSource,
@@ -4719,24 +4748,14 @@ async fn record_live(
                     };
                     // The permit is the connection, so the row is taken here.
                     let lane = m2.occupy(&c2);
-                    // Bounded exactly as the VOD path bounds an attempt. An
-                    // origin that accepts and then goes SILENT never completes
-                    // a read, and `fetch_object` only tests the cancel flag
-                    // between reads — so without this the append loop blocks
-                    // forever on `task.await`: the recording freezes, the
-                    // deadline never fires, and Cancel does nothing.
-                    let r = match tokio::time::timeout(
-                        hya_stream::hls::ATTEMPT_TIMEOUT,
-                        f(url, d2, c2.clone()),
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "live segment stalled",
-                        )),
-                    };
+                    // Supervised exactly as the VOD path supervises an
+                    // attempt. An origin that accepts and then goes SILENT
+                    // never completes a read, and `fetch_object` only tests
+                    // the cancel flag between reads — so without this the
+                    // append loop blocks forever on `task.await`: the
+                    // recording freezes, the deadline never fires, and
+                    // Cancel does nothing.
+                    let r = watched(f(url, d2, c2.clone()), &c2).await;
                     if let Some(l) = lane {
                         l.finish(r.is_ok());
                     }
@@ -4872,11 +4891,7 @@ async fn record_live(
     }
 
     // Finalise exactly as a VOD download does.
-    let want_ext = if spec.container.eq_ignore_ascii_case("ts") {
-        "ts"
-    } else {
-        "mp4"
-    };
+    let want_ext = crate::model::container_ext(&spec.container);
     let final_str = final_path
         .lock()
         .map(|g| g.clone())
@@ -4998,66 +5013,131 @@ impl Assembly {
     }
 }
 
+/// The extension the finished file carries: the container the user asked
+/// for, or a packed audio stream's own — the only one its bytes deserve.
+fn wanted_ext(container: &str, assembly: &Assembly) -> &'static str {
+    match assembly {
+        Assembly::Single(plan) if plan.raw_audio.is_some() => plan.native_ext(),
+        _ => crate::model::container_ext(container),
+    }
+}
+
+/// Run one live-segment fetch under idle supervision, as `fetch_all` runs a
+/// VOD segment's: abandoned once `counter` has not moved for
+/// [`hya_stream::hls::ATTEMPT_TIMEOUT`], or after
+/// [`hya_stream::hls::ATTEMPT_CEILING`] regardless. A wall-clock timeout
+/// here killed any segment slower than the allowance, however steadily its
+/// bytes were arriving.
+async fn watched<Fut>(fut: Fut, counter: &AtomicU64) -> std::io::Result<u64>
+where
+    Fut: std::future::Future<Output = std::io::Result<u64>>,
+{
+    supervised(
+        fut,
+        counter,
+        hya_stream::hls::ATTEMPT_TIMEOUT,
+        hya_stream::hls::ATTEMPT_CEILING,
+    )
+    .await
+}
+
+async fn supervised<Fut>(
+    fut: Fut,
+    counter: &AtomicU64,
+    idle: std::time::Duration,
+    ceiling: std::time::Duration,
+) -> std::io::Result<u64>
+where
+    Fut: std::future::Future<Output = std::io::Result<u64>>,
+{
+    tokio::pin!(fut);
+    let started = tokio::time::Instant::now();
+    let mut seen = counter.load(Ordering::Relaxed);
+    let mut moved_at = started;
+    let tick = (idle / 20).clamp(
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_secs(3),
+    );
+    let mut ticker = tokio::time::interval(tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            r = &mut fut => return r,
+            _ = ticker.tick() => {
+                let now = counter.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    moved_at = tokio::time::Instant::now();
+                } else if moved_at.elapsed() >= idle {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("live segment stalled: no bytes for {}s", idle.as_secs()),
+                    ));
+                }
+                if started.elapsed() >= ceiling {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "live segment still arriving after {}s; abandoned",
+                            ceiling.as_secs()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// Resolve a manifest, download its segments, and produce one playable file.
 ///
 /// Progress is reported against the size the manifest *implies*
 /// (bitrate x duration) only until the first segments land; after that it is
 /// projected from what actually arrived, because no server states the total
 /// for a stream and the manifest's own number is routinely out by a third.
-async fn run_stream(
-    spec: StreamSpec,
-    cancel: Arc<AtomicBool>,
-    pace: Pace,
-    final_path: Arc<Mutex<String>>,
-    tx: UnboundedSender<Event>,
-) {
+/// Everything a stream transfer's requests share.
+#[derive(Clone, Copy)]
+struct StreamCtx<'a> {
+    spec: &'a StreamSpec,
+    connector: &'a Arc<TlsCapableConnector>,
+    session: &'a StreamSession,
+    route: &'a Route,
+    pace: &'a Pace,
+    cancel: &'a Arc<AtomicBool>,
+    tx: &'a UnboundedSender<Event>,
+}
+
+/// What the manifest turned out to describe: a finite plan to assemble, or
+/// a live window to record.
+enum StreamPlan {
+    Vod {
+        assembly: Box<Assembly>,
+        is_dash: bool,
+    },
+    Live {
+        source: LiveSource,
+        primed: Option<(Vec<Window>, bool, std::time::Duration)>,
+    },
+}
+
+/// Read the manifest and every playlist it points at, down to the segment
+/// lists that will be fetched. The error is the sentence the row shows.
+async fn resolve_stream_plan(ctx: &StreamCtx<'_>) -> Result<StreamPlan, String> {
+    let StreamCtx {
+        spec,
+        connector,
+        session,
+        route,
+        ..
+    } = *ctx;
     let id = spec.id;
-    let ev = |e: Event| {
-        let _ = tx.send(e);
-    };
-    let fail = |msg: String| {
-        crate::log::error(&format!("#{id} stream failed: {msg}"));
-        let _ = tx.send(Event::Failed {
-            id,
-            error: msg,
-            done: 0,
-            held: vec![],
-            permission_denied: false,
-        });
-    };
-
-    // One route for the whole recording, resolved before the first request:
-    // the manifest, every variant playlist and every segment must leave by
-    // the same door.
-    let route = match crate::proxy::for_choice(&spec.proxy) {
-        Ok(r) => r,
-        Err(e) => return fail(e),
-    };
-    let connector = match connector_for(route.socks()) {
-        Ok(c) => c,
-        Err(e) => return fail(e),
-    };
-    let (ck, rf, ua) = (
-        spec.cookies.as_deref(),
-        spec.referer.as_deref(),
-        spec.user_agent.as_str(),
-    );
-
-    ev(Event::Status {
-        id,
-        line: crate::i18n::tr("Reading playlist..."),
-    });
-
-    // 1. The manifest.
     let cap = hya_stream::hls::playlist_cap();
     // `base` is where the manifest ACTUALLY came from after redirects; every
     // relative URI inside resolves against it.
-    let (body, base) =
-        match stream_get_at(&connector, &spec.manifest, ck, rf, ua, &route, cap).await {
-            Ok(b) => b,
-            Err(e) => return fail(format!("could not read the manifest: {e}")),
-        };
-    let text = String::from_utf8_lossy(&body).into_owned();
+    let (body, base) = match stream_get_at(connector, &spec.manifest, session, route, cap).await {
+        Ok(b) => b,
+        Err(e) => return Err(format!("could not read the manifest: {e}")),
+    };
+    let text = manifest_text(&body);
     if base != spec.manifest {
         crate::log::info(&format!(
             "#{id} manifest redirected to {}",
@@ -5079,7 +5159,7 @@ async fn run_stream(
     } else if text.contains("<MPD") {
         true
     } else {
-        return fail(format!(
+        return Err(format!(
             "{} is not an HLS or DASH manifest (the server returned {} bytes of something else)",
             spec.manifest,
             body.len()
@@ -5089,7 +5169,7 @@ async fn run_stream(
     let assembly = if is_dash {
         let mf = hya_stream::dash::parse(&text, &base);
         let Some(video) = mf.choose_video(spec.height) else {
-            return fail("the manifest lists no video renditions".into());
+            return Err("the manifest lists no video renditions".into());
         };
         if mf.live {
             // The refusals below live in `mf.plan()`, which only the VOD path
@@ -5099,7 +5179,7 @@ async fn run_stream(
             // the live path must refuse too, rather than appending ciphertext
             // and finishing successfully over it.
             if let Some(d) = &mf.drm {
-                return fail(drm_refusal(d));
+                return Err(drm_refusal(d));
             }
             // A dynamic manifest publishes a sliding window, not a list to
             // work through: record it until it ends or is stopped.
@@ -5127,18 +5207,7 @@ async fn run_stream(
                 });
             }
             let primed = Some((windows, false, mf.refresh_after()));
-            return record_live(
-                &spec,
-                source,
-                primed,
-                &connector,
-                &pace,
-                &cancel,
-                &final_path,
-                &route,
-                &tx,
-            )
-            .await;
+            return Ok(StreamPlan::Live { source, primed });
         }
         crate::log::info(&format!(
             "#{id} dash video {}p @ {} kbps ({} segments)",
@@ -5148,7 +5217,7 @@ async fn run_stream(
         ));
         let vplan = match mf.plan(video) {
             Ok(p) => p,
-            Err(refusal) => return fail(refusal.to_string()),
+            Err(refusal) => return Err(refusal.to_string()),
         };
         // Audio is a separate Representation in most DASH; without it the
         // finished file would be silent, so it is fetched and muxed rather
@@ -5182,6 +5251,9 @@ async fn run_stream(
         // Set from the master, before `playlist` becomes the media playlist:
         // once that happens the rendition groups are gone.
         let mut audio_url: Option<String> = None;
+        // Its `#EXT-X-DEFINE` variables likewise: a media playlist may
+        // `IMPORT` them, and they are gone with the master.
+        let mut imported: Vec<(String, String)> = Vec::new();
         if playlist.is_master() {
             let Some(chosen) = hya_stream::hls::choose(
                 &playlist.variants,
@@ -5189,7 +5261,7 @@ async fn run_stream(
                 spec.height,
             )
             .cloned() else {
-                return fail("the master playlist lists no variants".into());
+                return Err("the master playlist lists no variants".into());
             };
             bandwidth = bandwidth.or(chosen.bandwidth);
             for v in &playlist.variants {
@@ -5214,21 +5286,26 @@ async fn run_stream(
                 ));
                 audio_url = rendition.url.clone();
             }
-            let body = match stream_get(&connector, &chosen.url, ck, rf, ua, &route, cap).await {
+            let body = match stream_get(connector, &chosen.url, session, route, cap).await {
                 Ok(b) => b,
-                Err(e) => return fail(format!("could not read the variant playlist: {e}")),
+                Err(e) => return Err(format!("could not read the variant playlist: {e}")),
             };
-            playlist = hya_stream::hls::parse(&String::from_utf8_lossy(&body), &chosen.url);
+            imported = std::mem::take(&mut playlist.variables);
+            playlist = hya_stream::hls::parse_with_variables(
+                &String::from_utf8_lossy(&body),
+                &chosen.url,
+                &imported,
+            );
             variant_url = chosen.url;
         }
         if playlist.live {
             // As above: `Plan::build` is never reached on this path, so its
             // refusals are restated before the primed window is used.
             if let Some(d) = &playlist.drm {
-                return fail(drm_refusal(d));
+                return Err(drm_refusal(d));
             }
             if let Some(enc) = &playlist.encryption {
-                return fail(format!("recording {enc} live streams is not supported yet"));
+                return Err(format!("recording {enc} live streams is not supported yet"));
             }
             crate::log::info(&format!(
                 "#{id} recording live hls from {}",
@@ -5240,7 +5317,7 @@ async fn run_stream(
                 // track count is fixed from this point, and a second track
                 // that starts a window late is a recording whose sound is
                 // permanently behind its picture.
-                match hls_playlist(&connector, au, &spec, &route).await {
+                match hls_playlist(connector, au, spec, route, &imported).await {
                     Ok(apl) => windows.push(Window::of(&apl)),
                     Err(e) => {
                         crate::log::warn(&format!(
@@ -5254,29 +5331,19 @@ async fn run_stream(
             let source = LiveSource::Hls {
                 url: variant_url,
                 audio_url,
+                imported,
             };
-            return record_live(
-                &spec,
-                source,
-                primed,
-                &connector,
-                &pace,
-                &cancel,
-                &final_path,
-                &route,
-                &tx,
-            )
-            .await;
+            return Ok(StreamPlan::Live { source, primed });
         }
         let vplan = match hya_stream::hls::Plan::build(&playlist, bandwidth) {
             Ok(p) => p,
-            Err(refusal) => return fail(refusal.to_string()),
+            Err(refusal) => return Err(refusal.to_string()),
         };
         // A variant that names an audio rendition group carries no sound of
         // its own; muxing the rendition back in is what keeps the finished
         // file from being silent.
         match &audio_url {
-            Some(u) => match hls_playlist(&connector, u, &spec, &route).await {
+            Some(u) => match hls_playlist(connector, u, spec, route, &imported).await {
                 Ok(apl) => match hya_stream::hls::Plan::build(&apl, None) {
                     Ok(aplan) => {
                         crate::log::info(&format!(
@@ -5301,53 +5368,59 @@ async fn run_stream(
         }
     };
 
-    let total_segments = assembly.segments();
-    let estimated = assembly.estimated();
-    for (n, plan) in assembly.plans().iter().enumerate() {
-        crate::log::debug(&format!(
-            "#{id} track {n}: {} segments, {:?}, init {}, byte-ranged {}, ~{} bytes",
-            plan.segments.len(),
-            plan.kind,
-            plan.init.is_some(),
-            plan.segments.iter().any(|s| s.range.is_some()),
-            plan.estimated_size.unwrap_or(0)
-        ));
-    }
-    let conc = hya_stream::hls::Concurrency::fixed(spec.conns);
-    crate::log::info(&format!(
-        "#{id} {} ({} declared): {total_segments} segments, ~{estimated} bytes, \
-         {} connection(s), ffmpeg {}",
-        if is_dash { "dash" } else { "hls" },
-        spec.protocol,
-        conc.ceiling(),
-        // Which branch the finish takes hangs on this, so a file that came
-        // out as TS when MP4 was asked for is explained by this one word.
-        if hya_stream::hls::ffmpeg().is_some() {
-            "present"
-        } else {
-            "absent"
-        },
-    ));
-    ev(Event::Probed {
-        id,
-        size: (estimated > 0).then_some(estimated),
-        ranges: false,
-        file_name: None,
-    });
+    Ok(StreamPlan::Vod {
+        assembly: Box::new(assembly),
+        is_dash,
+    })
+}
 
-    // 2. Assemble. One staging file per track.
+/// One track's staging files, and where an earlier run left it.
+struct Job {
+    part: String,
+    staging: String,
+    checkpoint: String,
+    resumed: hya_stream::hls::Checkpoint,
+}
+
+/// The tracks on disk, ready to be joined into the container.
+struct Assembled {
+    parts: Vec<String>,
+    jobs: Vec<Job>,
+    started: std::time::Instant,
+}
+
+/// Why assembly did not finish. A stop carries the bytes that landed, which
+/// the row reports as one held span.
+enum Ended {
+    Stopped(u64),
+    Failed(String),
+}
+
+/// Fetch every track's segments into its staging file, carrying on from a
+/// usable checkpoint, with the Progress ticker running meanwhile.
+async fn assemble_tracks(
+    ctx: &StreamCtx<'_>,
+    assembly: &Assembly,
+    conc: hya_stream::hls::Concurrency,
+    total_segments: u64,
+    estimated: u64,
+) -> Result<Assembled, Ended> {
+    let StreamCtx {
+        spec,
+        connector,
+        session,
+        route,
+        pace,
+        cancel,
+        tx,
+    } = *ctx;
+    let id = spec.id;
     if let Some(dir) = std::path::Path::new(&spec.temp_path).parent() {
         let _ = std::fs::create_dir_all(dir);
     }
 
-    // One job per track. Whether each can carry on from an earlier run is
-    // decided here, before anything is measured.
-    struct Job {
-        part: String,
-        staging: String,
-        checkpoint: String,
-        resumed: hya_stream::hls::Checkpoint,
-    }
+    // Whether each track can carry on from an earlier run is decided here,
+    // before anything is measured.
     let jobs: Vec<Job> = assembly
         .plans()
         .iter()
@@ -5398,12 +5471,10 @@ async fn run_stream(
                 crate::log::redact(&uri)
             ));
             match stream_get(
-                &connector,
+                connector,
                 &uri,
-                ck,
-                rf,
-                ua,
-                &route,
+                session,
+                route,
                 hya_stream::hls::KEY_FETCH_CAP,
             )
             .await
@@ -5414,12 +5485,16 @@ async fn run_stream(
                     keys.insert(uri, k);
                 }
                 Ok(bytes) => {
-                    return fail(format!(
+                    return Err(Ended::Failed(format!(
                         "the AES-128 key at {uri} is {} bytes, not 16",
                         bytes.len()
-                    ))
+                    )));
                 }
-                Err(e) => return fail(format!("could not fetch the AES-128 key {uri}: {e}")),
+                Err(e) => {
+                    return Err(Ended::Failed(format!(
+                        "could not fetch the AES-128 key {uri}: {e}"
+                    )))
+                }
             }
         }
     }
@@ -5443,14 +5518,14 @@ async fn run_stream(
     let ticker = spawn_ticker(
         id,
         &meter,
-        &tx,
-        &cancel,
+        tx,
+        cancel,
         Some(total_segments),
         estimated,
         None,
     );
 
-    let fetch = segment_fetcher(&spec, &connector, &pace, &cancel, &route);
+    let fetch = segment_fetcher(spec, connector, pace, cancel, route);
 
     let mut parts: Vec<String> = Vec::new();
     let mut outcome = Ok(());
@@ -5479,7 +5554,7 @@ async fn run_stream(
             &job.staging,
             fetch.clone(),
             &meter,
-            &cancel,
+            cancel,
             resume,
             conc,
             &keys,
@@ -5491,14 +5566,8 @@ async fn run_stream(
                 ticker.abort();
                 // The staging files and their checkpoints are KEPT: that is
                 // what makes the next Start carry on rather than refetch
-                // everything. `held` still reports one contiguous span so the
-                // row and the bar show where it stopped.
-                let done = meter.settled();
-                return ev(Event::Stopped {
-                    id,
-                    done,
-                    held: vec![(0, done)],
-                });
+                // everything.
+                return Err(Ended::Stopped(meter.settled()));
             }
             Err(e) => {
                 outcome = Err(format!("segment download failed: {e}"));
@@ -5507,30 +5576,35 @@ async fn run_stream(
         }
     }
     ticker.abort();
-    if let Err(e) = outcome {
-        // A failure leaves the parts and checkpoints alone too — a flaky
-        // segment is the commonest failure and retrying should not throw
-        // away the gigabyte that did arrive.
-        return fail(e);
+    // A failure leaves the parts and checkpoints alone too — a flaky segment
+    // is the commonest failure and retrying should not throw away the
+    // gigabyte that did arrive.
+    match outcome {
+        Ok(()) => Ok(Assembled {
+            parts,
+            jobs,
+            started: t0,
+        }),
+        Err(e) => Err(Ended::Failed(e)),
     }
+}
 
-    // 3. Container. What was assembled is already playable for every case
-    //    except MPEG-TS asked to become MP4, and DASH's two tracks.
-    let want_ext = if spec.container.eq_ignore_ascii_case("ts") {
-        "ts"
-    } else {
-        "mp4"
+/// Join the assembled tracks into the file the user asked for, and clear
+/// the staging files whichever way that went. A failure keeps the tracks
+/// under their own names, and says where.
+fn finish_container(
+    ctx: &StreamCtx<'_>,
+    assembly: &Assembly,
+    parts: &[String],
+    jobs: &[Job],
+    want_ext: &str,
+    final_p: &std::path::Path,
+) -> Result<hya_stream::hls::Finished, String> {
+    let id = ctx.spec.id;
+    let ev = |e: Event| {
+        let _ = ctx.tx.send(e);
     };
-    let final_str = final_path
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_else(|_| spec.final_path.clone());
-    let final_p = std::path::Path::new(&final_str);
-    if let Some(dir) = final_p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-
-    let result = match (&assembly, parts.as_slice()) {
+    let result = match (assembly, parts) {
         (Assembly::VideoAudio(_, aplan), [video, audio]) => {
             ev(Event::Status {
                 id,
@@ -5558,18 +5632,15 @@ async fn run_stream(
             .map(|()| hya_stream::hls::Finished::Remuxed)
         }
         (Assembly::Single(plan), [only]) => {
-            if hya_stream::hls::plan_finish(
-                plan.kind,
-                want_ext,
-                hya_stream::hls::ffmpeg().is_some(),
-            ) == hya_stream::hls::Finish::Remux
+            if hya_stream::hls::plan_finish_for(plan, want_ext, hya_stream::hls::ffmpeg().is_some())
+                == hya_stream::hls::Finish::Remux
             {
                 ev(Event::Status {
                     id,
                     line: crate::i18n::tr("Remuxing..."),
                 });
             }
-            hya_stream::hls::finish(plan.kind, want_ext, std::path::Path::new(only), final_p)
+            hya_stream::hls::finish_plan(plan, want_ext, std::path::Path::new(only), final_p)
                 .map_err(|e| {
                     let kept = final_p.with_extension(plan.native_ext());
                     let _ = std::fs::rename(only, &kept);
@@ -5578,11 +5649,161 @@ async fn run_stream(
         }
         _ => Err("nothing was assembled".into()),
     };
-    for j in &jobs {
+    for j in jobs {
         let _ = std::fs::remove_file(&j.part);
         let _ = std::fs::remove_file(&j.checkpoint);
     }
-    let finished = match result {
+    result
+}
+
+async fn run_stream(
+    spec: StreamSpec,
+    cancel: Arc<AtomicBool>,
+    pace: Pace,
+    final_path: Arc<Mutex<String>>,
+    tx: UnboundedSender<Event>,
+) {
+    let id = spec.id;
+    let ev = |e: Event| {
+        let _ = tx.send(e);
+    };
+    let fail = |msg: String| {
+        crate::log::error(&format!("#{id} stream failed: {msg}"));
+        let _ = tx.send(Event::Failed {
+            id,
+            error: msg,
+            done: 0,
+            held: vec![],
+            permission_denied: false,
+        });
+    };
+
+    // One route for the whole recording, resolved before the first request:
+    // the manifest, every variant playlist and every segment must leave by
+    // the same door.
+    let route = match crate::proxy::for_choice(&spec.proxy) {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+    let connector = match connector_for(route.socks()) {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    let session = spec.session();
+
+    ev(Event::Status {
+        id,
+        line: crate::i18n::tr("Reading playlist..."),
+    });
+
+    // 1. The manifest.
+    let ctx = StreamCtx {
+        spec: &spec,
+        connector: &connector,
+        session: &session,
+        route: &route,
+        pace: &pace,
+        cancel: &cancel,
+        tx: &tx,
+    };
+    let (assembly, is_dash) = match resolve_stream_plan(&ctx).await {
+        Ok(StreamPlan::Vod { assembly, is_dash }) => (*assembly, is_dash),
+        Ok(StreamPlan::Live { source, primed }) => {
+            return record_live(
+                &spec,
+                source,
+                primed,
+                &connector,
+                &pace,
+                &cancel,
+                &final_path,
+                &route,
+                &tx,
+            )
+            .await;
+        }
+        Err(e) => return fail(e),
+    };
+    let total_segments = assembly.segments();
+    let estimated = assembly.estimated();
+    for (n, plan) in assembly.plans().iter().enumerate() {
+        crate::log::debug(&format!(
+            "#{id} track {n}: {} segments, {:?}, init {}, byte-ranged {}, ~{} bytes",
+            plan.segments.len(),
+            plan.kind,
+            plan.init.is_some(),
+            plan.segments.iter().any(|s| s.range.is_some()),
+            plan.estimated_size.unwrap_or(0)
+        ));
+    }
+    let conc = hya_stream::hls::Concurrency::fixed(spec.conns);
+    crate::log::info(&format!(
+        "#{id} {} ({} declared): {total_segments} segments, ~{estimated} bytes, \
+         {} connection(s), ffmpeg {}",
+        if is_dash { "dash" } else { "hls" },
+        spec.protocol,
+        conc.ceiling(),
+        // Which branch the finish takes hangs on this, so a file that came
+        // out as TS when MP4 was asked for is explained by this one word.
+        if hya_stream::hls::ffmpeg().is_some() {
+            "present"
+        } else {
+            "absent"
+        },
+    ));
+    // A packed audio stream lands under its own extension: a `.mp4` full of
+    // ADTS frames plays nowhere, and the container choice speaks of video.
+    // Nothing knew that before the media playlist was read, so the name is
+    // corrected here — unless File Info has already retargeted the file.
+    let want_ext = wanted_ext(&spec.container, &assembly);
+    let mut renamed = None;
+    if want_ext != crate::model::container_ext(&spec.container) {
+        if let Ok(mut g) = final_path.lock() {
+            if *g == spec.final_path {
+                let p = std::path::Path::new(&spec.final_path).with_extension(want_ext);
+                renamed = p.file_name().map(|n| n.to_string_lossy().into_owned());
+                *g = p.to_string_lossy().into_owned();
+            }
+        }
+    }
+    ev(Event::Probed {
+        id,
+        size: (estimated > 0).then_some(estimated),
+        ranges: false,
+        file_name: renamed,
+    });
+
+    // 2. Assemble. One staging file per track.
+    let Assembled {
+        parts,
+        jobs,
+        started,
+    } = match assemble_tracks(&ctx, &assembly, conc, total_segments, estimated).await {
+        Ok(a) => a,
+        // `held` reports one contiguous span so the row and the bar show
+        // where it stopped.
+        Err(Ended::Stopped(done)) => {
+            return ev(Event::Stopped {
+                id,
+                done,
+                held: vec![(0, done)],
+            })
+        }
+        Err(Ended::Failed(e)) => return fail(e),
+    };
+
+    // 3. Container. What was assembled is already playable for every case
+    //    except MPEG-TS asked to become MP4, and DASH's two tracks.
+    let final_str = final_path
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|_| spec.final_path.clone());
+    let final_p = std::path::Path::new(&final_str);
+    if let Some(dir) = final_p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let finished = match finish_container(&ctx, &assembly, &parts, &jobs, want_ext, final_p) {
         Ok(f) => f,
         Err(e) => return fail(e),
     };
@@ -5596,7 +5817,7 @@ async fn run_stream(
     }
 
     let size = std::fs::metadata(final_p).map(|m| m.len()).unwrap_or(0);
-    let elapsed = t0.elapsed().as_secs_f64();
+    let elapsed = started.elapsed().as_secs_f64();
     crate::log::log(&format!(
         "done stream #{id} -> {final_str} ({size} bytes, {elapsed:.1}s)"
     ));
@@ -6073,6 +6294,152 @@ mod stream_tests {
     /// `RandomState`, so the bytes exist only while the test does. The bytes
     /// are assembled from the hasher's output rather than written into a
     /// zeroed array, which static analysis reads as a hard-coded key.
+    /// A media playlist may `IMPORT` a variable the master `DEFINE`d; parsing
+    /// it without the master's table leaves `{$cdn}` in every segment URL.
+    #[tokio::test]
+    async fn a_media_playlist_imports_the_masters_variables() {
+        let dir = tmp("define");
+        let (base, seen) = serve(vec![
+            (
+                "/master.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n",
+                    "#EXT-X-DEFINE:NAME=\"cdn\",VALUE=\"c1\"\n",
+                    "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360\n",
+                    "v/index.m3u8\n"
+                )
+                .into(),
+            ),
+            (
+                "/v/index.m3u8".into(),
+                concat!(
+                    "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n",
+                    "#EXT-X-DEFINE:IMPORT=\"cdn\"\n",
+                    "#EXTINF:4.0,\n{$cdn}/v0.ts\n#EXT-X-ENDLIST\n"
+                )
+                .into(),
+            ),
+            ("/v/c1/v0.ts".into(), b"VVVV".to_vec()),
+        ]);
+        let spec = StreamSpec {
+            container: "TS".into(),
+            ..spec_for(31, format!("{base}/master.m3u8"), &dir, "out.ts")
+        };
+        let (finished, failure) = drive(spec, Arc::new(AtomicBool::new(false))).await;
+        assert_eq!(failure, None);
+        assert_eq!(finished, Some(4));
+        assert_eq!(std::fs::read(dir.join("out.ts")).unwrap(), b"VVVV");
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.starts_with("/v/c1/v0.ts\n")),
+            "the segment was asked for under an unsubstituted name"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Packed AAC segments concatenate into an `.aac` file, so the item named
+    /// `out.mp4` for an MP4 container lands as `out.aac` and the list is told.
+    #[tokio::test]
+    async fn a_raw_audio_playlist_lands_under_its_own_extension() {
+        let dir = tmp("aac");
+        let (base, _seen) = serve(vec![
+            (
+                "/radio.m3u8".into(),
+                "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:4.0,\na0.aac\n#EXTINF:4.0,\na1.aac\n\
+                 #EXT-X-ENDLIST\n"
+                    .into(),
+            ),
+            ("/a0.aac".into(), b"AAAA".to_vec()),
+            ("/a1.aac".into(), b"BBBB".to_vec()),
+        ]);
+        let spec = spec_for(32, format!("{base}/radio.m3u8"), &dir, "out.mp4");
+        let (tx, mut rx) = unbounded_channel();
+        let final_path = Arc::new(Mutex::new(spec.final_path.clone()));
+        run_stream(
+            spec,
+            Arc::new(AtomicBool::new(false)),
+            Pace::unlimited(),
+            final_path.clone(),
+            tx,
+        )
+        .await;
+        let (mut named, mut finished, mut failure) = (None, None, None);
+        while let Ok(e) = rx.try_recv() {
+            match e {
+                Event::Probed { file_name, .. } => named = named.or(file_name),
+                Event::Finished { size, .. } => finished = Some(size),
+                Event::Failed { error, .. } => failure = Some(error),
+                _ => {}
+            }
+        }
+        assert_eq!(failure, None);
+        assert_eq!(finished, Some(8));
+        assert_eq!(named.as_deref(), Some("out.aac"));
+        assert_eq!(
+            *final_path.lock().unwrap(),
+            dir.join("out.aac").to_string_lossy()
+        );
+        assert_eq!(std::fs::read(dir.join("out.aac")).unwrap(), b"AAAABBBB");
+        assert!(!dir.join("out.mp4").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live recorder's supervision is idle-based, as the library's is:
+    /// a segment that keeps delivering is never abandoned for being slow.
+    #[tokio::test]
+    async fn a_slow_but_moving_live_segment_is_not_abandoned() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+        let idle = std::time::Duration::from_millis(200);
+        // Forty ticks of 10 ms: twice the idle allowance end to end, never
+        // idle for a twentieth of it.
+        let trickle = async move {
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(40)
+        };
+        let got = supervised(trickle, &counter, idle, std::time::Duration::from_secs(30)).await;
+        assert_eq!(got.unwrap(), 40);
+    }
+
+    #[tokio::test]
+    async fn a_live_segment_that_stops_moving_is_abandoned() {
+        let counter = AtomicU64::new(0);
+        let idle = std::time::Duration::from_millis(100);
+        let silent = std::future::pending::<std::io::Result<u64>>();
+        let e = supervised(silent, &counter, idle, std::time::Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("stalled"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_dripping_live_segment_meets_the_ceiling() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+        let drip = async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let e = supervised(
+            drip,
+            &counter,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("abandoned"), "{e}");
+    }
+
     fn test_key() -> [u8; 16] {
         use std::collections::hash_map::RandomState;
         use std::hash::{BuildHasher, Hasher};
@@ -7004,18 +7371,11 @@ pub async fn probe_stream(
     let route = crate::proxy::active();
     let connector = connector_for(route.socks())?;
     let cap = hya_stream::hls::playlist_cap();
-    let body = stream_get(
-        &connector,
-        &url,
-        cookies.as_deref(),
-        None,
-        &user_agent,
-        &route,
-        cap,
-    )
-    .await
-    .map_err(|e| format!("could not read the manifest: {e}"))?;
-    let text = String::from_utf8_lossy(&body).into_owned();
+    let session = StreamSession::new(&url, cookies, None, user_agent);
+    let body = stream_get(&connector, &url, &session, &route, cap)
+        .await
+        .map_err(|e| format!("could not read the manifest: {e}"))?;
+    let text = manifest_text(&body);
 
     if text.contains("<MPD") {
         let mf = hya_stream::dash::parse(&text, &url);
@@ -7052,18 +7412,16 @@ pub async fn probe_stream(
     let (live, is_ts) = if pl.is_master() {
         match pl.variants.last() {
             Some(cheapest) => {
-                let probe = stream_get(
-                    &connector,
-                    &cheapest.url,
-                    cookies.as_deref(),
-                    None,
-                    &user_agent,
-                    &route,
-                    cap,
-                )
-                .await
-                .ok()
-                .map(|b| hya_stream::hls::parse(&String::from_utf8_lossy(&b), &cheapest.url));
+                let probe = stream_get(&connector, &cheapest.url, &session, &route, cap)
+                    .await
+                    .ok()
+                    .map(|b| {
+                        hya_stream::hls::parse_with_variables(
+                            &String::from_utf8_lossy(&b),
+                            &cheapest.url,
+                            &pl.variables,
+                        )
+                    });
                 match probe {
                     Some(p) => (
                         p.live,
@@ -8097,5 +8455,78 @@ mod probe_link_tests {
 
         let named = probe(port, "/token/video/clip.mp4");
         assert_eq!(named.file_name.as_deref(), Some("clip.mp4"));
+    }
+
+    /// The extension assembled the cookies for the manifest's host. A CDN
+    /// on another host serving the segments must not receive them — the
+    /// referer and agent travel everywhere, the session only home.
+    #[test]
+    fn a_streams_cookies_go_only_to_the_manifests_host() {
+        let session = super::StreamSession::new(
+            "https://Video.Example/live/master.m3u8",
+            Some("sid=s3cr3t".into()),
+            Some("https://video.example/watch".into()),
+            "hydra-test/1".into(),
+        );
+        let route = crate::proxy::Route::direct();
+        let target = |url: &str| {
+            super::stream_target(&hya_stream::Segment::new(url), &session, &route).unwrap()
+        };
+
+        let home = target("https://video.example/live/seg1.ts");
+        assert!(home.headers.iter().any(|h| h == "Cookie: sid=s3cr3t"));
+        assert!(home
+            .headers
+            .iter()
+            .any(|h| h == "Referer: https://video.example/watch"));
+
+        let cdn = target("https://cdn-edge.example/live/seg1.ts");
+        assert!(
+            !cdn.headers.iter().any(|h| h.starts_with("Cookie:")),
+            "another host got the session: {:?}",
+            cdn.headers
+        );
+        assert!(cdn
+            .headers
+            .iter()
+            .any(|h| h == "Referer: https://video.example/watch"));
+        assert_eq!(cdn.agent.as_deref(), Some("hydra-test/1"));
+
+        // A manifest that does not parse scopes the cookies to nowhere.
+        let unknown = super::StreamSession::new(
+            "not a url",
+            Some("sid=1".into()),
+            None,
+            "hydra-test/1".into(),
+        );
+        let t = super::stream_target(
+            &hya_stream::Segment::new("https://video.example/a.ts"),
+            &unknown,
+            &route,
+        )
+        .unwrap();
+        assert!(!t.headers.iter().any(|h| h.starts_with("Cookie:")));
+    }
+
+    /// Some origins put a byte-order mark before `#EXTM3U`; `trim_start`
+    /// does not remove it, and the manifest was refused as "not a manifest".
+    #[test]
+    fn a_byte_order_mark_does_not_hide_the_manifest_tag() {
+        let text = super::manifest_text("\u{feff}#EXTM3U\n#EXT-X-VERSION:3\n".as_bytes());
+        assert!(text.starts_with("#EXTM3U"));
+        assert_eq!(super::manifest_text(b"  #EXTM3U"), "  #EXTM3U");
+    }
+
+    /// A 50 KB file is one request; the connection count grows with the
+    /// object, one per 256 KiB, and the user's ceiling still applies.
+    #[test]
+    fn small_objects_take_fewer_connections() {
+        use super::conns_for_size;
+        assert_eq!(conns_for_size(0), 1);
+        assert_eq!(conns_for_size(50 * 1024), 1);
+        assert_eq!(conns_for_size(512 * 1024 - 1), 1);
+        assert_eq!(conns_for_size(512 * 1024), 2);
+        assert_eq!(conns_for_size(8 * 256 * 1024), 8);
+        assert_eq!(8usize.clamp(1, 32).min(conns_for_size(u64::MAX)), 8);
     }
 }

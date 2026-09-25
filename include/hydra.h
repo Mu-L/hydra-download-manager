@@ -1726,8 +1726,12 @@ hydra_error_code_t hydra_engine_shutdown(hydra_engine_t *engine,
  * same engine, and the handle must not be used afterwards. Passing NULL is a
  * no-op.
  *
- * Thread-safe with respect to *other* engines. Blocking for up to a few hundred
- * milliseconds while runtime threads are joined.
+ * Thread-safe with respect to *other* engines. **Blocking**: up to about half a
+ * second while runtime threads are joined, and up to two seconds more for the
+ * emergency shutdown when hydra_engine_shutdown was not called first. A
+ * callback still executing on an engine thread past that grace period is left
+ * to finish on its own; nothing inside the library is freed underneath it, but
+ * `user_data` is yours to keep alive until it returns.
  *
  * # Safety
  *
@@ -2311,6 +2315,12 @@ hydra_error_code_t hydra_event_set_callback(hydra_engine_t *engine,
  *
  * `max_level` is one of hydra_log_level_t; messages above it are discarded
  * before they are formatted. Pass NULL as `callback` to clear.
+ *
+ * The callback runs on whichever engine thread produced the message, with the
+ * sink held so that clearing it is synchronous: once a call that passes NULL
+ * returns, no delivery is in flight and `user_data` may be freed. The price is
+ * that the callback **must not call back into the engine** — in particular not
+ * this function — and should return quickly.
  *
  * **`user_data` is never owned by hydra and is never freed by hydra.** It is
  * stored, never dereferenced, and handed back to your function verbatim. It

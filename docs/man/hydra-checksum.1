@@ -97,11 +97,12 @@ reported as a pass.
 .B \-\-json
 Machine-readable output.
 .TP
-.B \-\-sidecars
-Also try sidecar and manifest files, not just headers (one extra request
-each).
-On by default, and see
-.BR BUGS .
+.B \-\-no\-sidecars
+Read only the response headers; skip the
+.B .sha256\-style
+sidecar and
+.B SHA256SUMS
+lookups that otherwise cost one request each.
 .TP
 .B \-\-download\-if\-needed
 Compute the digest by streaming the body when nothing is advertised.
@@ -186,13 +187,8 @@ hydra checksum \-\-json \-\-download\-if\-needed URL | jq '.objects[0]'
 .RE
 .
 .SH BUGS
-.B \-\-sidecars
-is on by default and this release provides no way to switch it off.
-It is declared as taking no value, so
-.B "\-\-sidecars false"
-prints a parse complaint about
-.BR false ,
-then proceeds with sidecars enabled.
+A run with no URL is a usage error (exit 2); earlier releases printed nothing
+and exited 0.
 .
 .SH SEE ALSO
 .BR hydra (1),

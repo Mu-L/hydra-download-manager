@@ -356,7 +356,7 @@ pub fn view(app: &App) -> El<'_> {
                 start_label(item.map(|d| d.state), item.map_or(0, |d| d.downloaded)),
                 Some(Message::FiStartDownload),
             ),
-            dlg_btn_primary(tr("OK"), Some(Message::FiDownloadLater)),
+            dlg_btn_primary(tr("OK"), Some(Message::FiOk)),
         ]
         .spacing(GAP)
         .into()

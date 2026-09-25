@@ -157,7 +157,66 @@ fn parse_header(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
+/// `--limit-rate` at parse time: a cap the user asked for and did not get can
+/// saturate a metered link, and `0.5`, `NaN` or `-1` are all "no cap" in disguise.
+fn parse_limit_rate(s: &str) -> Result<String, String> {
+    match parse_rate(s) {
+        Some(n) if n >= 1 => Ok(s.to_string()),
+        _ => Err(format!(
+            "--limit-rate {s:?} is not a rate of at least one byte per second (try 500k, 2M)"
+        )),
+    }
+}
+
+/// A byte count with an optional k/M/G suffix, as `--max-filesize` takes it.
+fn parse_size(s: &str) -> Result<u64, String> {
+    parse_rate(s).ok_or_else(|| format!("{s:?} is not a size (try 500k, 10M, 2G)"))
+}
+
+/// A non-negative, finite number of seconds.
+fn parse_seconds(s: &str) -> Result<f64, String> {
+    match s.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        _ => Err(format!("{s:?} is not a number of seconds")),
+    }
+}
+
+/// Container for a downloaded stream.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Container {
+    /// MP4, remuxed through ffmpeg when the segments are MPEG-TS.
+    Mp4,
+    /// The assembled MPEG transport stream, no ffmpeg needed.
+    Ts,
+}
+
+impl Container {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Container::Mp4 => "mp4",
+            Container::Ts => "ts",
+        }
+    }
+}
+
+impl std::fmt::Display for Container {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl Cli {
+    /// The `Authorization: Basic` line `--user`/`--password` ask for, if any.
+    pub fn basic_auth_header(&self) -> Option<String> {
+        let spec = self.user.as_deref()?;
+        let (user, pass) = match (spec.split_once(':'), self.password.as_deref()) {
+            (_, Some(p)) => (spec, p),
+            (Some((u, p)), None) => (u, p),
+            (None, None) => (spec, ""),
+        };
+        Some(crate::url::basic_auth_line(user, pass))
+    }
+
     /// The `--metalink-*` flags, as the selection the resolver takes.
     pub fn metalink_selection(&self) -> crate::metalink::Selection {
         crate::metalink::Selection {
@@ -311,6 +370,10 @@ pub enum UrlMode {
 #[command(
     name = "hydra",
     version,
+    // wget and curl both take the last of a repeated valued flag (`-o a -o b`),
+    // and so does every wrapper that prepends its own flags to a command the
+    // user already wrote. Refusing the repeat fails scripts the real tools run.
+    args_override_self = true,
     // GPL-3.0 section 5(a) wants a distributed binary to state its own terms, and
     // the release profile strips symbols, so a user handed just the binary has no
     // other way to learn them. `--version` carries the notice in the GNU form
@@ -381,8 +444,8 @@ pub struct Cli {
     ///
     /// MPEG-TS segments become MP4 through ffmpeg when it is installed;
     /// without it, ask for `ts` and get the assembled transport stream.
-    #[arg(long = "container", value_name = "FMT", default_value = "mp4")]
-    pub container: String,
+    #[arg(long = "container", value_name = "FMT", default_value_t = Container::Mp4)]
+    pub container: Container,
 
     /// Report what the server says about a URL, then exit.
     ///
@@ -418,7 +481,11 @@ pub struct Cli {
     /// A live stream has no end of its own, so without this the only way to
     /// stop is Ctrl-C. Either way the result is a complete, playable file —
     /// stopping a recording is not an interruption, it is the end of it.
-    #[arg(long = "record-seconds", value_name = "SECONDS")]
+    #[arg(
+        long = "record-seconds",
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub record_seconds: Option<u64>,
 
     /// Write output to this file (`-O`).
@@ -429,8 +496,16 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue")]
     pub resume: bool,
 
-    /// Connections per source (`-x`). Omit to measure the useful number.
-    #[arg(short = 'x', long = "max-connection-per-server", value_name = "N")]
+    /// Connections per source (`-x`). Omit to open the politeness budget.
+    ///
+    /// Small objects are never split this finely: at most one connection per
+    /// 256 KiB of object, unless `--mirrors` names the sources explicitly.
+    #[arg(
+        short = 'x',
+        long = "max-connection-per-server",
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4096)
+    )]
     pub connections: Option<usize>,
 
     /// Alias for -x.
@@ -438,15 +513,25 @@ pub struct Cli {
     /// Declared here rather than translated by the compat layer: native long
     /// options pass through untouched, so the parser is the single place that
     /// defines the native namespace.
-    #[arg(short = 's', long = "split", value_name = "N")]
+    #[arg(
+        short = 's',
+        long = "split",
+        value_name = "N",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4096)
+    )]
     pub split: Option<usize>,
 
     /// Cap the aggregate transfer rate, e.g. 500k, 2M (`--limit-rate`).
-    #[arg(long = "limit-rate", value_name = "RATE")]
+    #[arg(long = "limit-rate", value_name = "RATE", value_parser = parse_limit_rate)]
     pub limit_rate: Option<String>,
 
     /// Total connections across all hosts.
-    #[arg(long = "max-total-connections", value_name = "N", default_value_t = DEFAULT_TOTAL)]
+    #[arg(
+        long = "max-total-connections",
+        value_name = "N",
+        default_value_t = DEFAULT_TOTAL,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4096)
+    )]
     pub max_total: usize,
 
     /// One connection per host, for volunteer mirrors.
@@ -542,16 +627,32 @@ pub struct Cli {
     )]
     pub user_agent: String,
 
-    /// Retries per range before giving up on a source (`--tries`).
-    #[arg(short = 't', long = "tries", value_name = "N", default_value_t = 4)]
+    /// Attempts per range request before a source is given up on (`-t`).
+    ///
+    /// Governs the byte-range fetches, the resume prefix check and chunk
+    /// repair. The probe (HEAD and redirects) is made once; a failure there
+    /// is reported, not retried.
+    #[arg(
+        short = 't',
+        long = "tries",
+        value_name = "N",
+        default_value_t = 4,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub tries: u32,
 
-    /// Per-request timeout in seconds (`--timeout`).
+    /// Seconds a single request may take to connect and answer (`-T`).
+    ///
+    /// Applies to the probe, to every byte-range request, to the resume
+    /// prefix check and to chunk repair. It is a per-request limit, not a
+    /// cap on the whole transfer. `--connect-timeout` tightens the probe
+    /// alone.
     #[arg(
         long = "timeout",
         short = 'T',
         value_name = "SECS",
-        default_value_t = 30.0
+        default_value_t = 30.0,
+        value_parser = parse_seconds
     )]
     pub timeout: f64,
 
@@ -570,7 +671,11 @@ pub struct Cli {
     pub chunk_digests: Option<PathBuf>,
 
     /// Chunk grid for --emit-manifest, in bytes (default 4 MiB).
-    #[arg(long = "chunk-size", value_name = "BYTES")]
+    #[arg(
+        long = "chunk-size",
+        value_name = "BYTES",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub chunk_size: Option<u64>,
 
     /// Verify the finished file, e.g. --checksum sha256:abc...
@@ -585,7 +690,6 @@ pub struct Cli {
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Machine-readable result on stdout.
     /// How to treat several URLs on one command line.
     ///
     /// The default changed to `same` because treating extra URLs as MIRRORS is the
@@ -634,7 +738,7 @@ pub struct Cli {
     /// cannot be piped to a parser. Human progress, the summary line, and the format
     /// hint move to stderr-suppressed silence rather than being interleaved with the
     /// document — `hydra --json <url> | jq .size` has to work.
-    #[arg(long = "json")]
+    #[arg(long = "json", conflicts_with = "stdout")]
     pub json: bool,
 
     /// Suppress the live progress display but keep summaries.
@@ -675,11 +779,14 @@ pub struct Cli {
     #[arg(long = "stdout")]
     pub stdout: bool,
 
-    /// Name the output from the URL's last path component.
+    /// Name the output from the URL's last path component (curl's `-O`).
+    ///
+    /// Already the default when no `-O FILE` is given; accepted so curl
+    /// scripts run unchanged.
     #[arg(long = "remote-name")]
     pub remote_name: bool,
 
-    /// Skip the download if the output file already exists (`-nc`).
+    /// Skip the download if the output file already exists (wget's `-nc`).
     #[arg(long = "no-clobber")]
     pub no_clobber: bool,
 
@@ -687,7 +794,7 @@ pub struct Cli {
     #[arg(long = "create-dirs")]
     pub create_dirs: bool,
 
-    /// Directory to save into (`-P`).
+    /// Directory to save into (`-P`). Created when it does not exist.
     #[arg(long = "output-dir", short = 'P', value_name = "DIR")]
     pub output_dir: Option<PathBuf>,
 
@@ -729,7 +836,10 @@ pub struct Cli {
     #[arg(long = "start-pos", value_name = "OFFSET")]
     pub start_pos: Option<u64>,
 
-    /// Exit non-zero on an HTTP error without writing a file (`--fail`).
+    /// Exit non-zero on an HTTP error without writing a file (curl's `-f`).
+    ///
+    /// Already the default: an error status from the probe is reported and
+    /// nothing is written. Accepted so curl scripts run unchanged.
     #[arg(long = "fail")]
     pub fail: bool,
 
@@ -737,11 +847,11 @@ pub struct Cli {
     #[arg(long = "show-error")]
     pub show_error: bool,
 
-    /// Force the progress display on, even when not a terminal (`--show-progress`).
+    /// Draw the progress display even when stdout is not a terminal.
     #[arg(long = "show-progress")]
     pub show_progress: bool,
 
-    /// Reduce output without silencing it (`-nv`).
+    /// Drop the progress display but keep the summary line (wget's `-nv`).
     #[arg(long = "no-verbose")]
     pub no_verbose: bool,
 
@@ -749,7 +859,7 @@ pub struct Cli {
     #[arg(long = "logfile", short = 'o', value_name = "FILE")]
     pub logfile: Option<PathBuf>,
 
-    /// Append to the log file instead of truncating (`-a`).
+    /// Append to this log file instead of truncating it (wget's `-a`).
     #[arg(long = "logfile-append", value_name = "FILE")]
     pub logfile_append: Option<PathBuf>,
 
@@ -757,11 +867,15 @@ pub struct Cli {
     #[arg(long = "remote-time", short = 'N')]
     pub remote_time: bool,
 
-    /// Name the output from a Content-Disposition header.
+    /// Name the output from the server's Content-Disposition header (curl's `-J`).
+    ///
+    /// Without it the name comes from the URL, as wget and curl do by default.
+    /// An explicit `-O` always wins.
     #[arg(long = "content-disposition")]
     pub content_disposition: bool,
 
-    /// Follow redirects (`-L`). On by default; the flag exists for scripts.
+    /// Follow redirects (curl's `-L`). Always on; `--max-redirs` bounds it.
+    /// Accepted so curl scripts run unchanged.
     #[arg(long = "location", short = 'L')]
     pub location: bool,
 
@@ -769,11 +883,12 @@ pub struct Cli {
     #[arg(long = "max-redirs", value_name = "N", default_value_t = 8)]
     pub max_redirs: u32,
 
-    /// Refuse an object larger than this many bytes (`--max-filesize`).
-    #[arg(long = "max-filesize", value_name = "BYTES")]
+    /// Refuse an object larger than this, e.g. 500k, 10M (`--max-filesize`).
+    #[arg(long = "max-filesize", value_name = "BYTES", value_parser = parse_size)]
     pub max_filesize: Option<u64>,
 
-    /// Proxy to use. Defaults to $http_proxy / $all_proxy.
+    /// Proxy to use. Defaults to $http_proxy, $https_proxy or $all_proxy,
+    /// with $no_proxy exempting hosts.
     ///
     /// Accepts `http://`, `socks4://`, `socks4a://`, `socks5://`, and `socks5h://`,
     /// with optional `user:pass@` credentials. SOCKS is a different mechanism, not a
@@ -804,17 +919,29 @@ pub struct Cli {
     #[arg(long = "ipv6", short = '6', conflicts_with = "ipv4")]
     pub ipv6: bool,
 
-    /// Seconds to wait between retries (`--retry-delay`).
-    #[arg(long = "retry-delay", value_name = "SECS", default_value_t = 0.5)]
-    pub retry_delay: f64,
-
-    /// Seconds to wait between separate URLs (`--wait`).
-    #[arg(long = "wait", value_name = "SECS", default_value_t = 0.0)]
+    /// Seconds to pause between separate URLs (wget's `--wait`).
+    ///
+    /// Implies `--mode queue`: a pause between transfers only means
+    /// something when they run one after another.
+    #[arg(long = "wait", value_name = "SECS", default_value_t = 0.0, value_parser = parse_seconds)]
     pub wait: f64,
 
-    /// Connection timeout in seconds.
-    #[arg(long = "connect-timeout", value_name = "SECS")]
+    /// Seconds the probe (connect, HEAD, redirects) may take. Defaults to
+    /// `--timeout`.
+    #[arg(long = "connect-timeout", value_name = "SECS", value_parser = parse_seconds)]
     pub connect_timeout: Option<f64>,
+
+    /// HTTP Basic credentials, `USER:PASSWORD` or just `USER` with
+    /// `--password` (curl's `-u`, wget's `--user`).
+    ///
+    /// `http://user:pass@host/` in the URL means the same thing. Sent to the
+    /// host named on the command line and dropped on a redirect elsewhere.
+    #[arg(long = "user", short = 'u', value_name = "USER[:PASSWORD]")]
+    pub user: Option<String>,
+
+    /// Password for `--user` (wget's `--password`).
+    #[arg(long = "password", value_name = "PASSWORD", requires = "user")]
+    pub password: Option<String>,
 
     /// Read URLs from a file, one per line (`--input-file`).
     #[arg(long = "input-file", value_name = "FILE")]
@@ -828,12 +955,18 @@ pub struct Cli {
     #[arg(long = "etag-save", value_name = "FILE")]
     pub etag_save: Option<PathBuf>,
 
-    /// Retrieve several URLs concurrently (`-Z`). Distinct objects, not mirrors.
+    /// Retrieve several URLs concurrently (curl's `-Z`). Already the default
+    /// (`--mode same`); accepted so curl scripts run unchanged.
     #[arg(long = "parallel", short = 'Z')]
     pub parallel: bool,
 
-    /// Maximum concurrent transfers with --parallel.
-    #[arg(long = "parallel-max", value_name = "N", default_value_t = 4)]
+    /// Most URLs transferring at once under `--mode same`.
+    #[arg(
+        long = "parallel-max",
+        value_name = "N",
+        default_value_t = 4,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=4096)
+    )]
     pub parallel_max: usize,
 
     /// Sort the finished file into a per-category subdirectory (Video, Music,
@@ -1035,7 +1168,7 @@ pub enum Command {
     /// which is the fast way to answer "is my copy current?" without refetching.
     Checksum {
         /// Object to inspect.
-        #[arg(value_name = "URL")]
+        #[arg(value_name = "URL", required = true)]
         urls: Vec<String>,
 
         /// Compare this local file against the advertised digest.
@@ -1046,9 +1179,10 @@ pub enum Command {
         #[arg(long = "json")]
         json: bool,
 
-        /// Also try sidecar and manifest files, not just headers (one extra request each).
-        #[arg(long = "sidecars", default_value_t = true)]
-        sidecars: bool,
+        /// Read only the response headers; skip the `.sha256`-style sidecar
+        /// and `SHA256SUMS` lookups that otherwise cost one request each.
+        #[arg(long = "no-sidecars")]
+        no_sidecars: bool,
 
         /// Compute the digest by streaming the body when nothing is advertised.
         ///
@@ -1375,6 +1509,78 @@ mod tests {
         assert!(parse_checksum("").is_err());
     }
 
+    /// A count of zero, a fractional rate or a bogus duration is a usage
+    /// error, never a silent one.
+    #[test]
+    fn nonsense_numbers_are_refused_at_parse_time() {
+        for argv in [
+            vec!["hydra", "-x", "0", "http://x/f"],
+            vec!["hydra", "-s", "0", "http://x/f"],
+            vec!["hydra", "--max-total-connections", "0", "http://x/f"],
+            vec!["hydra", "--parallel-max", "0", "http://x/f"],
+            vec!["hydra", "--chunk-size", "0", "http://x/f"],
+            vec!["hydra", "--record-seconds", "0", "http://x/f"],
+            vec!["hydra", "--tries", "0", "http://x/f"],
+            vec!["hydra", "--limit-rate", "0.5", "http://x/f"],
+            vec!["hydra", "--limit-rate", "NaN", "http://x/f"],
+            vec!["hydra", "--limit-rate", "-3k", "http://x/f"],
+            vec!["hydra", "--limit-rate", "0", "http://x/f"],
+            vec!["hydra", "--timeout", "nope", "http://x/f"],
+            vec!["hydra", "--timeout", "-1", "http://x/f"],
+            vec!["hydra", "--container", "mkv", "http://x/f"],
+            vec!["hydra", "--max-filesize", "big", "http://x/f"],
+            vec!["hydra", "--json", "--stdout", "http://x/f"],
+            vec!["hydra", "--password", "pw", "http://x/f"],
+            vec!["hydra", "checksum"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "{argv:?} must be a usage error"
+            );
+        }
+        let ok = Cli::try_parse_from(["hydra", "--max-filesize", "10M", "http://x/f"]).unwrap();
+        assert_eq!(ok.max_filesize, Some(10 << 20));
+        let ts = Cli::try_parse_from(["hydra", "--container", "ts", "http://x/f"]).unwrap();
+        assert_eq!(ts.container, Container::Ts);
+        let ck = Cli::try_parse_from(["hydra", "checksum", "--no-sidecars", "http://x/f"]).unwrap();
+        assert!(matches!(
+            ck.command,
+            Some(Command::Checksum {
+                no_sidecars: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_repeated_valued_flag_takes_the_last_value() {
+        let c = Cli::try_parse_from(["hydra", "-O", "a", "-O", "b", "http://x/f"]).unwrap();
+        assert_eq!(c.output.unwrap().to_str().unwrap(), "b");
+    }
+
+    #[test]
+    fn user_and_password_become_one_basic_header() {
+        let both = Cli::try_parse_from(["hydra", "-u", "alice:secret", "http://x/f"]).unwrap();
+        assert_eq!(
+            both.basic_auth_header().as_deref(),
+            Some("Authorization: Basic YWxpY2U6c2VjcmV0")
+        );
+        let split = Cli::try_parse_from([
+            "hydra",
+            "--user",
+            "alice",
+            "--password",
+            "secret",
+            "http://x/f",
+        ])
+        .unwrap();
+        assert_eq!(split.basic_auth_header(), both.basic_auth_header());
+        assert!(Cli::try_parse_from(["hydra", "http://x/f"])
+            .unwrap()
+            .basic_auth_header()
+            .is_none());
+    }
+
     #[test]
     fn wget_style_flags_parse() {
         let c = Cli::try_parse_from([
@@ -1554,9 +1760,8 @@ mod tests {
 
     #[test]
     fn bad_rate_limit_is_an_error_not_a_silent_unlimited() {
-        let c = Cli::try_parse_from(["hydra", "--limit-rate", "fast", "http://x/f"]).unwrap();
         assert!(
-            c.rate_limit().is_err(),
+            Cli::try_parse_from(["hydra", "--limit-rate", "fast", "http://x/f"]).is_err(),
             "silently ignoring a cap can saturate a metered link"
         );
         let ok = Cli::try_parse_from(["hydra", "--limit-rate", "1.5M", "http://x/f"]).unwrap();

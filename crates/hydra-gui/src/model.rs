@@ -185,6 +185,24 @@ pub struct StreamInfo {
     pub max_seconds: Option<u64>,
 }
 
+impl StreamInfo {
+    /// The extension the finished file is named with, from the container
+    /// asked for. The engine corrects it once the playlist has said what the
+    /// segments are — a packed audio stream is neither `mp4` nor `ts`.
+    pub fn ext(&self) -> &'static str {
+        container_ext(&self.container)
+    }
+}
+
+/// `ts` or `mp4`, whichever way the container was spelled.
+pub fn container_ext(container: &str) -> &'static str {
+    if container.eq_ignore_ascii_case("ts") {
+        "ts"
+    } else {
+        "mp4"
+    }
+}
+
 /// One mirror from a Metalink document, as the engine will use it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct MirrorRef {
@@ -724,14 +742,14 @@ impl PowerAction {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteLogin {
     pub site: String,
     pub user: String,
     pub pass: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoundRow {
     pub event: String,
     pub enabled: bool,
@@ -981,8 +999,6 @@ pub struct Settings {
     /// Ignored without `--config`. See [`crate::nmhost::ensure_registered`].
     pub portable_capture: bool,
     pub dont_start_sites: String,
-    pub addr_exceptions: Vec<String>,
-    pub show_exception_dialog: bool,
     // Save to tab
     pub remember_last_dir: bool,
     pub server_file_date: bool,
@@ -1049,7 +1065,6 @@ pub struct Settings {
     /// What that address speaks. Configs written before the setting existed
     /// deserialize as `Http`, which is what they were treated as.
     pub proxy_type: ProxyType,
-    pub ftp_pasv: bool,
     // Sites logins
     pub logins: Vec<SiteLogin>,
     // Sounds
@@ -1131,8 +1146,6 @@ impl Default for Settings {
             ai_formats_seeded: true,
             portable_capture: false,
             dont_start_sites: "*.update.microsoft.com download.windowsupdate.com".into(),
-            addr_exceptions: vec![],
-            show_exception_dialog: true,
             remember_last_dir: true,
             server_file_date: false,
             no_category_dirs: false,
@@ -1165,7 +1178,6 @@ impl Default for Settings {
             proxy_user: String::new(),
             proxy_pass: String::new(),
             proxy_type: ProxyType::default(),
-            ftp_pasv: false,
             logins: vec![],
             sounds: [
                 "Download complete",
@@ -1223,6 +1235,143 @@ impl Settings {
         let cap = self.global_limit();
         self.speed_profiles.iter().position(|p| p.limit == cap)
     }
+
+    /// Fold an accepted Options draft into the live settings.
+    ///
+    /// Three-way, not a copy: `base` is what the dialog opened on, and only
+    /// a field the dialog actually changed is taken from `draft`. Everything
+    /// else keeps its current value, so a window moved, a column resized or
+    /// a toolbar toggle flipped while the dialog was up is not undone by OK.
+    pub fn apply_options_draft(&mut self, base: &Settings, draft: &Settings) {
+        macro_rules! take_changed {
+            ($($field:ident),* $(,)?) => {
+                $( if draft.$field != base.$field {
+                    self.$field = draft.$field.clone();
+                } )*
+            };
+        }
+        take_changed!(
+            launch_on_startup,
+            check_updates_on_startup,
+            beta_channel,
+            start_in_tray,
+            close_to_tray,
+            power_save,
+            hide_from_taskbar,
+            gpu_render,
+            monitor_clipboard,
+            capture_browsers,
+            auto_types,
+            portable_capture,
+            dont_start_sites,
+            remember_last_dir,
+            server_file_date,
+            no_category_dirs,
+            show_file_info_dialog,
+            bg_download,
+            start_minimized,
+            show_speed_tab,
+            show_completion_tab,
+            show_hide_buttons,
+            show_conn_details,
+            show_complete_dialog,
+            remove_completed,
+            user_agent,
+            virus_scanner,
+            virus_args,
+            cookies_from_browser,
+            default_conns,
+            adaptive_conns,
+            conn_exceptions,
+            dl_limit_enabled,
+            dl_limit_mb,
+            dl_limit_hours,
+            warn_before_stop,
+            proxy_mode,
+            proxy_script,
+            proxy_host,
+            proxy_port,
+            proxy_user,
+            proxy_pass,
+            proxy_type,
+            logins,
+            sounds,
+            global_speed_limit,
+            speed_limiter_on,
+            speed_profiles,
+        );
+    }
+}
+
+/// A wall-clock minute typed into the Scheduler, as `(hour, minute)`.
+///
+/// `9:00`, `21:0` and `9.00` all name a minute; the box is not a form to
+/// fill in to the digit. Anything that is not two numbers in range is `None`.
+pub fn parse_hhmm(s: &str) -> Option<(u8, u8)> {
+    let (h, m) = s.trim().split_once([':', '.'])?;
+    let h: u8 = h.trim().parse().ok()?;
+    let m: u8 = m.trim().parse().ok()?;
+    (h < 24 && m < 60).then_some((h, m))
+}
+
+/// The canonical `HH:MM` spelling of a typed minute, or the text as typed
+/// when it does not parse — the field then shows what is wrong instead of
+/// quietly holding a value nothing will ever match.
+pub fn normalize_hhmm(s: &str) -> String {
+    match parse_hhmm(s) {
+        Some((h, m)) => format!("{h:02}:{m:02}"),
+        None => s.to_string(),
+    }
+}
+
+/// A shortcut as typed, in the one spelling a key press produces:
+/// `cmd`, then `shift`, then `alt`, then a single character, lowercase.
+///
+/// `None` for anything a press can never match — no command modifier, a
+/// multi-character base, an unknown modifier — so the dialog can say so
+/// rather than store a combo that silently never fires.
+pub fn normalize_combo(typed: &str) -> Option<String> {
+    let mut parts: Vec<String> = typed
+        .split('+')
+        .map(|p| p.trim().to_ascii_lowercase())
+        .collect();
+    let base = parts.pop()?;
+    if base.chars().count() != 1 {
+        return None;
+    }
+    let (mut cmd, mut shift, mut alt) = (false, false, false);
+    for part in parts {
+        match part.as_str() {
+            "cmd" | "command" | "ctrl" | "control" | "meta" | "super" => cmd = true,
+            "shift" => shift = true,
+            "alt" | "option" => alt = true,
+            _ => return None,
+        }
+    }
+    if !cmd {
+        return None;
+    }
+    let mut combo = String::from("cmd+");
+    if shift {
+        combo.push_str("shift+");
+    }
+    if alt {
+        combo.push_str("alt+");
+    }
+    combo.push_str(&base);
+    Some(combo)
+}
+
+/// `"{base} N"` for the smallest N no queue already carries.
+///
+/// Queues are addressed by name everywhere, so a new one must never come out
+/// with a name in use — which `len() + 1` did the moment a queue had been
+/// deleted from the middle.
+pub fn free_queue_name(queues: &[QueueDef], base: &str) -> String {
+    (1..)
+        .map(|n| format!("{base} {n}"))
+        .find(|name| !queues.iter().any(|q| q.name == *name))
+        .expect("the naturals are never exhausted")
 }
 
 /// What the Scheduler's two number fields accept, whether they are typed
@@ -1355,10 +1504,7 @@ pub fn pick_queue_color(existing: &[QueueDef]) -> u32 {
     };
     // Enough randomness for a colour: the nanosecond clock, not a crypto
     // source, and no dependency for it.
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as usize)
-        .unwrap_or(0);
+    let seed = crate::fmt::since_epoch().subsec_nanos() as usize;
     pool[seed % pool.len()]
 }
 
@@ -1846,6 +1992,17 @@ pub fn save_quota(q: &DlQuota) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stream_is_named_for_the_container_however_it_was_spelled() {
+        for (container, ext) in [("TS", "ts"), ("ts", "ts"), ("MP4", "mp4"), ("", "mp4")] {
+            assert_eq!(super::container_ext(container), ext);
+            let si = super::StreamInfo {
+                container: container.into(),
+                ..super::StreamInfo::default()
+            };
+            assert_eq!(si.ext(), ext);
+        }
+    }
     /// The load-bearing half of the migration flag.
     ///
     /// `Settings` carries `#[serde(default)]`, which fills a missing field
@@ -2534,5 +2691,118 @@ mod tests {
         migrate_columns(&mut s);
         assert_eq!(order(&s.columns), order(&stock()));
         assert!(s.columns.iter().all(|p| p.visible));
+    }
+
+    /// The reported bug: Options was open while the window was moved and
+    /// a column hidden, and OK put both back. Only what the dialog changed
+    /// may be written; what changed elsewhere meanwhile stays.
+    #[test]
+    fn accepting_the_options_draft_keeps_what_changed_outside_the_dialog() {
+        let base = Settings::default();
+        let mut draft = base.clone();
+        draft.user_agent = "curl/8".into();
+        draft.show_speed_tab = false;
+
+        let mut live = base.clone();
+        // Changed elsewhere while the dialog was up.
+        live.window_pos = Some((10.0, 20.0));
+        live.show_toolbar_labels = false;
+        live.speed_limiter_on = true;
+        live.global_speed_limit = Some(128 * 1024);
+        live.bg_download = false;
+
+        live.apply_options_draft(&base, &draft);
+
+        assert_eq!(live.user_agent, "curl/8");
+        assert!(!live.show_speed_tab);
+        assert_eq!(live.window_pos, Some((10.0, 20.0)));
+        assert!(!live.show_toolbar_labels);
+        assert!(live.speed_limiter_on, "the toolbar's toggle survives");
+        assert_eq!(live.global_speed_limit, Some(128 * 1024));
+        assert!(!live.bg_download, "File Info's tick survives");
+    }
+
+    /// A field the dialog DID change wins over one changed elsewhere: the
+    /// draft is what the user pressed OK on.
+    #[test]
+    fn a_field_edited_in_the_dialog_wins_over_a_toolbar_change() {
+        let base = Settings::default();
+        let mut draft = base.clone();
+        draft.speed_limiter_on = true;
+        draft.global_speed_limit = Some(50 * 1024);
+        let mut live = base.clone();
+        live.global_speed_limit = Some(128 * 1024);
+        live.apply_options_draft(&base, &draft);
+        assert!(live.speed_limiter_on);
+        assert_eq!(live.global_speed_limit, Some(50 * 1024));
+    }
+
+    /// The Scheduler used to match the typed text against `%H:%M` exactly,
+    /// so `9:00` never fired. Every sensible spelling of a minute is one.
+    #[test]
+    fn a_typed_time_is_read_as_a_minute_however_it_is_spelled() {
+        assert_eq!(parse_hhmm("9:00"), Some((9, 0)));
+        assert_eq!(parse_hhmm("21:0"), Some((21, 0)));
+        assert_eq!(parse_hhmm("9.00"), Some((9, 0)));
+        assert_eq!(parse_hhmm(" 09:05 "), Some((9, 5)));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("9:60"), None);
+        assert_eq!(parse_hhmm("900"), None);
+        assert_eq!(parse_hhmm(""), None);
+        assert_eq!(normalize_hhmm("9:00"), "09:00");
+        assert_eq!(normalize_hhmm("21:0"), "21:00");
+        assert_eq!(normalize_hhmm("9.00"), "09:00");
+        assert_eq!(
+            normalize_hhmm("nine"),
+            "nine",
+            "what cannot be read is left to be seen"
+        );
+    }
+
+    /// A shortcut is stored in the one spelling a key press produces, or
+    /// refused: modifier order, aliases, and the command modifier that
+    /// every editable combo has to carry.
+    #[test]
+    fn a_typed_shortcut_normalizes_or_is_refused() {
+        assert_eq!(
+            normalize_combo("cmd+shift+v").as_deref(),
+            Some("cmd+shift+v")
+        );
+        assert_eq!(
+            normalize_combo("Shift+Cmd+V").as_deref(),
+            Some("cmd+shift+v")
+        );
+        assert_eq!(
+            normalize_combo("ctrl+alt+shift+r").as_deref(),
+            Some("cmd+shift+alt+r")
+        );
+        assert_eq!(normalize_combo(" CMD + , ").as_deref(), Some("cmd+,"));
+        assert_eq!(normalize_combo("shift+v"), None, "no command modifier");
+        assert_eq!(normalize_combo("cmd+F5"), None, "not a character");
+        assert_eq!(normalize_combo("cmd+hyper+v"), None);
+        assert_eq!(normalize_combo(""), None);
+        for (_, combo, _) in SHORTCUT_ACTIONS {
+            assert_eq!(normalize_combo(combo).as_deref(), Some(combo));
+        }
+    }
+
+    /// Queues are named, and a name must be free. `len() + 1` handed out
+    /// "Queue 3" again after "Queue 2" was deleted from the middle.
+    #[test]
+    fn a_new_queue_takes_the_smallest_free_number() {
+        let q = |name: &str| QueueDef {
+            name: name.into(),
+            files_at_once: 4,
+            schedule: Schedule::default(),
+            builtin: false,
+            color: None,
+            running: false,
+            did_work: false,
+        };
+        assert_eq!(free_queue_name(&[], "Queue"), "Queue 1");
+        let queues = [q("Main download queue"), q("Queue 1"), q("Queue 3")];
+        assert_eq!(free_queue_name(&queues, "Queue"), "Queue 2");
+        let queues = [q("Queue 1"), q("Queue 2")];
+        assert_eq!(free_queue_name(&queues, "Queue"), "Queue 3");
     }
 }

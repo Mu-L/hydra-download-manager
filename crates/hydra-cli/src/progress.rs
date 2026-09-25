@@ -9,7 +9,7 @@
 //! Everything degrades to plain lines when stdout is not a terminal, so piping
 //! to a file or a CI log produces something readable rather than escape soup.
 
-use hya_core::Health;
+use hya_core::{fmt, Health, RateMeter};
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
@@ -47,17 +47,13 @@ pub struct Progress {
     history: Vec<f64>,
     /// Smoothed transfer rate, for the number a human reads.
     ///
-    /// The raw quotient over one ~80 ms redraw interval is an unusably noisy
-    /// estimator: a single TCP window arriving late halves it, and one arriving
-    /// early doubles it, so the figure changed several times per second while the
-    /// actual throughput was steady. A number that unstable cannot be read at all
-    /// — you cannot tell a slow link from a jittery one.
-    ///
-    /// Exponentially-weighted, which is what every download client that displays
-    /// a readable rate does. The raw samples still feed `history`, so the
-    /// sparkline keeps showing real variance: the smoothing is for the digits, not
-    /// for the evidence.
-    smoothed: Option<f64>,
+    /// The raw quotient over one ~80 ms redraw interval swings with every late
+    /// TCP window, so the digits changed several times a second while the
+    /// throughput was steady. The raw samples still feed `history`: the
+    /// smoothing is for the digits, not for the evidence.
+    rate: SeededRate,
+    /// Seconds of redraw intervals accumulated so far, the meter's clock.
+    clock: f64,
     /// Lines drawn last frame, so the cursor can be rewound exactly.
     drawn_lines: usize,
     tty: bool,
@@ -98,7 +94,8 @@ impl Progress {
             started: Instant::now(),
             last_draw: Instant::now() - Duration::from_secs(1),
             last_bytes: 0,
-            smoothed: None,
+            rate: SeededRate::primed(0),
+            clock: 0.0,
             baseline: 0,
             history: Vec::new(),
             drawn_lines: 0,
@@ -112,6 +109,11 @@ impl Progress {
             stdout_is_payload: false,
             log: None,
         }
+    }
+
+    /// Draw the frame even when stdout is not a terminal (`--show-progress`).
+    pub fn force_frame(&mut self) {
+        self.tty = true;
     }
 
     /// Send human output to `path` instead of the terminal (`-o` / `-a` logfile).
@@ -231,6 +233,7 @@ impl Progress {
     pub fn set_baseline(&mut self, bytes: u64) {
         self.baseline = bytes;
         self.last_bytes = bytes;
+        self.rate = SeededRate::primed(bytes);
     }
 
     /// Redraw. Rate-limited to ~12 fps: redrawing per arrival makes the terminal
@@ -254,22 +257,8 @@ impl Progress {
         self.last_draw = Instant::now();
         self.last_bytes = done;
         self.history.push(inst);
-
-        // Time-based EWMA: the weight depends on how much wall clock the sample
-        // covers, not on how many frames were drawn, so the smoothing has the
-        // same time constant whether the terminal redraws at 12 fps or the
-        // transfer stalls and a single frame covers a second. TAU is the time to
-        // forget ~63% of the past — long enough to hold the digits still, short
-        // enough that a genuine slowdown shows within a second.
-        const TAU: f64 = 1.5;
-        let a = 1.0 - (-dt.as_secs_f64() / TAU).exp();
-        self.smoothed = Some(match self.smoothed {
-            Some(prev) => prev + a * (inst - prev),
-            // Seed with the first real sample rather than zero, so the display
-            // does not spend the first second climbing out of a hole.
-            None => inst,
-        });
-        let inst = self.smoothed.unwrap_or(inst);
+        self.clock += dt.as_secs_f64();
+        let inst = self.rate.sample(self.clock, done, inst);
         if self.history.len() > 48 {
             self.history.remove(0);
         }
@@ -285,8 +274,8 @@ impl Progress {
                     "{} {} {} {}/s reqs={} repairs={}",
                     self.name,
                     pct,
-                    human(done),
-                    human(inst as u64),
+                    fmt::bytes(done),
+                    fmt::bytes(inst as u64),
                     c.requests,
                     c.repairs
                 ));
@@ -334,12 +323,16 @@ impl Progress {
                     "─".repeat(BAR_W - filled)
                 );
                 let remain = t.saturating_sub(done) as f64;
-                let eta = if avg > 1024.0 { remain / avg } else { f64::NAN };
-                (bar, format!("{:5.1}%", 100.0 * frac), fmt_dur(eta))
+                let eta = if avg > RateMeter::ETA_FLOOR {
+                    remain / avg
+                } else {
+                    f64::NAN
+                };
+                (bar, format!("{:5.1}%", 100.0 * frac), fmt::duration(eta))
             }
             _ => ("─".repeat(BAR_W), "  ?  ".to_string(), "?".to_string()),
         };
-        let total_s = self.total.map(human).unwrap_or_else(|| "?".into());
+        let total_s = self.total.map(fmt::bytes).unwrap_or_else(|| "?".into());
         let _ = writeln!(
             out,
             "\x1b[1m{}\x1b[0m  {}\x1b[K",
@@ -350,12 +343,12 @@ impl Progress {
         let _ = writeln!(
             out,
             "  {bar} {pct_s}  {}/{}  \x1b[32m{}/s\x1b[0m  avg {}/s  eta {}  {}\x1b[K",
-            human(done),
+            fmt::bytes(done),
             total_s,
-            human(inst as u64),
-            human(avg as u64),
+            fmt::bytes(inst as u64),
+            fmt::bytes(avg as u64),
             eta_s,
-            fmt_dur(elapsed)
+            fmt::duration(elapsed)
         );
         lines += 1;
 
@@ -388,7 +381,7 @@ impl Progress {
                 "   {colour}{tag}\x1b[0m #{:<2} {:<24} {rng} {:>9}/s\x1b[K",
                 cv.idx,
                 trunc(&cv.host, 24),
-                human(cv.rate as u64)
+                fmt::bytes(cv.rate as u64)
             );
             lines += 1;
         }
@@ -401,7 +394,7 @@ impl Progress {
                 c.repairs,
                 c.reclaims,
                 c.retries,
-                human(c.wasted)
+                fmt::bytes(c.wasted)
             );
             lines += 1;
         }
@@ -459,18 +452,18 @@ impl Progress {
         let moved_str = if self.baseline > 0 {
             format!(
                 "{} fetched (+{} resumed)",
-                human(moved),
-                human(self.baseline)
+                fmt::bytes(moved),
+                fmt::bytes(self.baseline)
             )
         } else {
-            human(done)
+            fmt::bytes(done)
         };
         line!(
             "{mark} {} — {} in {} ({}/s), {} requests{}",
             self.name,
             moved_str,
-            fmt_dur(el),
-            human(rate as u64),
+            fmt::duration(el),
+            fmt::bytes(rate as u64),
             c.requests,
             digest
                 .map(|d| format!(", sha256 {}", &d[..d.len().min(16)]))
@@ -479,7 +472,7 @@ impl Progress {
         if c.wasted > 0 {
             line!(
                 "  {} wasted, {} repairs, {} reclaims",
-                human(c.wasted),
+                fmt::bytes(c.wasted),
                 c.repairs,
                 c.reclaims
             );
@@ -543,7 +536,7 @@ impl Progress {
         let el = self.started.elapsed().as_secs_f64();
         let spin = ["|", "/", "-", "\\"][(el * 6.0) as usize % 4];
         let held = if self.probe_bytes > 0 {
-            format!("  {} kept", human(self.probe_bytes))
+            format!("  {} kept", fmt::bytes(self.probe_bytes))
         } else {
             String::new()
         };
@@ -636,43 +629,40 @@ pub fn demo_frame() {
     println!();
 }
 
-/// Bytes as a human-readable string, aligned for column output.
-pub fn human(n: u64) -> String {
-    // Ladder runs to EiB so no input can widen the column: u64::MAX in TiB is
-    // "16777216.0 TiB", which is 15 characters and breaks the aligned
-    // per-connection layout. Absurd sizes are not realistic, but a renderer that
-    // corrupts its own table on unexpected input is a bug regardless.
-    const U: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < U.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 {
-        format!("{n} B")
-    } else if v < 10.0 {
-        format!("{v:.2} {}", U[i])
-    } else {
-        format!("{v:.1} {}", U[i])
-    }
+/// A [`RateMeter`] whose readout starts at its first sample instead of
+/// climbing out of zero over the first second.
+///
+/// The meter is primed with where the counter stood, so the first redraw is a
+/// real sample; the part of that sample the meter has not yet absorbed is kept
+/// as a seed that decays at the same time constant, which is exactly what a
+/// meter constructed at that rate would read.
+struct SeededRate {
+    meter: RateMeter,
+    seed: Option<(f64, f64)>,
+    reading: f64,
 }
 
-fn fmt_dur(s: f64) -> String {
-    if !s.is_finite() {
-        return "?".into();
+impl SeededRate {
+    /// Seconds to forget ~63% of the past: long enough to hold the digits
+    /// still, short enough that a genuine slowdown shows within a second.
+    const TAU: f64 = 1.5;
+
+    fn primed(done: u64) -> Self {
+        let mut meter = RateMeter::new(Self::TAU);
+        meter.sample(0.0, done);
+        SeededRate {
+            meter,
+            seed: None,
+            reading: 0.0,
+        }
     }
-    let s = s.max(0.0);
-    if s < 60.0 {
-        format!("{s:.1}s")
-    } else if s < 3600.0 {
-        format!("{}m{:02}s", (s / 60.0) as u64, (s % 60.0) as u64)
-    } else {
-        format!(
-            "{}h{:02}m",
-            (s / 3600.0) as u64,
-            ((s % 3600.0) / 60.0) as u64
-        )
+
+    /// `inst` is the raw quotient over the interval that ended at `now`.
+    fn sample(&mut self, now: f64, done: u64, inst: f64) -> f64 {
+        let rate = self.meter.sample(now, done);
+        let (at, excess) = *self.seed.get_or_insert((now, inst - rate));
+        self.reading = rate + excess * (-(now - at) / Self::TAU).exp();
+        self.reading
     }
 }
 
@@ -846,7 +836,7 @@ impl Multi {
             } else {
                 String::new()
             },
-            human(total_rate as u64),
+            fmt::bytes(total_rate as u64),
             self.started.elapsed().as_secs_f64()
         ));
         lines += 1;
@@ -872,7 +862,7 @@ impl Multi {
             out.push_str(&format!(
                 "\x1b[K {mark}{:<26.26} {:>10}  {:>6.1}s  \x1b[90m{}\x1b[0m\r\n",
                 name,
-                human(size),
+                fmt::bytes(size),
                 secs,
                 what
             ));
@@ -903,7 +893,7 @@ impl Multi {
                     (
                         format!("{}{}", "━".repeat(fill.min(w)), "─".repeat(w - fill.min(w))),
                         format!("{:>5.1}%", f * 100.0),
-                        format!("{} / {}", human(t.done), human(sz)),
+                        format!("{} / {}", fmt::bytes(t.done), fmt::bytes(sz)),
                     )
                 }
                 // An unknown total is common enough (chunked, no Content-Length) that it
@@ -911,14 +901,14 @@ impl Multi {
                 _ => (
                     "─".repeat(18),
                     "    ?".into(),
-                    format!("{} / ?", human(t.done)),
+                    format!("{} / ?", fmt::bytes(t.done)),
                 ),
             };
             out.push_str(&format!(
                 "\x1b[K \x1b[36m▸ active   \x1b[0m{:<26.26} \x1b[36m{bar}\x1b[0m {pct}  {:<20}  {:>9}/s  \x1b[90m{} conn\x1b[0m\r\n",
                 name,
                 amount,
-                human(t.rate as u64),
+                fmt::bytes(t.rate as u64),
                 t.conns.len()
             ));
             lines += 1;
@@ -929,7 +919,7 @@ impl Multi {
                         c.host,
                         c.lo,
                         c.hi,
-                        human(c.rate as u64),
+                        fmt::bytes(c.rate as u64),
                         c.health
                     ));
                     lines += 1;
@@ -974,7 +964,7 @@ impl Multi {
                 eprintln!(
                     " {mark} {:<30} {:>10}  {:>6.1}s{}",
                     f.name,
-                    human(f.size),
+                    fmt::bytes(f.size),
                     f.secs,
                     what
                 );
@@ -993,9 +983,9 @@ impl Multi {
         eprintln!(
             " \x1b[1m{ok}/{}\x1b[0m file(s), {} in {:.1}s ({}/s aggregate)",
             self.names.len(),
-            human(bytes),
+            fmt::bytes(bytes),
             el,
-            human(if el > 0.0 {
+            fmt::bytes(if el > 0.0 {
                 (bytes as f64 / el) as u64
             } else {
                 0
@@ -1045,33 +1035,6 @@ pub fn demo_multi() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn human_units_are_readable_and_bounded() {
-        assert_eq!(human(0), "0 B");
-        assert_eq!(human(999), "999 B");
-        assert_eq!(human(1024), "1.00 KiB");
-        assert_eq!(human(1_048_576), "1.00 MiB");
-        assert_eq!(human(12_801_696), "12.2 MiB");
-        assert_eq!(human(1 << 40), "1.00 TiB");
-        // Never longer than a column budget, whatever the input.
-        for n in [0u64, 1, 1023, 1 << 20, u64::MAX] {
-            assert!(human(n).len() <= 10, "{} too wide: {}", n, human(n));
-        }
-    }
-
-    #[test]
-    fn durations_switch_units_sensibly() {
-        assert_eq!(fmt_dur(4.25), "4.2s");
-        assert_eq!(fmt_dur(90.0), "1m30s");
-        assert_eq!(fmt_dur(3725.0), "1h02m");
-        assert_eq!(fmt_dur(f64::NAN), "?");
-        assert_eq!(
-            fmt_dur(-1.0),
-            "0.0s",
-            "a negative interval must not print a sign"
-        );
-    }
 
     #[test]
     fn sparkline_is_empty_until_there_is_something_to_show() {
@@ -1467,9 +1430,7 @@ mod tests {
             done += bump;
             p.last_draw = Instant::now() - Duration::from_secs_f64(1.0);
             p.draw(done, &[], Counters::default());
-            if let Some(s) = p.smoothed {
-                seen.push(s);
-            }
+            seen.push(p.rate.reading);
         }
         assert!(
             seen.len() >= 20,
@@ -1491,10 +1452,37 @@ mod tests {
             p.last_draw = Instant::now() - Duration::from_secs_f64(1.0);
             p.draw(done, &[], Counters::default()); // no new bytes at all
         }
-        let after = p.smoothed.unwrap();
+        let after = p.rate.reading;
         assert!(
             after < lo * 0.35,
             "a stall must be visible within a few seconds, still reading {after:.0} B/s"
+        );
+    }
+
+    /// The meter is seeded from its first sample: a display that climbs out
+    /// of zero over the first second reads as a slow link on every start.
+    #[test]
+    fn the_first_frame_reads_its_sample_rather_than_climbing_from_zero() {
+        let mut p = Progress::new("x", Some(100 << 20), 0, false, false);
+        p.force_tty();
+        p.last_draw = Instant::now() - Duration::from_secs(1);
+        p.draw(1 << 20, &[], Counters::default());
+        let first = p.rate.reading;
+        let mib = (1 << 20) as f64;
+        assert!(
+            first > 0.95 * mib && first <= mib,
+            "first frame reads {first:.0} B/s for a 1 MiB/s sample"
+        );
+
+        let mut p = Progress::new("x", Some(100 << 20), 0, false, false);
+        p.force_tty();
+        p.set_baseline(90 << 20);
+        p.last_draw = Instant::now() - Duration::from_secs(1);
+        p.draw((90 << 20) + (1 << 20), &[], Counters::default());
+        assert!(
+            p.rate.reading > 0.95 * mib,
+            "a resume credits only this run's bytes: {:.0} B/s",
+            p.rate.reading
         );
     }
 }

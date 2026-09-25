@@ -31,6 +31,9 @@ struct Inner {
     dropped: u64,
     /// Closed flag set on engine shutdown.
     closed: bool,
+    /// Bumped by `wake`, so a waiter can tell a wake from a spurious return
+    /// and give up its wait rather than going back to sleep.
+    wakes: u64,
     callback: Option<Callback>,
 }
 
@@ -52,6 +55,12 @@ fn is_terminal(kind: T) -> bool {
     )
 }
 
+/// Events after which the job publishes nothing more until it is started again,
+/// so a progress sample still pending from before must not be delivered after.
+fn ends_the_attempt(kind: T) -> bool {
+    is_terminal(kind) || kind == T::HYDRA_EVENT_PAUSED
+}
+
 impl EventQueue {
     /// Creates a new event queue with the specified capacity limit for lifecycle events.
     pub(crate) fn new(cap: usize) -> Self {
@@ -62,6 +71,7 @@ impl EventQueue {
                 rotation: VecDeque::new(),
                 dropped: 0,
                 closed: false,
+                wakes: 0,
                 callback: None,
             }),
             ready: Condvar::new(),
@@ -85,6 +95,9 @@ impl EventQueue {
                     g.rotation.push_back(ev.job_id);
                 }
             } else {
+                if ends_the_attempt(ev.kind) {
+                    g.progress.remove(&ev.job_id);
+                }
                 if g.lifecycle.len() >= self.cap {
                     if let Some(i) = g.lifecycle.iter().position(|e| !is_terminal(e.kind)) {
                         g.lifecycle.remove(i);
@@ -128,17 +141,18 @@ impl EventQueue {
 
     /// Wait up to `timeout` for an event.
     ///
-    /// Returns `None` on timeout or once the queue is closed. A closed queue
-    /// returns immediately rather than making a consumer thread wait out its
-    /// timeout during shutdown.
+    /// Returns `None` on timeout, on a `wake`, or once the queue is closed. A
+    /// closed queue returns immediately rather than making a consumer thread
+    /// wait out its timeout during shutdown.
     pub(crate) fn wait(&self, timeout: Option<Duration>) -> Option<hydra_event_t> {
         let mut g = self.lock();
         if let Some(e) = Self::pop(&mut g) {
             return Some(e);
         }
+        let entered = g.wakes;
         match timeout {
             None => loop {
-                if g.closed {
+                if g.closed || g.wakes != entered {
                     return None;
                 }
                 g = self.ready.wait(g).unwrap_or_else(|p| p.into_inner());
@@ -149,7 +163,7 @@ impl EventQueue {
             Some(t) => {
                 let deadline = Instant::now() + t;
                 loop {
-                    if g.closed {
+                    if g.closed || g.wakes != entered {
                         return None;
                     }
                     let left = deadline.saturating_duration_since(Instant::now());
@@ -181,6 +195,7 @@ impl EventQueue {
     /// told to look at something else — a shutdown flag of the host's own —
     /// without the engine having to shut down first.
     pub(crate) fn wake(&self) {
+        self.lock().wakes += 1;
         self.ready.notify_all();
     }
 
@@ -203,6 +218,7 @@ impl EventQueue {
 mod tests {
     use super::*;
     use crate::abi::hydra_event_type_t as T;
+    use std::sync::Arc;
 
     fn ev(kind: T, job: u64) -> hydra_event_t {
         hydra_event_t {
@@ -279,6 +295,48 @@ mod tests {
             T::HYDRA_EVENT_COMPLETED,
             "a completion must not wait behind a progress sample"
         );
+    }
+
+    #[test]
+    fn an_attempt_ending_event_discards_the_pending_progress_sample() {
+        for ending in [
+            T::HYDRA_EVENT_COMPLETED,
+            T::HYDRA_EVENT_FAILED,
+            T::HYDRA_EVENT_CANCELLED,
+            T::HYDRA_EVENT_PAUSED,
+        ] {
+            let q = EventQueue::new(8);
+            q.push(ev(T::HYDRA_EVENT_PROGRESS, 1));
+            q.push(ev(T::HYDRA_EVENT_PROGRESS, 2));
+            q.push(ev(ending, 1));
+            let kinds: Vec<(T, u64)> = std::iter::from_fn(|| q.try_next())
+                .map(|e| (e.kind, e.job_id))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![(ending, 1), (T::HYDRA_EVENT_PROGRESS, 2)],
+                "{ending:?} must be job 1's last event, and job 2 is untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_releases_a_waiter_without_an_event() {
+        let q = Arc::new(EventQueue::new(8));
+        let waiter = {
+            let q = q.clone();
+            std::thread::spawn(move || q.wait(None))
+        };
+        // Until the waiter is parked a wake is a no-op for it, and there is no
+        // way to observe parking from outside: keep waking until it returns.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !waiter.is_finished() {
+            assert!(Instant::now() < deadline, "the waiter never woke");
+            q.wake();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(waiter.join().unwrap().is_none(), "a wake delivers no event");
+        assert!(q.try_next().is_none(), "and consumes nothing");
     }
 
     #[test]

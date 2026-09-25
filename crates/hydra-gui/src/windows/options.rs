@@ -5,8 +5,12 @@
 //! Connection, Proxy/Socks, Sites Logins, Extensions, Sounds — two-row
 //! tab strip.
 
-use crate::app::{App, El, Message, OptField, OptTab, WinKind};
-use crate::model::{ProxyMode, ProxyType};
+use crate::app::{
+    upsert_exception, upsert_login, upsert_profile, App, El, Message, OptField, OptTab,
+    OptionsState, WinKind,
+};
+use crate::model::{ProxyMode, ProxyType, SiteLogin};
+use crate::sounds;
 use crate::windows::{cell, check, dlg_btn, dlg_btn_auto, dlg_btn_auto_primary, dlg_btn_primary};
 use crate::{i18n::tr, theme};
 use iced::widget::{
@@ -44,6 +48,19 @@ fn hinted<'a>(el: impl Into<El<'a>>, hint: String) -> El<'a> {
 /// Palette entries are packed hex; unpack one for a `text` colour.
 fn hex(v: u32) -> iced::Color {
     iced::Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+/// A number box that has to hold at least 1 while `required`: blank or
+/// zero would be stored as a cap that blocks everything.
+fn number_style(
+    typed: &str,
+    required: bool,
+) -> fn(&iced::Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style {
+    if !required || typed.trim().parse::<u64>().is_ok_and(|n| n > 0) {
+        theme::input
+    } else {
+        theme::input_invalid
+    }
 }
 
 fn section<'a>(title: String) -> El<'a> {
@@ -170,20 +187,25 @@ fn file_types(app: &App) -> El<'_> {
     let _ = s;
     column![
         section(tr("Downloaded file types")),
-        text(tr("Automatically start downloading the following file types:")).size(theme::FONT_SIZE),
+        text(tr(
+            "Automatically start downloading the following file types:"
+        ))
+        .size(theme::FONT_SIZE),
         text_editor(&app.options.auto_types_edit)
             .on_action(|a| o(OptField::AutoTypesEdit(a)))
             .size(theme::FONT_SIZE)
             .height(90.0),
-        text(tr("Don't start downloading automatically from the following sites:"))
-            .size(theme::FONT_SIZE),
+        text(tr(
+            "Don't start downloading automatically from the following sites:"
+        ))
+        .size(theme::FONT_SIZE),
         text_editor(&app.options.sites_edit)
             .on_action(|a| o(OptField::SitesEdit(a)))
             .size(theme::FONT_SIZE)
             .height(70.0),
-        text(tr("(separate with commas or spaces)")).size(theme::FONT_SIZE - 1.0)
+        text(tr("(separate with commas or spaces)"))
+            .size(theme::FONT_SIZE - 1.0)
             .color(theme::dim_text(&iced::Theme::Light)),
-        check(s.show_exception_dialog, tr("Show the dialog to add an address to the list of exceptions for a twice-cancelled download")).on_toggle(|b| o(OptField::ExcDialog(b))),
     ]
     .spacing(10)
     .into()
@@ -507,6 +529,256 @@ pub fn with_profile(current: &str, profile: &str) -> String {
     }
 }
 
+/// Field edits that touch nothing outside the dialog's own state. The pickers
+/// and the cookie-store check need the app and stay in
+/// [`App::on_opt_field`](crate::app::App); their results come back here as
+/// `*Picked` fields.
+impl OptionsState {
+    pub fn apply(&mut self, f: OptField) {
+        match f {
+            OptField::AutoTypesEdit(a) => {
+                self.auto_types_edit.perform(a);
+                self.draft.auto_types = self.auto_types_edit.text();
+                return;
+            }
+            OptField::SitesEdit(a) => {
+                self.sites_edit.perform(a);
+                self.draft.dont_start_sites = self.sites_edit.text();
+                return;
+            }
+            OptField::CatExtsEdit(a) => {
+                self.cat_exts_edit.perform(a);
+                return;
+            }
+            // The Download-limit numbers keep a text buffer beside the draft:
+            // digits only, and the draft takes the value only when it parses,
+            // so a momentarily empty field is a legal editing state instead of
+            // an ignored keystroke.
+            OptField::DlLimitMb(v) => {
+                let v: String = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect();
+                if let Ok(n) = v.parse() {
+                    self.draft.dl_limit_mb = n;
+                }
+                self.dl_limit_mb_txt = v;
+                return;
+            }
+            OptField::DlLimitHours(v) => {
+                let v: String = v.chars().filter(|c| c.is_ascii_digit()).take(5).collect();
+                if let Ok(n) = v.parse() {
+                    self.draft.dl_limit_hours = n;
+                }
+                self.dl_limit_hours_txt = v;
+                return;
+            }
+            OptField::SpeedLimitKb(v) => {
+                let v: String = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect();
+                // Blank or zero is "no number yet", not a cap of zero — a
+                // zero cap would stall every transfer under it.
+                self.draft.global_speed_limit = v
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|kb| *kb > 0)
+                    .map(|kb| kb * 1024);
+                self.speed_limit_kb_txt = v;
+                return;
+            }
+            _ => {}
+        }
+        let s = &mut self.draft;
+        match f {
+            OptField::LaunchStartup(b) => s.launch_on_startup = b,
+            OptField::CheckUpdates(b) => s.check_updates_on_startup = b,
+            OptField::BetaChannel(b) => s.beta_channel = b,
+            OptField::StartInTray(b) => s.start_in_tray = b,
+            OptField::CloseToTray(b) => s.close_to_tray = b,
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            OptField::HideTaskbar(b) => s.hide_from_taskbar = b,
+            OptField::PowerSave(b) => s.power_save = b,
+            OptField::GpuRender(b) => s.gpu_render = b,
+            OptField::Clipboard(b) => s.monitor_clipboard = b,
+            OptField::PortableCapture(b) => s.portable_capture = b,
+            OptField::Browser(i, b) => {
+                if let Some(x) = s.capture_browsers.get_mut(i) {
+                    x.1 = b;
+                }
+            }
+            OptField::AutoTypesEdit(_)
+            | OptField::SitesEdit(_)
+            | OptField::CatExtsEdit(_)
+            | OptField::DlLimitMb(_)
+            | OptField::DlLimitHours(_)
+            | OptField::SpeedLimitKb(_) => unreachable!(),
+            OptField::BrowseVirus | OptField::BrowseCatDir | OptField::SoundBrowse(_) => {}
+            OptField::RememberLast(b) => s.remember_last_dir = b,
+            OptField::ServerDate(b) => s.server_file_date = b,
+            OptField::NoCatDirs(b) => s.no_category_dirs = b,
+            OptField::ShowFileInfo(b) => s.show_file_info_dialog = b,
+            OptField::BgDownload(b) => s.bg_download = b,
+            OptField::StartMinimized(b) => s.start_minimized = b,
+            OptField::SpeedTab(b) => s.show_speed_tab = b,
+            OptField::CompletionTab(b) => s.show_completion_tab = b,
+            OptField::HideButtons(b) => s.show_hide_buttons = b,
+            OptField::ConnDetails(b) => s.show_conn_details = b,
+            OptField::CompleteDialog(b) => s.show_complete_dialog = b,
+            OptField::RemoveCompleted(b) => s.remove_completed = b,
+            OptField::UserAgent(v) => s.user_agent = v,
+            OptField::VirusScanner(v) => s.virus_scanner = v,
+            OptField::VirusArgs(v) => s.virus_args = v,
+            OptField::VirusPicked(Some(p)) => s.virus_scanner = p,
+            OptField::VirusPicked(None) => {}
+            OptField::DefaultConns(n) => s.default_conns = n,
+            OptField::AdaptiveConns(b) => s.adaptive_conns = b,
+            // Stored as the one `BROWSER[:PROFILE]` string the CLI parses, so
+            // the two surfaces cannot disagree about what a profile is.
+            OptField::CookiesBrowser(name) => {
+                s.cookies_from_browser = with_browser(&s.cookies_from_browser, &name);
+            }
+            OptField::CookiesProfile(v) => {
+                s.cookies_from_browser = with_profile(&s.cookies_from_browser, &v);
+            }
+            OptField::ExcSel(i) => {
+                self.sel_exc = Some(i);
+                if let Some((server, n)) = self.draft.conn_exceptions.get(i) {
+                    self.conn_exc_server = server.clone();
+                    self.conn_exc_n = n.to_string();
+                }
+            }
+            OptField::ExcServer(v) => self.conn_exc_server = v,
+            OptField::ExcConns(v) => self.conn_exc_n = v,
+            OptField::ExcAdd => {
+                let server = self.conn_exc_server.trim().to_string();
+                let n: usize = self.conn_exc_n.trim().parse().unwrap_or(0);
+                if !server.is_empty() && n > 0 {
+                    upsert_exception(&mut self.draft.conn_exceptions, server, n.clamp(1, 32));
+                    self.sel_exc = None;
+                    self.conn_exc_server.clear();
+                    self.conn_exc_n.clear();
+                }
+            }
+            OptField::ExcRemove => {
+                if let Some(i) = self.sel_exc.take() {
+                    if i < self.draft.conn_exceptions.len() {
+                        self.draft.conn_exceptions.remove(i);
+                    }
+                    self.conn_exc_server.clear();
+                    self.conn_exc_n.clear();
+                }
+            }
+            OptField::DlLimit(b) => s.dl_limit_enabled = b,
+            OptField::SpeedLimiter(b) => s.speed_limiter_on = b,
+            OptField::ProfileSel(i) => {
+                self.sel_profile = Some(i);
+                if let Some(p) = self.draft.speed_profiles.get(i) {
+                    self.profile_name = p.name.clone();
+                    self.profile_kb = p.limit.map(|b| (b / 1024).to_string()).unwrap_or_default();
+                }
+            }
+            OptField::ProfileName(v) => self.profile_name = v,
+            OptField::ProfileKb(v) => {
+                self.profile_kb = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect()
+            }
+            OptField::ProfileAdd => {
+                let name = self.profile_name.trim().to_string();
+                if !name.is_empty() {
+                    // Blank speed makes an unlimited profile — the one that
+                    // clears the cap, which every profile list needs.
+                    let limit = self
+                        .profile_kb
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|kb| *kb > 0)
+                        .map(|kb| kb * 1024);
+                    upsert_profile(&mut self.draft.speed_profiles, name, limit);
+                    self.sel_profile = None;
+                    self.profile_name.clear();
+                    self.profile_kb.clear();
+                }
+            }
+            OptField::ProfileRemove => {
+                if let Some(i) = self.sel_profile.take() {
+                    if i < self.draft.speed_profiles.len() {
+                        self.draft.speed_profiles.remove(i);
+                    }
+                    self.profile_name.clear();
+                    self.profile_kb.clear();
+                }
+            }
+            OptField::WarnStop(b) => s.warn_before_stop = b,
+            OptField::ProxyMode(m) => s.proxy_mode = m,
+            OptField::ProxyScript(v) => s.proxy_script = v,
+            OptField::ProxyHost(v) => s.proxy_host = v,
+            OptField::ProxyPort(v) => s.proxy_port = v,
+            OptField::ProxyUser(v) => s.proxy_user = v,
+            OptField::ProxyPass(v) => s.proxy_pass = v,
+            OptField::ProxyType(t) => s.proxy_type = t,
+            OptField::SelCategory(c) => self.select_category(c),
+            OptField::CatName(v) => self.cat_name = v,
+            OptField::CatAdd => self.add_category(),
+            OptField::CatRename => self.rename_category(),
+            OptField::CatRemove => self.remove_category(),
+            OptField::CatDir(v) | OptField::CatDirPicked(Some(v)) => {
+                let sel = self.sel_category.clone();
+                if let Some(c) = self.draft_cats.iter_mut().find(|c| c.name == sel) {
+                    c.dir = v;
+                }
+            }
+            OptField::CatDirPicked(None) => {}
+            OptField::LoginSel(i) => {
+                self.sel_login = Some(i);
+                if let Some(l) = self.draft.logins.get(i) {
+                    self.login_site = l.site.clone();
+                    self.login_user = l.user.clone();
+                    self.login_pass = l.pass.clone();
+                }
+            }
+            OptField::LoginSite(v) => self.login_site = v,
+            OptField::LoginUser(v) => self.login_user = v,
+            OptField::LoginPass(v) => self.login_pass = v,
+            OptField::LoginAdd => {
+                let site = self.login_site.trim().to_string();
+                if !site.is_empty() {
+                    let login = SiteLogin {
+                        site,
+                        user: self.login_user.clone(),
+                        pass: self.login_pass.clone(),
+                    };
+                    upsert_login(&mut self.draft.logins, login);
+                    self.sel_login = None;
+                    self.login_site.clear();
+                    self.login_user.clear();
+                    self.login_pass.clear();
+                }
+            }
+            OptField::LoginRemove => {
+                if let Some(i) = self.sel_login.take() {
+                    if i < self.draft.logins.len() {
+                        self.draft.logins.remove(i);
+                    }
+                }
+            }
+            OptField::Sound(i, b) => {
+                if let Some(row) = s.sounds.get_mut(i) {
+                    row.enabled = b;
+                }
+            }
+            OptField::SoundPicked(i, p) => {
+                if let Some(row) = s.sounds.get_mut(i) {
+                    row.file = p;
+                }
+            }
+            OptField::SoundPlay(i) => {
+                if let Some(row) = s.sounds.get(i) {
+                    sounds::play(
+                        (!row.file.is_empty()).then(|| row.file.clone()),
+                        sounds::Event::from_index(i),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// What the chosen browser's store turned out to be, or why it could not be
 /// read.
 ///
@@ -600,6 +872,13 @@ fn conn_limits(app: &App) -> El<'_> {
             o(OptField::ExcSel(i)),
         ));
     }
+    // The Number box takes 1..=32, the range every connection count is
+    // clamped to; New waits until it holds one.
+    let exc_n_ok = st
+        .conn_exc_n
+        .trim()
+        .parse::<usize>()
+        .is_ok_and(|n| (1..=32).contains(&n));
     column![
         section(tr("Connections and Limits")),
         row![
@@ -632,9 +911,17 @@ fn conn_limits(app: &App) -> El<'_> {
             text_input(&tr("Number"), &st.conn_exc_n)
                 .on_input(|v| o(OptField::ExcConns(v)))
                 .size(theme::FONT_SIZE)
-                .style(theme::input)
+                .style(if exc_n_ok || st.conn_exc_n.trim().is_empty() {
+                    theme::input
+                } else {
+                    theme::input_invalid
+                })
                 .width(90.0),
-            dlg_btn(tr("New"), Some(o(OptField::ExcAdd))),
+            dlg_btn(
+                tr("New"),
+                (exc_n_ok && !st.conn_exc_server.trim().is_empty())
+                    .then(|| o(OptField::ExcAdd)),
+            ),
             dlg_btn(
                 tr("Remove"),
                 st.sel_exc.map(|_| o(OptField::ExcRemove)),
@@ -708,7 +995,7 @@ fn conn_speed(app: &App) -> El<'_> {
             text_input("500", &st.speed_limit_kb_txt)
                 .on_input(|v| o(OptField::SpeedLimitKb(v)))
                 .size(theme::FONT_SIZE)
-                .style(theme::input)
+                .style(number_style(&st.speed_limit_kb_txt, s.speed_limiter_on))
                 .width(80.0),
             text(tr("KB/sec")).size(theme::FONT_SIZE),
         ]
@@ -762,13 +1049,13 @@ fn conn_quota(app: &App) -> El<'_> {
             text_input("200", &st.dl_limit_mb_txt)
                 .on_input(|v| o(OptField::DlLimitMb(v)))
                 .size(theme::FONT_SIZE)
-                .style(theme::input)
+                .style(number_style(&st.dl_limit_mb_txt, s.dl_limit_enabled))
                 .width(80.0),
             text(tr("MBytes every")).size(theme::FONT_SIZE),
             text_input("5", &st.dl_limit_hours_txt)
                 .on_input(|v| o(OptField::DlLimitHours(v)))
                 .size(theme::FONT_SIZE)
-                .style(theme::input)
+                .style(number_style(&st.dl_limit_hours_txt, s.dl_limit_enabled))
                 .width(60.0),
             text(tr("hours")).size(theme::FONT_SIZE),
         ]
@@ -786,6 +1073,16 @@ fn conn_quota(app: &App) -> El<'_> {
 fn proxy(app: &App) -> El<'_> {
     let s = &app.options.draft;
     let mode = s.proxy_mode;
+    // Manual fields that describe no proxy: said under the row while they
+    // are typed, and OK refuses them — stored, they would silently connect
+    // directly.
+    let manual_note: El<'_> = match (mode, crate::proxy::manual_problem(s)) {
+        (ProxyMode::Manual, Some(why)) => text(why)
+            .size(theme::FONT_SIZE - 1.0)
+            .color(theme::error_text())
+            .into(),
+        _ => iced::widget::space::horizontal().height(0.0).into(),
+    };
     column![
         section(tr("Proxy / socks configuration")),
         radio(tr("No proxy/socks"), ProxyMode::None, Some(mode), |m| o(
@@ -828,15 +1125,17 @@ fn proxy(app: &App) -> El<'_> {
                 .width(Length::Fill),
         ]
         .spacing(8),
-        // Said here rather than only in the log: a radio that quietly does
-        // nothing is how a download ends up leaving through the real address
-        // while the user believes it is tunnelled.
-        text(tr(
-            "Configuration scripts (PAC) are not evaluated yet — choose manual \
-             configuration or system settings."
-        ))
-        .size(theme::FONT_SIZE - 1.0)
-        .color(theme::dim_text(&iced::Theme::Light)),
+        // Said here rather than only in the log, and in red once the radio
+        // is on: OK refuses it, because a route that quietly does nothing is
+        // how a download ends up leaving through the real address while the
+        // user believes it is tunnelled.
+        text(tr(crate::proxy::PAC_UNSUPPORTED))
+            .size(theme::FONT_SIZE - 1.0)
+            .color(if mode == ProxyMode::Script {
+                theme::error_text()
+            } else {
+                theme::dim_text(&iced::Theme::Light)
+            }),
         radio(
             tr("Manual proxy/socks configuration"),
             ProxyMode::Manual,
@@ -910,12 +1209,12 @@ fn proxy(app: &App) -> El<'_> {
             .width(140.0),
         ]
         .spacing(10),
+        manual_note,
         text(tr(
             "The proxy carries every download: HTTP, HTTPS and — over SOCKS — FTP."
         ))
         .size(theme::FONT_SIZE - 1.0)
         .color(theme::dim_text(&iced::Theme::Light)),
-        check(s.ftp_pasv, tr("Use FTP in PASV mode")).on_toggle(|b| o(OptField::FtpPasv(b))),
     ]
     .spacing(8)
     .into()
@@ -975,8 +1274,11 @@ fn sites(app: &App) -> El<'_> {
         ]
         .spacing(8),
         row![
-            dlg_btn(tr("New"), Some(o(OptField::LoginAdd))),
-            dlg_btn(tr("Remove"), Some(o(OptField::LoginRemove))),
+            dlg_btn(
+                tr("New"),
+                (!st.login_site.trim().is_empty()).then(|| o(OptField::LoginAdd)),
+            ),
+            dlg_btn(tr("Remove"), st.sel_login.map(|_| o(OptField::LoginRemove)),),
         ]
         .spacing(10),
     ]
@@ -1229,12 +1531,28 @@ fn extensions(app: &App) -> El<'_> {
         .spacing(6)
         .into()
     });
+    // Which browsers can start Hydra from the extension: the native-host
+    // manifests this launch registered. A connected extension with no
+    // manifest works only while Hydra is already running.
+    let registered = crate::nmhost::registered();
+    let host_line = if registered.is_empty() {
+        tr("Native host registered with: none yet")
+    } else {
+        format!(
+            "{} {}",
+            tr("Native host registered with:"),
+            registered.join(", ")
+        )
+    };
     let mut col = column![
         section(tr("Browser extensions")),
         text(tr(
             "Install the Hydra extension to capture downloads straight from your browser."
         ))
         .size(theme::FONT_SIZE),
+        text(host_line)
+            .size(theme::FONT_SIZE - 1.0)
+            .color(theme::dim_text(&iced::Theme::Light)),
         ext_row(
             crate::icons::browser_chrome(),
             "Google Chrome",
@@ -1466,6 +1784,12 @@ pub fn view(app: &App) -> El<'_> {
                 .height(Length::Fill)
                 .style(theme::panel),
             row![
+                match &app.options.error {
+                    Some(why) => text(why.clone())
+                        .size(theme::FONT_SIZE - 1.0)
+                        .color(theme::error_text()),
+                    None => text(""),
+                },
                 iced::widget::space::horizontal(),
                 dlg_btn_primary(tr("OK"), Some(Message::OptOk)),
                 dlg_btn(
@@ -1473,7 +1797,8 @@ pub fn view(app: &App) -> El<'_> {
                     app.win_of(WinKind::Options).map(Message::CloseThis)
                 ),
             ]
-            .spacing(10),
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(6)
         .padding(10),

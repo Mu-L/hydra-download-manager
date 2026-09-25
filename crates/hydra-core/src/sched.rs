@@ -499,6 +499,33 @@ impl Scheduler {
         self.conn_ceiling.min(self.conns.len()).max(1)
     }
 
+    /// How much unassigned work to hand an idle connection.
+    ///
+    /// Everything, once concurrency has settled: maximal ranges mean the fewest
+    /// requests. A budget-sized share while connections THIS PASS cannot reach
+    /// are still expected — not yet admitted by the ramp (`active_limit <
+    /// ceiling`), or `waiting` on a cooldown with a seat under the limit still
+    /// free (`+ 1` counts the caller itself) — because the first idle
+    /// connection would otherwise swallow the reserve those later admissions
+    /// are meant to pick up, leaving each of them a steal: a repair per
+    /// admission. One extra request later is the cheaper mistake.
+    ///
+    /// `limit` rather than `active_limit` alone: the latter is `usize::MAX` for
+    /// every caller that never opted into the ramp, which would make the share
+    /// path swallow the fixed `-x N` case whole. See
+    /// `settled_concurrency_hands_out_maximal_ranges_not_shares` and
+    /// `a_ramping_connection_that_drains_its_quota_does_not_swallow_the_reserve`.
+    fn share_for(&self, waiting: usize, admitted: usize) -> u64 {
+        let ceiling = self.ceiling();
+        let limit = self.active_limit.min(self.conns.len());
+        if self.active_limit < ceiling || (waiting > 0 && admitted + 1 < limit) {
+            let share = self.unassigned.total() / ceiling as u64;
+            share.max(STEAL_QUANTUM * 4)
+        } else {
+            u64::MAX
+        }
+    }
+
     /// When every source is deliberately suspended, the earliest time one returns.
     ///
     /// `None` means at least one source is usable now, so a lack of progress is a
@@ -1354,58 +1381,7 @@ impl Scheduler {
             if !self.sources[src].usable_at(now) {
                 continue;
             }
-            // How much to hand this connection.
-            //
-            // `u64::MAX` — take everything — is right once concurrency has settled:
-            // maximal ranges mean the fewest requests, which is the whole point of
-            // range scheduling. It is wrong while more admissions are still
-            // expected, because the first idle connection would swallow the
-            // reserve that connections admitted later are supposed to pick up, and
-            // they would be left to STEAL from it. That is a repair per admission,
-            // and the repair undoes a split that had just been made for no reason.
-            //
-            // So while room remains, hand out a budget-sized share and leave the
-            // rest. The cost of being wrong in this direction is one extra request
-            // later — now nearly free on a pooled connection — against one repair
-            // per admitted connection the other way.
-            //
-            // Reserve only for connections THIS LOOP CANNOT REACH. An idle
-            // connection that is merely further down the visit order is not one
-            // of them — it gets its work in this same pass, so holding a share
-            // back for it just splits one request into two.
-            //
-            // Two things put a connection out of reach:
-            //
-            // * the ramp has not admitted it yet — `active_limit < ceiling`. This
-            //   is every `--adaptive` transfer, which starts at one connection
-            //   with the rest of the budget ahead of it. Without this clause the
-            //   reserve `initial_split` holds back is swallowed on the first tick
-            //   after that connection drains its quota, and every later admission
-            //   can only steal — see
-            //   `a_ramping_connection_that_drains_its_quota_does_not_swallow_the_reserve`.
-            //
-            // * it is `waiting`: idle, but held off by its own cooldown or a
-            //   suspended source, with a seat under the current limit still free.
-            //   This is the throttled case — the cap has just widened on a
-            //   successful probe, and the connections that will fill the new seats
-            //   are still cooling down from the refusal that taught the old one.
-            //   `+ 1` because `j` itself is not yet counted in `admitted`.
-            //
-            // Testing `admitted` against `active_limit` ALONE is wrong in a way no
-            // existing test caught: `active_limit` is `usize::MAX` for every caller
-            // that never opted into the ramp, so the comparison is vacuously true,
-            // the share path swallows the fixed `-x N` case whole, and the maximal
-            // branch below becomes unreachable. Hence `limit`, and hence
-            // `settled_concurrency_hands_out_maximal_ranges_not_shares`.
-            let ceiling = self.ceiling();
-            let limit = self.active_limit.min(self.conns.len());
-            let want = if self.active_limit < ceiling || (waiting > 0 && admitted + 1 < limit) {
-                let remaining = self.unassigned.total();
-                let share = remaining / ceiling as u64;
-                share.max(STEAL_QUANTUM * 4)
-            } else {
-                u64::MAX
-            };
+            let want = self.share_for(waiting, admitted);
             if let Some(r) = self.unassigned.take_front(want) {
                 self.start(j, r, now);
                 acts.push(Action::Request { conn: j, range: r });
@@ -1827,25 +1803,20 @@ mod tests {
         let mut s = Scheduler::new(1000, vec![src(1.0)], &[1]);
         s.tick(0.0);
         assert_eq!(s.conn_range(0), Some((0, 0, 1000)));
-        // 100 bytes land and are credited.
         s.on_bytes_at(0, 0, 100, 1.0, 0.5);
         assert_eq!(s.bytes_held(), 100);
-        // The connection is reclaimed and re-requested from where it got to.
         s.on_conn_error(0, 9.0, 0.0);
         let acts = s.tick(10.0);
         assert!(
             matches!(acts.as_slice(), [Action::Request { conn: 0, range }] if range.lo == 100),
             "the reclaimed remainder must be re-requested from 100: {acts:?}"
         );
-        // Now the aborted request's last write arrives, timestamped BEFORE the new
-        // request was issued.
         s.on_bytes_at(0, 100, 50, 9.5, 0.1);
         assert_eq!(
             s.bytes_held(),
             100,
             "an arrival older than the request in flight was credited to it"
         );
-        // And the new request's own first arrival, at the same offset, must land.
         s.on_bytes_at(0, 100, 50, 10.2, 0.1);
         assert_eq!(
             s.bytes_held(),
@@ -1887,21 +1858,19 @@ mod tests {
         );
     }
 
+    /// A connection whose active range is stolen down to its current position
+    /// goes idle WITHOUT completing; without the queue-start path its queued
+    /// bytes were never requested.
     #[test]
     fn fully_stolen_range_does_not_livelock() {
-        // Regression: a connection whose active range is stolen down to its
-        // current position goes idle WITHOUT completing. If the queue-start
-        // path is missing, its queued bytes are never requested.
         let mut s = Scheduler::new(200_000, vec![src(1e5), src(1e5)], &[1, 1]);
         s.tick(0.0);
-        // conn 0 makes progress, conn 1 stalls entirely
         let mut now = 0.06;
         for _ in 0..50 {
             s.on_bytes(0, 1000, now, 0.01);
             now += 0.01;
             s.tick(now);
         }
-        // force a steal by making conn 1 look terrible, then run to completion
         for _ in 0..20000 {
             s.tick(now);
             s.on_bytes(0, 1000, now, 0.01);
@@ -2001,7 +1970,6 @@ mod tests {
         let mut s = Scheduler::new(100_000, vec![src(1e5), src(1e5)], &[1, 1]);
         s.tick(0.0);
         let before = s.stats.reclaims;
-        // no bytes at all: both connections must be reclaimed after the timeout
         let acts = s.tick(5.0);
         assert!(s.stats.reclaims > before);
         assert!(acts.iter().any(|a| matches!(a, Action::Cancel { .. })));

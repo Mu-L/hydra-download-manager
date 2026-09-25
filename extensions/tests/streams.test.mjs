@@ -35,6 +35,10 @@ p/index.m3u8
 `;
 const BODIES = {
   "https://cdn.ex/hls/master.m3u8?tok=1": MASTER,
+  "https://api.ex/playlist?id=77": MASTER,
+  "https://api.ex/manifest?id=78": MPD,
+  "https://api.ex/status?id=79": "everything is fine\n",
+  "https://old.ex/radio.m3u": "#EXTM3U\n#EXTINF:-1,Station\nhttps://old.ex/live/stream\n",
   "https://cdn.ex/hls/v8/index.m3u8": VARIANT,
   "https://cdn.ex/hls/v5/index.m3u8": VARIANT,
   "https://cdn.ex/hls/v2/index.m3u8": VARIANT,
@@ -69,7 +73,9 @@ function build({ hydraReply = { ok: true } } = {}) {
       setImmediate(() => this.onmessage && this.onmessage({ data: JSON.stringify({ ...rep, id: m.id, capture: true, auto_types: "ZIP MP4", dont_start_sites: "" }) })); }
     close() {}
   }
+  const fetched = [];
   const fetch = async (url) => {
+    fetched.push(url);
     const body = BODIES[url];
     if (body === undefined) throw new Error("404 " + url);
     return { ok: true, headers: { get: () => null }, text: async () => body };
@@ -79,8 +85,8 @@ function build({ hydraReply = { ok: true } } = {}) {
   loadBackground(ctx);
   const hdr = (ct, len) => [{ name: "Content-Type", value: ct }].concat(len ? [{ name: "Content-Length", value: String(len) }] : []);
   return {
-    sent, tabsUpdated,
-    resp: (url, ct, len) => wr.fn({ tabId: 7, url, responseHeaders: hdr(ct, len) }),
+    sent, tabsUpdated, fetched,
+    resp: (url, ct, len, type = "media") => wr.fn({ tabId: 7, url, type, frameId: 0, responseHeaders: hdr(ct, len) }),
     state: () => new Promise((res) => msgs.l[0]({ type: "get-state" }, {}, res)),
     send: (m) => new Promise((res) => msgs.l[0](m, {}, res)),
     badge: () => badge,
@@ -242,6 +248,49 @@ function build({ hydraReply = { ok: true } } = {}) {
   await tick(10);
   st = await h.state();
   check("the video floor is unchanged", st.media.length === 1, JSON.stringify(st.media));
+}
+
+// ----------------------------------- manifests that do not announce themselves
+//
+// A playlist served as text/plain from `/playlist?id=…`, an MPD served as
+// application/xml: nothing in the type or the path says "manifest", only
+// the body does — and a player fetches it with XHR, small.
+{
+  const h = build(); await tick(6);
+  h.resp("https://api.ex/playlist?id=77", "text/plain", MASTER.length, "xmlhttprequest");
+  await tick(24);
+  let st = await h.state();
+  check("a text/plain playlist at an extension-less path is sniffed", st.streams.length === 1 && st.streams[0].protocol === "hls" && st.streams[0].variants.length === 3, JSON.stringify(st.streams.map((x) => x.url)));
+
+  h.resp("https://api.ex/manifest?id=78", "application/xml", MPD.length, "xmlhttprequest");
+  await tick(16);
+  st = await h.state();
+  check("an MPD served as application/xml is sniffed", st.streams.some((x) => x.protocol === "dash"), JSON.stringify(st.streams.map((x) => x.protocol)));
+
+  // The same shape that is NOT a manifest is looked at once and then left alone.
+  h.resp("https://api.ex/status?id=79", "text/plain", 20, "xmlhttprequest");
+  await tick(12);
+  h.resp("https://api.ex/status?id=79", "text/plain", 20, "xmlhttprequest");
+  await tick(12);
+  st = await h.state();
+  check("a small text body that is not a manifest is not listed", st.streams.length === 2, JSON.stringify(st.streams.map((x) => x.url)));
+  check("and a polled endpoint is read once, not on every poll", h.fetched.filter((u) => u.includes("status?id=79")).length === 1, JSON.stringify(h.fetched));
+
+  // A navigation to a text file is a page the user is reading; a big text
+  // body is not a manifest. Neither is fetched.
+  h.resp("https://api.ex/playlist?id=80", "text/plain", MASTER.length, "main_frame");
+  h.resp("https://api.ex/playlist?id=81", "text/plain", 5_000_000, "xmlhttprequest");
+  await tick(12);
+  check("a navigation or a large body is not sniffed", !h.fetched.some((u) => u.includes("id=80") || u.includes("id=81")), JSON.stringify(h.fetched));
+}
+
+// ------------------------------------------------------ the older .m3u spelling
+{
+  const h = build(); await tick(6);
+  h.resp("https://old.ex/radio.m3u", "application/octet-stream");
+  await tick(16);
+  const st = await h.state();
+  check("a .m3u playlist is recognised by its path", st.streams.length === 1 && st.streams[0].protocol === "hls", JSON.stringify(st.streams));
 }
 
 console.log(fails ? `\n${fails} FAILED` : "\nall passed");

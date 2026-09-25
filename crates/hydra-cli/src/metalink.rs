@@ -205,7 +205,7 @@ pub async fn load_url(
 ) -> Result<Metalink, String> {
     let mut cur = crate::url::Url::parse(url).ok_or_else(|| format!("unparsable URL: {url}"))?;
     for _ in 0..=max_redirs {
-        let px = crate::url::proxy_from_env();
+        let px = crate::url::ProxyPolicy::default().http_route(&cur)?;
         let t = cur
             .to_target(px.as_ref().map(|(h, p)| (h.as_str(), *p)))?
             .with_headers(headers.to_vec(), Some(agent.to_string()));
@@ -244,6 +244,38 @@ const OUTSIDE_PREFERRED_LOCATION: u32 = 1_000_000;
 
 /// Demotion applied to a mirror outside the preferred protocol.
 const OUTSIDE_PREFERRED_PROTOCOL: u32 = 1_000;
+
+/// Sort key for a mirror, most significant first: preferred location,
+/// preferred protocol, the publisher's ranking, then the URL so the order is
+/// reproducible — a download that opens different mirrors on every attempt
+/// cannot be debugged from its logs.
+///
+/// With no stated protocol preference the transport decides: HTTP(S) mirrors
+/// can be spliced, repaired per chunk and substituted, while an FTP source is
+/// one sequential stream, and metalinker.org's own samples rank `ftp://` at
+/// preference 100 beside one HTTP mirror. The publisher's ranking still orders
+/// mirrors within each transport; `--metalink-preferred-protocol ftp` restores
+/// the old order where FTP is the better path.
+fn mirror_order(u: &MetaUrl, sel: &Selection, want_proto: Option<&str>) -> (u32, u32, u32, String) {
+    let loc = match &u.location {
+        Some(l) if !sel.locations.is_empty() => sel
+            .locations
+            .iter()
+            .position(|w| w == l)
+            .map(|i| i as u32)
+            .unwrap_or(OUTSIDE_PREFERRED_LOCATION),
+        _ if sel.locations.is_empty() => 0,
+        // A mirror with no stated location cannot be shown to be in the
+        // user's preferred one, so it is demoted rather than assumed.
+        _ => OUTSIDE_PREFERRED_LOCATION,
+    };
+    let proto = match want_proto {
+        Some(p) if u.kind.as_str() == p => 0,
+        Some(_) => OUTSIDE_PREFERRED_PROTOCOL,
+        None => u.kind.transport_tier() as u32,
+    };
+    (loc, proto, u.priority, u.url.clone())
+}
 
 /// Order a file's mirrors into the one ranking that drives everything downstream.
 ///
@@ -297,42 +329,12 @@ pub fn rank(file: &MetalinkFile, sel: &Selection) -> (Vec<MetaUrl>, Vec<String>)
         .map(str::to_ascii_lowercase)
         .filter(|p| p != "none");
 
-    // Sort key, most significant first: preferred location, preferred protocol,
-    // the publisher's ranking, then the URL so the order is reproducible. A
-    // download that opens different mirrors on every attempt cannot be debugged
-    // from its logs.
     urls.sort_by(|a, b| {
-        let key = |u: &MetaUrl| {
-            let loc = match &u.location {
-                Some(l) if !sel.locations.is_empty() => sel
-                    .locations
-                    .iter()
-                    .position(|w| w == l)
-                    .map(|i| i as u32)
-                    .unwrap_or(OUTSIDE_PREFERRED_LOCATION),
-                _ if sel.locations.is_empty() => 0,
-                // A mirror with no stated location cannot be shown to be in the
-                // user's preferred one, so it is demoted rather than assumed.
-                _ => OUTSIDE_PREFERRED_LOCATION,
-            };
-            let proto = match &want_proto {
-                Some(p) if u.kind.as_str() == p => 0,
-                Some(_) => OUTSIDE_PREFERRED_PROTOCOL,
-                // No stated preference: the TRANSPORT decides. HTTP(S) mirrors
-                // can be spliced, repaired per chunk, and substituted; an FTP
-                // source is a single sequential stream, and an FTP mirror the
-                // publisher ranked first would hand the whole transfer to the
-                // one scheme that turns all of that off. Real documents do
-                // this — metalinker.org's own samples rank ftp:// at
-                // preference 100 beside one http mirror. The publisher's
-                // ranking still orders mirrors WITHIN each transport, and
-                // `--metalink-preferred-protocol ftp` restores the old order
-                // for a network where ftp is the better path.
-                None => u.kind.transport_tier() as u32,
-            };
-            (loc, proto, u.priority, u.url.clone())
-        };
-        key(a).cmp(&key(b))
+        mirror_order(a, sel, want_proto.as_deref()).cmp(&mirror_order(
+            b,
+            sel,
+            want_proto.as_deref(),
+        ))
     });
 
     if want_proto.is_none() {
@@ -449,7 +451,7 @@ pub fn resolve(doc: &Metalink, sel: &Selection, from: &Origin) -> Result<Vec<Res
                         notes.push(format!(
                             "per-chunk verification from the document: {} chunks of {}",
                             m.chunks.digests.len(),
-                            crate::progress::human(m.object.chunk_size)
+                            hya_core::fmt::bytes(m.object.chunk_size)
                         ));
                         Some(m)
                     }

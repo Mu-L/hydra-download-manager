@@ -28,8 +28,6 @@ const HEADER_DRAG_SLOP: f32 = 4.0;
 /// table in without a visible pause.
 const BATCH_PROBE_IDLE: std::time::Duration = std::time::Duration::from_millis(400);
 
-// ------------------------------------------------------------------- windows
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WinKind {
     Main,
@@ -52,8 +50,6 @@ pub enum WinKind {
     /// What is inside a ZIP archive, read from its tail before the download.
     ZipPreview(DlId),
 }
-
-// ---------------------------------------------------------------- selections
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TreeSel {
@@ -297,8 +293,6 @@ impl MenuAction {
         })
     }
 }
-
-// ------------------------------------------------------------- dialog states
 
 #[derive(Clone, Debug, Default)]
 pub struct AddUrlState {
@@ -594,6 +588,11 @@ pub enum OptTab {
 pub struct OptionsState {
     pub tab: OptTab,
     pub draft: crate::model::Settings,
+    /// The settings the dialog opened on. OK merges against these — see
+    /// [`crate::model::Settings::apply_options_draft`].
+    pub base: crate::model::Settings,
+    /// Why OK was refused, shown beside the buttons until the field is fixed.
+    pub error: Option<String>,
     /// Multiline editors for the File-types lists.
     pub auto_types_edit: iced::widget::text_editor::Content,
     pub sites_edit: iced::widget::text_editor::Content,
@@ -657,6 +656,8 @@ impl Default for OptionsState {
         OptionsState {
             tab: OptTab::General,
             draft: crate::model::Settings::default(),
+            base: crate::model::Settings::default(),
+            error: None,
             auto_types_edit: iced::widget::text_editor::Content::new(),
             sites_edit: iced::widget::text_editor::Content::new(),
             draft_cats: crate::model::default_categories(),
@@ -846,6 +847,9 @@ pub struct UpdateUiState {
     /// The pending check came from Help > Check for updates: report
     /// "up to date" and failures too, where the startup check stays silent.
     pub manual: bool,
+    /// Bumped by every Update Now and every cancel, so events from a run
+    /// the user has since called off are dropped instead of exiting the app.
+    pub generation: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1154,6 +1158,9 @@ pub enum ConfirmKind {
     Duplicate {
         existing: Option<DlId>,
         file: Option<String>,
+        /// The URL waiting on the decision; travels with the question so a
+        /// second confirmation queued behind this one cannot lose it.
+        pending: Box<PendingAdd>,
     },
     /// Startup check could not write into the download folder.
     PermissionWarn {
@@ -1177,8 +1184,6 @@ pub enum ConfirmKind {
         stop_queues: bool,
     },
 }
-
-// ------------------------------------------------------------------ messages
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -1206,7 +1211,7 @@ pub enum Message {
     /// The OS switched between light and dark appearance (or the startup
     /// query answered). Only View > Theme > System Default acts on it.
     SystemTheme(iced::theme::Mode),
-    // main window chrome
+    /// Main window chrome: a menu-bar menu opened.
     MenuOpen(MenuBarKind),
     /// Moving the pointer over a menu-bar title while another menu is already
     /// open: switches to that menu without closing the bar (Windows menu
@@ -1270,7 +1275,7 @@ pub enum Message {
     ToolbarResume,
     ToolbarStop,
     ToolbarDelete,
-    // add url
+    /// Add URL dialog: the address box changed.
     AddrChanged(String),
     AddrAuthToggled(bool),
     AddrLogin(String),
@@ -1288,7 +1293,7 @@ pub enum Message {
     AddUrlOk,
     /// Requests arriving from the browser extension over the extbus socket.
     Ext(crate::extbus::ExtEvent),
-    // file info
+    /// File Info dialog: the category picker changed.
     FiCategory(String),
     /// TheSave As box: one full path, folder and file name.
     FiSaveAs(String),
@@ -1309,11 +1314,14 @@ pub enum Message {
     FiProxySpec(String),
     FiDownloadLater,
     FiStartDownload,
+    /// Properties mode's OK: commit the fields and close, leaving the
+    /// transfer in whatever state it was.
+    FiOk,
     FiCancel,
     /// Preview: list the archive's contents without downloading it.
     FiPreview,
     ZipPeeked(DlId, Result<Vec<hya_net::zipdir::Entry>, String>),
-    // progress dialog
+    /// Progress dialog: a tab was picked.
     ProgTabSet(DlId, ProgTab),
     ProgToggleDetails(DlId),
     ProgPauseResume(DlId),
@@ -1330,6 +1338,8 @@ pub enum Message {
     /// "Remove completed downloads from the list": the setting is global,
     /// so toggling it here writes straight to the config.
     ProgRemoveCompleted(bool),
+    /// The same tab's mirror of "Show download complete dialog".
+    ProgShowCompleteDialog(bool),
     /// Skip the virus scan running over the finished file.
     ProgScanSkip(DlId),
     /// Infected (or unscannable): keep the file, close the dialog.
@@ -1338,11 +1348,11 @@ pub enum Message {
     ProgScanDelete(DlId),
     /// Console line / verdict from the virus scanner.
     Scan(crate::scan::ScanEvent),
-    // complete dialog
+    /// Complete dialog: open the finished file.
     OpenFile(DlId),
     OpenFolder(DlId),
     MoveRename(DlId),
-    // options
+    /// Options dialog: a tab was picked.
     OptTabSet(OptTab),
     /// Extensions page: open a browser's add-on store in the default browser.
     OptExtStore(&'static str),
@@ -1360,8 +1370,7 @@ pub enum Message {
     AddrRecordMinutes(String),
     OptOk,
     OptDraft(OptField),
-    // update dialog
-    /// Startup (or manual) check finished: newer release / up to date / error.
+    /// Update dialog. Startup (or manual) check finished: newer release / up to date / error.
     UpdateChecked(Result<Option<crate::update::UpdateInfo>, String>),
     UpdateNow,
     UpdateCancel,
@@ -1369,9 +1378,11 @@ pub enum Message {
     /// Open a link out of the release notes (the "Full Changelog" compare
     /// URL) in the browser.
     UpdateOpenUrl(String),
-    /// Progress of a running update, streamed from `update::run`.
-    UpdateEvent(crate::update::UpdateEvent),
-    // scheduler
+    /// Progress of a running update, streamed from `update::run`, tagged
+    /// with the generation that started it so a cancelled run's tail is
+    /// ignored.
+    UpdateEvent(u64, crate::update::UpdateEvent),
+    /// Scheduler dialog: the queue picker changed.
     SchQueue(String),
     SchNameEdit,
     SchNameDraft(String),
@@ -1388,7 +1399,7 @@ pub enum Message {
     SchFileUp,
     SchFileDown,
     SchFileRemove,
-    // batch
+    /// Batch dialog: the list editor changed.
     BatchEdit(iced::widget::text_editor::Action),
     BatchLoaded(Option<String>),
     /// The URL box has stood still since edit `.0` — measure what it holds.
@@ -1417,7 +1428,7 @@ pub enum Message {
     BatchHideDups(bool),
     BatchBrowseDir,
     BatchDirPicked(String),
-    // generic dialog buttons
+    /// Confirm dialog: Yes.
     ConfirmYes,
     ConfirmRemoveFile(bool),
     AddrPrefill(Option<String>),
@@ -1432,6 +1443,10 @@ pub enum Message {
     /// The folder the user chose after a download failed for want of write
     /// permission on the one it had.
     SaveDirRegranted(DlId, std::path::PathBuf),
+    /// Tasks > Export: where the picker said the list should go.
+    ExportListTo(Option<std::path::PathBuf>),
+    /// Tasks > Import: the text of the file the picker chose.
+    ImportListFrom(Option<String>),
     CloseThis(window::Id),
 }
 
@@ -1454,7 +1469,6 @@ pub enum OptField {
     PortableCapture(bool),
     AutoTypesEdit(iced::widget::text_editor::Action),
     SitesEdit(iced::widget::text_editor::Action),
-    ExcDialog(bool),
     RememberLast(bool),
     ServerDate(bool),
     NoCatDirs(bool),
@@ -1502,7 +1516,6 @@ pub enum OptField {
     ProxyUser(String),
     ProxyPass(String),
     ProxyType(crate::model::ProxyType),
-    FtpPasv(bool),
     SelCategory(String),
     CatDir(String),
     BrowseCatDir,
@@ -1543,8 +1556,6 @@ pub enum SchField {
     ShutdownAction(PowerAction),
     FilesAtOnce(String),
 }
-
-// ----------------------------------------------------------------------- app
 
 pub struct App {
     pub cfg: ConfigFile,
@@ -1616,8 +1627,10 @@ pub struct App {
     pub quota_saved: (u64, i64),
     /// Last clipboard text seen by the URL watcher (deduplication).
     pub last_clipboard: String,
-    /// URL+auth waiting on the duplicate/exists decision dialog.
-    pub pending_add: Option<PendingAdd>,
+    /// Confirmations raised while one is already on screen, oldest first.
+    /// The window is one slot; a question must wait its turn, not overwrite
+    /// the one the user is still reading.
+    pub confirm_queue: std::collections::VecDeque<ConfirmKind>,
     /// Next capture-dialog window (File Info / Confirm / Batch) must be
     /// forced above the browser: at capture time this app is usually a
     /// background tray process, and a normal-level window opens behind the
@@ -1725,7 +1738,7 @@ fn exception_for(list: &[(String, usize)], host: &str) -> Option<usize> {
 /// Appending instead would leave the older entry in front of the newer one, and
 /// [`exception_for`] reads the first: the number the user just typed would be
 /// stored, displayed, and never used.
-fn upsert_exception(list: &mut Vec<(String, usize)>, server: String, n: usize) {
+pub(crate) fn upsert_exception(list: &mut Vec<(String, usize)>, server: String, n: usize) {
     match list.iter_mut().find(|(s, _)| *s == server) {
         Some(row) => row.1 = n,
         None => list.push((server, n)),
@@ -1737,10 +1750,25 @@ fn upsert_exception(list: &mut Vec<(String, usize)>, server: String, n: usize) {
 /// Names are what the menus address a profile by ([`MenuAction::SpeedProfile`]),
 /// so a second profile under a name already taken would be unreachable — the
 /// menu entry would always resolve to the first.
-fn upsert_profile(list: &mut Vec<crate::model::SpeedProfile>, name: String, limit: Option<u64>) {
+pub(crate) fn upsert_profile(
+    list: &mut Vec<crate::model::SpeedProfile>,
+    name: String,
+    limit: Option<u64>,
+) {
     match list.iter_mut().find(|p| p.name == name) {
         Some(row) => row.limit = limit,
         None => list.push(crate::model::SpeedProfile { name, limit }),
+    }
+}
+
+/// Store `login`, replacing the entry its site already has.
+///
+/// `find_login` takes the first match, so a second row for the same site
+/// would be one the user can see, edit and never use.
+pub(crate) fn upsert_login(list: &mut Vec<SiteLogin>, login: SiteLogin) {
+    match list.iter_mut().find(|l| l.site == login.site) {
+        Some(row) => *row = login,
+        None => list.push(login),
     }
 }
 
@@ -1857,7 +1885,7 @@ impl Default for App {
             cfg_dirty: false,
             quota_saved: (0, 0),
             last_clipboard: String::new(),
-            pending_add: None,
+            confirm_queue: std::collections::VecDeque::new(),
             capture_raise: false,
             queue_menu: None,
             speed_menu: false,
@@ -1965,8 +1993,7 @@ impl App {
             Task::none()
         } else {
             crate::log::warn(&format!("no write access to {dir}"));
-            self.confirm = Some(ConfirmKind::PermissionWarn { dir });
-            self.open_window(WinKind::Confirm)
+            self.ask(ConfirmKind::PermissionWarn { dir })
         }
     }
 
@@ -2009,8 +2036,7 @@ impl App {
         }
         if let Err(e) = crate::files::move_file(&from, &to) {
             crate::log::warn(&format!("move {} -> {}: {e}", from.display(), to.display()));
-            self.confirm = Some(ConfirmKind::MoveFailed(e.to_string()));
-            return self.open_window(WinKind::Confirm);
+            return self.ask(ConfirmKind::MoveFailed(e.to_string()));
         }
         let dir = to.parent().map(|p| p.to_string_lossy().into_owned());
         let name = to.file_name().map(|n| n.to_string_lossy().into_owned());
@@ -2208,7 +2234,6 @@ impl App {
                         .unwrap_or(std::cmp::Ordering::Equal),
                     Column::LastTry => a.last_try.cmp(&b.last_try),
                     Column::Description => a.description.cmp(&b.description),
-                    // Handled above.
                     Column::Name | Column::Status => std::cmp::Ordering::Equal,
                 };
                 if asc {
@@ -2292,13 +2317,13 @@ impl App {
         }
     }
 
-    // -------------------------------------------------------------- windows
-
     /// Open the Configuration window on a fresh draft of the saved settings.
     /// `tab` forces a page (the toolbar's Extensions shortcut); `None` keeps
     /// whichever page was last visited.
     fn open_options(&mut self, tab: Option<OptTab>) -> Task<Message> {
         self.options.draft = self.cfg.settings.clone();
+        self.options.base = self.cfg.settings.clone();
+        self.options.error = None;
         self.options.draft_cats = self.cfg.categories.clone();
         self.options.sel_category = model::DEFAULT_CATEGORY.into();
         self.options.cat_renames.clear();
@@ -2379,23 +2404,16 @@ impl App {
                 // Login/Password row, the Cookies row, the blank line under
                 // them, inside the dialog padding.
                 let mut h = 162.0;
-                // The note under the Cookies field is a real row: without it
-                // the line naming the store the session came from — the one
-                // thing that makes the import something the user was told
-                // about — is drawn below the window's bottom edge.
-                //
-                // TWO lines for a note, one while probing. A store path is
-                // `~/Library/Application Support/Firefox/Profiles/<salt>.default-release/cookies.sqlite`
-                // and its equivalents, which wraps at this width on every
-                // platform — so a second line is the normal case, not the
-                // exception, and reserving one clipped exactly the half of the
-                // path that identifies the profile.
+                // The cookie note is a real row, and a store path wraps to two
+                // lines at this width on every platform; one line while probing.
                 if self.add_url.cookies_importing {
                     h += 22.0;
                 } else if self.add_url.cookie_note.is_some() {
                     h += 44.0;
                 }
                 let warn = self.add_url.error.is_some()
+                    || self.add_url.stream_error.is_some()
+                    || self.add_url.metalink_error.is_some()
                     || (!self.add_url.address.trim().is_empty()
                         && site_blocked(
                             self.add_url.address.trim(),
@@ -2627,6 +2645,35 @@ impl App {
         }
     }
 
+    /// Put a question to the user. While one is already on screen it waits
+    /// in line rather than replacing it — an answer is only meaningful for
+    /// the question that was showing when it was given.
+    fn ask(&mut self, kind: ConfirmKind) -> Task<Message> {
+        if self.win_of(WinKind::Confirm).is_some() {
+            self.confirm_queue.push_back(kind);
+            return Task::none();
+        }
+        self.confirm = Some(kind);
+        self.confirm_remove_file = false;
+        self.open_window(WinKind::Confirm)
+    }
+
+    /// The confirmation window is gone: raise the next question waiting, if
+    /// any. Called from every path that dismisses one.
+    fn next_confirm(&mut self) -> Task<Message> {
+        self.confirm = None;
+        match self.confirm_queue.pop_front() {
+            Some(kind) => self.ask(kind),
+            None => Task::none(),
+        }
+    }
+
+    /// Close the confirmation window and move on to the next question.
+    fn dismiss_confirm(&mut self) -> Task<Message> {
+        let close = self.close_window(WinKind::Confirm);
+        Task::batch([close, self.next_confirm()])
+    }
+
     /// Close every Download File Info window, whichever download each one
     /// was opened for — and any Zip preview, which is a File Info dialog's
     /// sub-dialog and has nothing to show once its dialog is gone.
@@ -2638,6 +2685,13 @@ impl App {
     /// they close nothing at all and the dialog is stuck on screen. The
     /// dialog is therefore opened one at a time, and its buttons dismiss
     /// whatever File Info window exists rather than one specific id.
+    /// A window whose kind was dropped before the runtime created it: the
+    /// `window::close` issued then was lost, so the surface arrives with no
+    /// owner and must be closed again on arrival.
+    pub(crate) fn window_is_orphan(&self, id: window::Id) -> bool {
+        !self.windows.contains_key(&id)
+    }
+
     fn close_file_info_windows(&mut self) -> Task<Message> {
         let ids: Vec<window::Id> = self
             .windows
@@ -2652,8 +2706,6 @@ impl App {
         }
         Task::batch(tasks)
     }
-
-    // ------------------------------------------------------------ downloads
 
     /// Effective connection count for a URL (Connection tab exceptions).
     fn conns_for(&self, url: &str) -> usize {
@@ -2691,7 +2743,50 @@ impl App {
         engine::set_global_limit(self.cfg.settings.global_limit());
     }
 
-    // ------------------------------------------------- download limit
+    /// Put the power-save setting in force: the engine's tick, and the tray
+    /// menu's tick mark, which is rebuilt rather than synced.
+    fn set_power_save(&self, on: bool) {
+        engine::set_power_save(on);
+        crate::log::info(&format!("power save: {on}"));
+        let queues: Vec<String> = self.cfg.queues.iter().map(|q| q.name.clone()).collect();
+        crate::tray::reinstall(&queues, on);
+    }
+
+    /// The first thing in the Options draft OK cannot accept, and the page
+    /// it is on: a value that would be stored and then quietly do nothing,
+    /// or something worse than nothing.
+    fn options_problem(&self) -> Option<(OptTab, String)> {
+        let st = &self.options;
+        let s = &st.draft;
+        if s.dl_limit_enabled {
+            let mb = st.dl_limit_mb_txt.trim().parse::<u64>().unwrap_or(0);
+            let hours = st.dl_limit_hours_txt.trim().parse::<u64>().unwrap_or(0);
+            if mb == 0 || hours == 0 {
+                return Some((
+                    OptTab::Quota,
+                    i18n::tr("Enter how many MBytes per how many hours, both at least 1."),
+                ));
+            }
+        }
+        if s.speed_limiter_on && s.global_speed_limit.is_none() {
+            return Some((
+                OptTab::SpeedLimit,
+                i18n::tr("Enter a speed in KB/sec, or untick \"Limit download speed\"."),
+            ));
+        }
+        match s.proxy_mode {
+            ProxyMode::Script => {
+                return Some((OptTab::Proxy, crate::proxy::PAC_UNSUPPORTED.to_string()));
+            }
+            ProxyMode::Manual => {
+                if let Some(why) = crate::proxy::manual_problem(s) {
+                    return Some((OptTab::Proxy, why));
+                }
+            }
+            _ => {}
+        }
+        None
+    }
 
     fn quota_exhausted(&self) -> bool {
         quota_over_cap(&self.cfg.settings, &self.state.dl_quota)
@@ -2959,8 +3054,7 @@ impl App {
             .iter()
             .any(|id| self.item(*id).map(|d| d.state.is_active()).unwrap_or(false));
         if self.cfg.settings.warn_before_stop && any_active {
-            self.confirm = Some(ConfirmKind::StopWarn { ids, stop_queues });
-            return self.open_window(WinKind::Confirm);
+            return self.ask(ConfirmKind::StopWarn { ids, stop_queues });
         }
         self.stop_ids(ids, stop_queues);
         Task::none()
@@ -2989,11 +3083,14 @@ impl App {
         } else {
             self.remove_item_opts(id, remove_file);
         }
-        let mut task = self.close_window(WinKind::Progress(id));
-        if self.win_of(WinKind::FileInfo(id)).is_some() {
-            task = Task::batch([task, self.close_window(WinKind::FileInfo(id))]);
-        }
-        task
+        // Every window that describes the row goes with it: buttons on a
+        // dialog over a download that no longer exists do nothing.
+        Task::batch([
+            self.close_window(WinKind::Progress(id)),
+            self.close_window(WinKind::FileInfo(id)),
+            self.close_window(WinKind::Complete(id)),
+            self.close_window(WinKind::ZipPreview(id)),
+        ])
     }
 
     /// `pending_delete` is a deadline, not a promise: the engine's stop
@@ -3150,6 +3247,656 @@ impl App {
         id
     }
 
+    /// Name a freshly listed item after something better than its URL — a
+    /// stream's chosen rendition, a Metalink `<file>` — and file it under the
+    /// category that name implies, in that category's folder.
+    fn name_new_item(&mut self, id: DlId, name: String) {
+        let cat = categorize(&name, &self.cfg.categories);
+        let dir = self
+            .cat_dir(cat.as_deref())
+            .or_else(|| self.cat_dir(None))
+            .unwrap_or_default();
+        if let Some(d) = self.item_mut(id) {
+            d.file_name = name;
+            d.category = cat;
+            d.save_dir = dir;
+        }
+    }
+
+    /// One list entry for one `<file>` of a Metalink document, carrying the
+    /// whole mirror list, the document's size and digest, and its `<pieces>`.
+    fn adopt_metalink_file(
+        &mut self,
+        f: &engine::MetalinkChoice,
+        auth: Option<(String, String)>,
+        queue: Option<String>,
+    ) -> DlId {
+        let id = self.add_item(f.primary.clone(), auth, queue);
+        // The document names the file. A redirector URL
+        // (`metalink?repo=fedora-40`) names nothing, and the last path
+        // segment of the first mirror is a guess the document does not need
+        // us to make.
+        self.name_new_item(id, f.name.clone());
+        if let Some(d) = self.item_mut(id) {
+            d.name_locked = true;
+            d.size = f.info.size;
+            // Every mirror in the list honours ranges — a source that does
+            // not is dropped at probe time — and the document's size is what
+            // makes resuming across them safe.
+            d.resume = Some(true);
+            d.metalink = Some(f.info.clone());
+        }
+        id
+    }
+
+    /// The Batch dialog's "all files to one category / one directory"
+    /// overrides, and the Queued state every batch row is left in.
+    fn file_batch_row(
+        &mut self,
+        id: DlId,
+        cat_override: &Option<String>,
+        dir_override: &Option<String>,
+    ) {
+        if let Some(c) = cat_override {
+            let dir = self.cat_dir(Some(c));
+            if let Some(d) = self.item_mut(id) {
+                d.category = Some(c.clone());
+                if let Some(dir) = dir {
+                    d.save_dir = dir;
+                }
+            }
+        }
+        if let Some(d) = self.item_mut(id) {
+            if let Some(dir) = dir_override {
+                d.save_dir = dir.clone();
+            }
+            d.state = DlState::Queued;
+        }
+    }
+
+    /// The File Info dialog's fields for an item that was just listed.
+    fn file_info_for_new(&self, id: DlId) -> FileInfoState {
+        let d = self.item(id).expect("a just-listed item is in the list");
+        FileInfoState {
+            dl: id,
+            category: d
+                .category
+                .clone()
+                .unwrap_or_else(|| model::DEFAULT_CATEGORY.into()),
+            save_dir: d.save_dir.clone(),
+            file_name: d.file_name.clone(),
+            description: String::new(),
+            // Off by default: an edited Save As folder applies to this one
+            // download. Only an explicit tick writes it back to the category.
+            remember: false,
+            is_new: true,
+            url: d.url.clone(),
+            login: d.auth.clone().map(|a| a.0).unwrap_or_default(),
+            password: d.auth.clone().map(|a| a.1).unwrap_or_default(),
+            cookies: d.cookies.clone().unwrap_or_default(),
+            proxy_pick: d.proxy.pick(),
+            proxy_spec: d.proxy.spec().to_string(),
+            bg_blocked: !self.auto_start_type(id),
+            ..FileInfoState::default()
+        }
+    }
+
+    /// What happens to a just-listed item once the dialog that added it has
+    /// closed: the File Info dialog when Options asks for one, else a start
+    /// — unless the address is on the do-not-start list, or is a signed URL
+    /// that would expire while a dialog waits.
+    fn offer_new_item(&mut self, id: DlId, close: Task<Message>) -> Task<Message> {
+        // A signed URL may expire within seconds (`s3q.ait.dtu.dk` allows ten):
+        // a dialog that waits for a person is a guaranteed 403, so start now.
+        let perishable = self.item(id).is_some_and(|d| expiring_soon(&d.url));
+        if perishable {
+            crate::log::info(&format!(
+                "expiring link: starting at once, skipping the File Info dialog for {}",
+                self.item(id).map(|d| d.url.as_str()).unwrap_or("-")
+            ));
+        }
+        if self.cfg.settings.show_file_info_dialog && !perishable {
+            self.file_info = self.file_info_for_new(id);
+            let bg = self.file_info_prefetch(id);
+            Task::batch([close, self.open_window(WinKind::FileInfo(id)), bg])
+        } else if self
+            .item(id)
+            .map(|d| site_blocked(&d.url, &self.cfg.settings.dont_start_sites))
+            .unwrap_or(false)
+        {
+            // Blocked site, no File Info dialog to surface the block
+            // through: the item is added, queued, but left for the
+            // user to start by hand.
+            close
+        } else {
+            Task::batch([close, self.start_download(id, true)])
+        }
+    }
+
+    fn add_url_ok(&mut self) -> Task<Message> {
+        // What the address IS is still being read; adding it now
+        // would download the manifest or the mirror list as a file.
+        if self.add_url.stream_probing || self.add_url.metalink_probing {
+            return Task::none();
+        }
+        let url = self.add_url.address.trim().to_string();
+        // A mirror list is not a download; it is a list of them. Handled
+        // before the URL check because the address may be a local
+        // `.meta4` path, which `parse_url` correctly refuses.
+        if self.add_url.metalink.is_some() && self.add_url.metalink_of == url {
+            return self.add_metalink_items();
+        }
+        if let Err(e) = engine::parse_url(&url) {
+            self.add_url.error = Some(e);
+            return self.resize_open(WinKind::AddUrl);
+        }
+        let auth = self
+            .add_url
+            .use_auth
+            .then(|| (self.add_url.login.clone(), self.add_url.password.clone()));
+        // Same URL already listed, or the target file already on
+        // disk? Ask instead of silently downloading twice.
+        let existing = self
+            .state
+            .downloads
+            .iter()
+            .find(|d| d.url == url)
+            .map(|d| d.id);
+        let captured = self.add_url.capture.taken();
+        // A manifest that was inspected becomes a STREAM item: the
+        // chosen rendition and container decide the filename, which
+        // the URL path cannot.
+        let stream = self
+            .add_url
+            .stream
+            .clone()
+            .filter(|p| p.drm.is_none())
+            .map(|p| {
+                let q = self.add_url.quality.clone();
+                let container = if self.add_url.container.eq_ignore_ascii_case("ts") {
+                    "TS"
+                } else {
+                    "MP4"
+                };
+                let minutes: u64 = self.add_url.record_minutes.parse().unwrap_or(0);
+                crate::model::StreamInfo {
+                    protocol: p.protocol.clone(),
+                    variant_url: q.as_ref().and_then(|q| q.url.clone()),
+                    height: q.as_ref().and_then(|q| q.height),
+                    bandwidth: q.as_ref().and_then(|q| q.bandwidth),
+                    container: container.into(),
+                    referer: None,
+                    user_agent: None,
+                    live: p.live,
+                    max_seconds: (p.live && minutes > 0).then(|| minutes * 60),
+                }
+            });
+        let name = match &stream {
+            Some(si) => format!("{}.{}", stream_base_name(&url), si.ext()),
+            None => captured
+                .name
+                .clone()
+                .unwrap_or_else(|| engine::file_name_from_url(&url)),
+        };
+        let cat = crate::model::categorize(&name, &self.cfg.categories);
+        let dir = self
+            .cat_dir(cat.as_deref())
+            .or_else(|| self.cat_dir(None))
+            .unwrap_or_default();
+        // A capture name and a stream name are the name the file
+        // will really be saved under; so is a URL that names one.
+        let named =
+            captured.name.is_some() || stream.is_some() || engine::url_file_name(&url).is_some();
+        let file = collision_file(&dir, &name, named);
+        if existing.is_some() || file.is_some() {
+            // Logged: the dialog names a path, and the report that
+            // it names one that "does not exist" cannot be told
+            // apart from a real leftover without knowing what Hydra
+            // saw at this instant.
+            crate::log::info(&format!(
+                "duplicate: list={} disk={}",
+                existing
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                file.as_deref().unwrap_or("-")
+            ));
+            let pending = Box::new(PendingAdd {
+                url,
+                auth,
+                capture: captured,
+            });
+            self.add_url = AddUrlState::default();
+            let close = self.close_window(WinKind::AddUrl);
+            let ask = self.ask(ConfirmKind::Duplicate {
+                existing,
+                file,
+                pending,
+            });
+            return Task::batch([close, ask]);
+        }
+        let id = self.add_item(url, auth, None);
+        self.apply_capture_extras(id, captured);
+        if let Some(si) = stream {
+            self.name_new_item(id, name);
+            if let Some(d) = self.item_mut(id) {
+                // Resumable by whole segments, not byte ranges.
+                d.resume = Some(true);
+                d.stream = Some(si);
+            }
+        }
+        self.add_url = AddUrlState::default();
+        let close = self.close_window(WinKind::AddUrl);
+        self.offer_new_item(id, close)
+    }
+
+    fn on_ext_event(&mut self, ev: crate::extbus::ExtEvent) -> Task<Message> {
+        match ev {
+            crate::extbus::ExtEvent::Download(dl, ack) => {
+                // Same flow as a manual Add URL, so duplicate detection,
+                // categorization, and the File Info dialog all behave
+                // consistently for browser capture.
+                crate::log::info(&format!("ext: capture dialog for {}", dl.url));
+                self.capture_raise = true;
+                self.add_url = AddUrlState {
+                    address: dl.url,
+                    capture: CaptureExtras {
+                        cookies: dl.cookies,
+                        cookie_source: None,
+                        name: dl.filename,
+                        referer: dl.referer,
+                        proxy: dl.proxy,
+                    },
+                    ..AddUrlState::default()
+                };
+                let first_new = self.state.next_id;
+                let task = self.update(Message::AddUrlOk);
+                // The item is listed (or a duplicate dialog is up over
+                // it): hydra owns this download, so the browser may drop
+                // its own paused copy. Until this, it must not — and if
+                // the browser has already been told to keep it, this
+                // copy is the duplicate and goes away again.
+                if ack.confirm() {
+                    return task;
+                }
+                crate::log::warn("ext: capture already handed back to the browser; dropping it");
+                let added: Vec<DlId> = self
+                    .state
+                    .downloads
+                    .iter()
+                    .filter(|d| d.id >= first_new)
+                    .map(|d| d.id)
+                    .collect();
+                let mut tasks = vec![task];
+                for id in added {
+                    tasks.push(self.delete_item_opts(id, false));
+                }
+                if matches!(self.confirm, Some(ConfirmKind::Duplicate { .. })) {
+                    tasks.push(self.dismiss_confirm());
+                }
+                Task::batch(tasks)
+            }
+            crate::extbus::ExtEvent::Stream(s) => {
+                // Not the capture dialog: a manifest cannot be probed
+                // for a size or a name, so the entry is built from what
+                // the extension already read out of it and started.
+                crate::log::info(&format!("ext: stream capture for {}", s.url));
+                self.capture_raise = true;
+                let container = s.container.clone().unwrap_or_else(|| "MP4".into());
+                let ext = crate::model::container_ext(&container);
+                let base = s
+                    .filename
+                    .as_deref()
+                    .map(sanitize_file_name)
+                    .filter(|b| !b.is_empty())
+                    .unwrap_or_else(|| "stream".to_string());
+                let file_name = format!("{base}.{ext}");
+                // The URL says `.m3u8`; the FILE is a video, so the
+                // category has to be decided from the name we chose.
+                let category = categorize(&file_name, &self.cfg.categories);
+                let save_dir = self
+                    .cat_dir(category.as_deref())
+                    .or_else(|| self.cat_dir(None))
+                    .unwrap_or_else(|| ".".into());
+                let id = self.add_item(s.url.clone(), None, None);
+                if let Some(d) = self.item_mut(id) {
+                    d.file_name = file_name;
+                    d.category = category;
+                    d.save_dir = save_dir;
+                    d.cookies = s.cookies.clone();
+                    d.size = s.size;
+                    if let Some(px) = captured_proxy(s.proxy.clone()) {
+                        d.proxy = px;
+                    }
+                    // Resumable, but by whole segments rather than byte
+                    // ranges: a paused stream carries on from the last
+                    // segment that landed.
+                    d.resume = Some(true);
+                    d.stream = Some(crate::model::StreamInfo {
+                        protocol: s.protocol.clone().unwrap_or_else(|| "hls".into()),
+                        variant_url: s
+                            .variant_url
+                            .clone()
+                            .or_else(|| s.variant.as_ref().and_then(|v| v.url.clone())),
+                        height: s.variant.as_ref().and_then(|v| v.height),
+                        bandwidth: s.variant.as_ref().and_then(|v| v.bandwidth),
+                        container,
+                        referer: s.referer.clone().or_else(|| s.tab_url.clone()),
+                        user_agent: s.user_agent.clone(),
+                        live: s.live,
+                        max_seconds: None,
+                    });
+                }
+                self.start_download(id, true)
+            }
+            crate::extbus::ExtEvent::Links(urls) => {
+                self.capture_raise = true;
+                // "Download all links": the batch window, like a
+                // multi-line clipboard capture.
+                self.batch = BatchState::default();
+                self.batch.category = model::DEFAULT_CATEGORY.into();
+                let open = self.open_window(WinKind::Batch);
+                let text = urls.join("\n");
+                Task::batch([open, self.update(Message::BatchLoaded(Some(text)))])
+            }
+            crate::extbus::ExtEvent::Open => self.open_window(WinKind::Main),
+            crate::extbus::ExtEvent::Shutdown => {
+                // A newer build is taking over the single-instance slot
+                // (extbus::signal_existing): leave the way tray Exit does.
+                crate::log::info("ext: shutdown requested by a newer build; exiting");
+                self.save_state();
+                self.save_config();
+                self.flush_saves();
+                iced::exit()
+            }
+        }
+    }
+
+    /// OK, Start Download or Download Later in the File Info dialog: commit
+    /// the fields to the item, then start it, park it, or leave it as found.
+    fn commit_file_info(&mut self, start: bool, park: bool) -> Task<Message> {
+        // A route the transport cannot take stops here, with the
+        // reason under the row. Letting the dialog close would start
+        // a download that fails a moment later for a reason the user
+        // can no longer see — which is how "empty proxy
+        // specification" ended up in the Result line instead of
+        // beside the box that caused it.
+        self.file_info.proxy_needs_address = true;
+        if crate::windows::file_info::proxy_problem(&self.file_info).is_some() {
+            return self.resize_open(WinKind::FileInfo(self.file_info.dl));
+        }
+        self.file_info.proxy_needs_address = false;
+        let mut fi = self.file_info.clone();
+        if fi.save_dir.trim().is_empty() {
+            // A bare file name in Save As: keep the folder the item
+            // already has, else the category's.
+            fi.save_dir = self
+                .item(fi.dl)
+                .map(|d| d.save_dir.clone())
+                .filter(|d| !d.is_empty())
+                .or_else(|| self.cat_dir(Some(&fi.category)))
+                .unwrap_or_default();
+        }
+        // Options > Save to > "Change folder for category on last
+        // selected" is the same tick, made for every dialog whose
+        // folder the user actually edited.
+        let remember = fi.remember || (self.cfg.settings.remember_last_dir && fi.dir_touched);
+        if remember && !fi.save_dir.is_empty() {
+            // "Remember this folder" writes where the folder is
+            // actually read from: the named category normally, and
+            // the General one while category folders are switched
+            // off — otherwise the tick would silently do nothing.
+            let target = if self.cfg.settings.no_category_dirs {
+                self.cfg.categories.first().map(|c| c.name.clone())
+            } else {
+                Some(fi.category.clone())
+            };
+            if let Some(cat) =
+                target.and_then(|n| self.cfg.categories.iter_mut().find(|k| k.name == n))
+            {
+                cat.dir = fi.save_dir.clone();
+                self.save_config();
+            }
+        }
+        let old_path = self.item(fi.dl).map(|d| d.full_path());
+        let mut was = None;
+        let url_changed = self
+            .item(fi.dl)
+            .map(|d| !fi.url.trim().is_empty() && d.url != fi.url.trim())
+            .unwrap_or(false)
+            && engine::parse_url(fi.url.trim()).is_ok();
+        let (new_proxy, proxy_changed) = match self.item(fi.dl) {
+            Some(d) => reroute(d, &fi),
+            None => (
+                ProxyChoice::from_parts(fi.proxy_pick, &fi.proxy_spec),
+                false,
+            ),
+        };
+        if proxy_changed {
+            crate::log::info(&format!("#{} proxy -> {:?}", fi.dl, new_proxy.pick()));
+        }
+        if url_changed {
+            // Mirror switch: keep the held byte spans — the engine
+            // verifies the new source reports the same size and
+            // continues where mirror A stopped.
+            crate::log::info(&format!("#{} mirror -> {}", fi.dl, fi.url.trim()));
+        }
+        if (url_changed || proxy_changed)
+            && self
+                .item(fi.dl)
+                .map(|d| d.state.is_active())
+                .unwrap_or(false)
+        {
+            engine::send(Cmd::Stop(fi.dl));
+        }
+        if let Some(d) = self.item_mut(fi.dl) {
+            d.category = Some(fi.category.clone());
+            d.save_dir = fi.save_dir.clone();
+            if !fi.file_name.trim().is_empty() {
+                d.file_name = fi.file_name.trim().to_string();
+                // Typing in the box is the user naming the file:
+                // pin it so the probe this Start Download is about
+                // to fire cannot hand the name back to the server.
+                d.name_locked |= fi.name_touched;
+            }
+            d.description = fi.description.clone();
+            if url_changed {
+                d.url = fi.url.trim().to_string();
+            }
+            if url_changed || proxy_changed {
+                d.state = DlState::Paused;
+                d.error = None;
+            }
+            d.auth = (!fi.login.is_empty()).then(|| (fi.login.clone(), fi.password.clone()));
+            let typed = fi.cookies.trim();
+            // An edited value is the user's, whatever it was before:
+            // leaving the old attribution would credit a browser for
+            // a session they replaced by hand.
+            if d.cookies.as_deref().unwrap_or("") != typed {
+                d.cookie_source =
+                    (!typed.is_empty()).then(|| crate::i18n::tr("edited in Properties"));
+            }
+            d.cookies = (!typed.is_empty()).then(|| typed.to_string());
+            d.proxy = new_proxy;
+            was = Some(d.state);
+        }
+        // Aim the running transfer at the edited destination; if a
+        // small file already finished under the provisional name,
+        // move it.
+        if let Some(d) = self.item(fi.dl) {
+            let new_path = d.full_path();
+            engine::send(Cmd::SetFinalPath(
+                fi.dl,
+                new_path.to_string_lossy().into_owned(),
+            ));
+            if was == Some(DlState::Complete) {
+                if let Some(old) = old_path.filter(|o| *o != new_path) {
+                    if let Some(dir) = new_path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::rename(old, &new_path);
+                }
+            }
+        }
+        self.save_state();
+        let close = self.close_file_info_windows();
+        match (start, was) {
+            // Reveal the already-running background transfer.
+            (true, Some(st)) if st.is_active() => {
+                Task::batch([close, self.open_progress_window(fi.dl)])
+            }
+            // "Start Download As New": the finished file is being
+            // fetched again, so nothing left over from the first
+            // transfer may be taken for a resume.
+            (true, Some(DlState::Complete)) => {
+                if let Some(d) = self.item_mut(fi.dl) {
+                    reset_for_redownload(d);
+                }
+                Task::batch([close, self.start_download(fi.dl, true)])
+            }
+            (true, _) => Task::batch([close, self.start_download(fi.dl, true)]),
+            // Download Later: park the background transfer, keep the
+            // bytes for resume, and leave it Queued for Start Queue.
+            (false, Some(st)) if park && st.is_active() => {
+                self.stop_download(fi.dl);
+                let main_q = self.cfg.queues.first().map(|q| q.name.clone());
+                if let Some(d) = self.item_mut(fi.dl) {
+                    if d.queue.is_none() {
+                        d.queue = main_q;
+                    }
+                }
+                close
+            }
+            (false, _) if park => {
+                if let Some(d) = self.item_mut(fi.dl) {
+                    if matches!(d.state, DlState::Paused) {
+                        d.state = DlState::Queued;
+                    }
+                }
+                self.save_state();
+                close
+            }
+            // Properties OK: the fields are committed, the transfer
+            // is left exactly as it was found.
+            (false, _) => close,
+        }
+    }
+
+    fn batch_ok(&mut self) -> Task<Message> {
+        self.parse_batch();
+        // Only what the table shows: a hidden duplicate or a hidden
+        // web page is not added however its checkbox was left.
+        let checked: Vec<BatchRow> = self
+            .batch_rows()
+            .into_iter()
+            .filter(|r| r.checked)
+            .collect();
+        if checked.is_empty() {
+            return self.ask(ConfirmKind::NoneChecked);
+        }
+        // "All files to one directory" with no directory would file
+        // the batch wherever the process happens to be running.
+        if self.batch.to_dir && self.batch.dir.trim().is_empty() {
+            return Task::none();
+        }
+        let cat_override = self.batch.to_category.then(|| self.batch.category.clone());
+        let dir_override = self.batch.to_dir.then(|| self.batch.dir.clone());
+        let queue = Some("Main download queue".to_string());
+        let want_height = self.batch.stream_quality.height();
+        let container = if self.batch.stream_container.eq_ignore_ascii_case("ts") {
+            "TS"
+        } else {
+            "MP4"
+        };
+        for row in checked {
+            let url = row.url;
+            // A mirror list in the batch is not one download but a list
+            // of them: one item per file entry, each carrying the whole
+            // mirror list, the document's size and digest, and its
+            // `<pieces>`. Adding the document itself would save a few
+            // kilobytes of XML under the name of the object the user
+            // wanted.
+            if let Some(doc) = self.batch.metalinks.get(&url).cloned() {
+                for f in &doc.files {
+                    if self.state.downloads.iter().any(|d| d.url == f.primary) {
+                        continue;
+                    }
+                    let id = self.adopt_metalink_file(f, None, queue.clone());
+                    self.file_batch_row(id, &cat_override, &dir_override);
+                }
+                continue;
+            }
+            // A manifest in the list is a STREAM, not a file: the
+            // batch's one quality choice is resolved against each
+            // manifest's own ladder when it starts.
+            let stream = manifest_address(&url).then(|| crate::model::StreamInfo {
+                protocol: if url
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or(&url)
+                    .to_ascii_lowercase()
+                    .ends_with(".mpd")
+                {
+                    "dash".into()
+                } else {
+                    "hls".into()
+                },
+                variant_url: None,
+                height: want_height,
+                bandwidth: None,
+                container: container.into(),
+                referer: None,
+                user_agent: None,
+                live: false,
+                max_seconds: None,
+            });
+            // A name the probe resolved (a redirector's real target, or
+            // a `Content-Disposition`) beats the one the pasted URL
+            // implies, and it decides the category with it.
+            let probed = self.batch.names.get(&url).cloned();
+            let stream_name = stream
+                .as_ref()
+                .map(|si| format!("{}.{}", stream_base_name(&url), si.ext()));
+            let id = self.add_item(url, None, queue.clone());
+            if let Some(si) = stream {
+                if let Some(d) = self.item_mut(id) {
+                    d.resume = Some(true);
+                    d.stream = Some(si);
+                }
+            } else if let Some(size) = row.size {
+                // What the dialog measured is what the list shows. A
+                // "Download Later" item never starts on its own, so
+                // without this its Size column stays empty until the
+                // user runs it — the answer was already on hand.
+                //
+                // Not for a stream: the row holds the size of the
+                // MANIFEST, a couple of kilobytes of text, and the
+                // media's own size is a projection the transfer
+                // refines as segments land.
+                if let Some(d) = self.item_mut(id) {
+                    d.size = Some(size);
+                }
+            }
+            let probed = stream_name.or(probed);
+            if let Some(name) = probed.filter(|n| !n.is_empty()) {
+                let cat = categorize(&name, &self.cfg.categories);
+                let dir = self.cat_dir(cat.as_deref());
+                if let Some(d) = self.item_mut(id) {
+                    d.file_name = name;
+                    if let Some(c) = cat {
+                        d.category = Some(c);
+                    }
+                    if let Some(dir) = dir {
+                        d.save_dir = dir;
+                    }
+                }
+            }
+            self.file_batch_row(id, &cat_override, &dir_override);
+        }
+        self.save_state();
+        self.batch = BatchState::default();
+        self.close_window(WinKind::Batch)
+    }
+
     /// Turn the Metalink document in the Add URL dialog into download items.
     ///
     /// One item per file entry, because one download fetches one object and a
@@ -3179,28 +3926,7 @@ impl App {
             if self.state.downloads.iter().any(|d| d.url == f.primary) {
                 continue;
             }
-            let id = self.add_item(f.primary.clone(), auth.clone(), None);
-            let cat = crate::model::categorize(&f.name, &self.cfg.categories);
-            let dir = self
-                .cat_dir(cat.as_deref())
-                .or_else(|| self.cat_dir(None))
-                .unwrap_or_default();
-            if let Some(d) = self.item_mut(id) {
-                // The document names the file. A redirector URL
-                // (`metalink?repo=fedora-40`) names nothing, and the last path
-                // segment of the first mirror is a guess the document does not
-                // need us to make.
-                d.file_name = f.name.clone();
-                d.name_locked = true;
-                d.category = cat;
-                d.save_dir = dir;
-                d.size = f.info.size;
-                // Every mirror in the list honours ranges — a source that does
-                // not is dropped at probe time — and the document's size is
-                // what makes resuming across them safe.
-                d.resume = Some(true);
-                d.metalink = Some(f.info.clone());
-            }
+            let id = self.adopt_metalink_file(f, auth.clone(), None);
             if f.info.signed {
                 crate::log::warn(&format!(
                     "#{id} the mirror list carries an OpenPGP signature over {}; Hydra records it but does not verify it",
@@ -3237,8 +3963,6 @@ impl App {
         self.save_state();
         Task::batch(tasks)
     }
-
-    // -------------------------------------------------------- virus scan
 
     /// Hand a finished file to the configured scanner. `true` when a scan
     /// really started — the caller then defers the completion tail
@@ -3305,7 +4029,40 @@ impl App {
         task
     }
 
-    // -------------------------------------------------------- power actions
+    /// Settle the shortcut table once the dialog is done with it: every
+    /// combo in the one spelling a key press produces, and one that no press
+    /// could ever match back to its default rather than stored as dead.
+    fn normalize_shortcuts(&mut self) {
+        let mut changed = false;
+        let mut taken: Vec<String> = Vec::new();
+        for (id, default, _) in crate::model::SHORTCUT_ACTIONS {
+            let typed = self.cfg.shortcuts.get(id).cloned().unwrap_or_default();
+            // Earlier rows win a conflict: the later one would never fire.
+            let settled = model::normalize_combo(&typed)
+                .filter(|c| !taken.contains(c))
+                .unwrap_or_else(|| default.to_string());
+            taken.push(settled.clone());
+            if settled != typed {
+                self.cfg.shortcuts.insert(id.to_string(), settled);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_config();
+        }
+    }
+
+    /// Call a running update off: raise its cancel flag and retire its
+    /// generation, so nothing it still reports can act on the app.
+    fn cancel_update(&mut self) {
+        if let Some(c) = &self.updater.cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.updater = UpdateUiState {
+            generation: self.updater.generation + 1,
+            ..UpdateUiState::default()
+        };
+    }
 
     /// Arm a "when done" power action behind its cancellable countdown.
     ///
@@ -3377,8 +4134,6 @@ impl App {
         }
     }
 
-    // --------------------------------------------------------------- queues
-
     /// Records a click on the queue row `name` and answers whether it closed
     /// a double-click. `None` is a click that landed somewhere other than a
     /// queue row, which restarts the count.
@@ -3416,12 +4171,34 @@ impl App {
                 d.queue = Some(new.to_string());
             }
         }
+        if self.sch.queue == old {
+            self.sch.queue = new.to_string();
+        }
         self.save_config();
         self.save_state();
         self.refresh_native_menu();
         let queues: Vec<String> = self.cfg.queues.iter().map(|q| q.name.clone()).collect();
         crate::tray::reinstall(&queues, self.cfg.settings.power_save);
         true
+    }
+
+    /// The queue the Scheduler window is showing, by name.
+    ///
+    /// The window keeps a name, and a name can go stale — the queue was
+    /// renamed from the sidebar, or deleted. The view already falls back to
+    /// the first queue in that case; the handlers must act on the same one
+    /// rather than on nothing.
+    fn sch_queue(&mut self) -> String {
+        if !self.cfg.queues.iter().any(|q| q.name == self.sch.queue) {
+            self.sch.queue = self
+                .cfg
+                .queues
+                .first()
+                .map(|q| q.name.clone())
+                .unwrap_or_default();
+            self.sch.rename_draft = self.sch.queue.clone();
+        }
+        self.sch.queue.clone()
     }
 
     fn queue_tick(&mut self) -> Task<Message> {
@@ -3550,7 +4327,7 @@ impl App {
             if schedule_start_due(s, &hhmm, weekday, q.running) {
                 start.push(q.name.clone());
             }
-            if s.stop_enabled && s.stop_at == hhmm && q.running {
+            if s.stop_enabled && same_minute(&s.stop_at, &hhmm) && q.running {
                 stop.push(q.name.clone());
             }
         }
@@ -3611,8 +4388,6 @@ impl App {
             // Anything still queued stays queued for the next start.
         }
     }
-
-    // -------------------------------------------------------------- engine
 
     /// Adopt what a probe learned about `id`: its size, and the name the
     /// object actually landed under — a `Content-Disposition`, or the last
@@ -3970,12 +4745,23 @@ impl App {
         self.save_state();
     }
 
-    // -------------------------------------------------------------- update
-
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        engine::set_progress_window_open(
+            self.windows
+                .values()
+                .any(|k| matches!(k, WinKind::Progress(_))),
+        );
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Noop => Task::none(),
             Message::WindowOpened(id) => {
+                if self.window_is_orphan(id) {
+                    return window::close(id);
+                }
                 #[cfg(target_os = "macos")]
                 let pin_surface = iced::window::run(id, |w| {
                     crate::macos_surface::pin_color_space(w);
@@ -4085,12 +4871,9 @@ impl App {
                             iced::exit()
                         }
                     }
-                    Some(WinKind::Confirm) => {
-                        self.confirm = None;
-                        // A duplicate decision dismissed with the OS close
-                        // button must not leave its URL parked: the next
-                        // "Download as new file" would add the stale one.
-                        self.pending_add = None;
+                    Some(WinKind::Confirm) => self.next_confirm(),
+                    Some(WinKind::Shortcuts) => {
+                        self.normalize_shortcuts();
                         Task::none()
                     }
                     Some(WinKind::FileInfo(dl)) => {
@@ -4120,10 +4903,7 @@ impl App {
                         // download and forget the offer (unless the finisher
                         // is already live — then the exit is imminent).
                         if self.updater.phase != UpdatePhase::Restarting {
-                            if let Some(c) = &self.updater.cancel {
-                                c.store(true, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            self.updater = UpdateUiState::default();
+                            self.cancel_update();
                         }
                         Task::none()
                     }
@@ -4481,6 +5261,23 @@ impl App {
                 if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::F4) && mods.alt() {
                     return self.update(Message::Menu(MenuAction::Exit));
                 }
+                // Escape is every dialog's Cancel and Enter its default
+                // button, whichever one has the focus.
+                if let iced::keyboard::Key::Named(named) = &key {
+                    use iced::keyboard::key::Named;
+                    if matches!(named, Named::Escape | Named::Enter) {
+                        let kind = self.windows.get(&win).copied();
+                        let msg = match (named, kind) {
+                            (Named::Escape, Some(k)) => dialog_cancel(self, k, win),
+                            (_, Some(k)) => dialog_primary(self, k, win),
+                            (_, None) => None,
+                        };
+                        return match msg {
+                            Some(m) => self.update(m),
+                            None => Task::none(),
+                        };
+                    }
+                }
                 let combo = combo_string(&key, mods);
                 let Some(combo) = combo else {
                     return Task::none();
@@ -4489,7 +5286,7 @@ impl App {
                     .cfg
                     .shortcuts
                     .iter()
-                    .find(|(_, c)| **c == combo)
+                    .find(|(_, c)| model::normalize_combo(c).as_deref() == Some(combo.as_str()))
                     .map(|(id, _)| id.clone());
                 match action.as_deref() {
                     Some("add_url") => self.update(Message::Menu(MenuAction::AddNewDownload)),
@@ -4772,15 +5569,12 @@ impl App {
             Message::ToolbarStop => self.stop_ids_confirming(self.selected.clone(), false),
             Message::ToolbarDelete => {
                 if !self.selected.is_empty() {
-                    self.confirm = Some(ConfirmKind::DeleteItems(self.selected.clone()));
-                    self.confirm_remove_file = false;
-                    self.open_window(WinKind::Confirm)
+                    self.ask(ConfirmKind::DeleteItems(self.selected.clone()))
                 } else {
                     Task::none()
                 }
             }
 
-            // ------------------------------------------------------ add url
             Message::AddrPrefill(text) => {
                 if self.add_url.address.is_empty() {
                     if let Some(t) = text {
@@ -4993,287 +5787,10 @@ impl App {
                 self.add_url.password = s;
                 Task::none()
             }
-            Message::AddUrlOk => {
-                let url = self.add_url.address.trim().to_string();
-                // A mirror list is not a download; it is a list of them. Handled
-                // before the URL check because the address may be a local
-                // `.meta4` path, which `parse_url` correctly refuses.
-                if self.add_url.metalink.is_some() && self.add_url.metalink_of == url {
-                    return self.add_metalink_items();
-                }
-                if let Err(e) = engine::parse_url(&url) {
-                    self.add_url.error = Some(e);
-                    return self.resize_open(WinKind::AddUrl);
-                }
-                let auth = self
-                    .add_url
-                    .use_auth
-                    .then(|| (self.add_url.login.clone(), self.add_url.password.clone()));
-                // Same URL already listed, or the target file already on
-                // disk? Ask instead of silently downloading twice.
-                let existing = self
-                    .state
-                    .downloads
-                    .iter()
-                    .find(|d| d.url == url)
-                    .map(|d| d.id);
-                let captured = self.add_url.capture.taken();
-                // A manifest that was inspected becomes a STREAM item: the
-                // chosen rendition and container decide the filename, which
-                // the URL path cannot.
-                let stream = self
-                    .add_url
-                    .stream
-                    .clone()
-                    .filter(|p| p.drm.is_none())
-                    .map(|p| {
-                        let q = self.add_url.quality.clone();
-                        let container = if self.add_url.container.eq_ignore_ascii_case("ts") {
-                            "TS"
-                        } else {
-                            "MP4"
-                        };
-                        let minutes: u64 = self.add_url.record_minutes.parse().unwrap_or(0);
-                        crate::model::StreamInfo {
-                            protocol: p.protocol.clone(),
-                            variant_url: q.as_ref().and_then(|q| q.url.clone()),
-                            height: q.as_ref().and_then(|q| q.height),
-                            bandwidth: q.as_ref().and_then(|q| q.bandwidth),
-                            container: container.into(),
-                            referer: None,
-                            user_agent: None,
-                            live: p.live,
-                            max_seconds: (p.live && minutes > 0).then(|| minutes * 60),
-                        }
-                    });
-                let name = match &stream {
-                    Some(si) => {
-                        let ext = if si.container.eq_ignore_ascii_case("ts") {
-                            "ts"
-                        } else {
-                            "mp4"
-                        };
-                        format!("{}.{ext}", stream_base_name(&url))
-                    }
-                    None => captured
-                        .name
-                        .clone()
-                        .unwrap_or_else(|| engine::file_name_from_url(&url)),
-                };
-                let cat = crate::model::categorize(&name, &self.cfg.categories);
-                let dir = self
-                    .cat_dir(cat.as_deref())
-                    .or_else(|| self.cat_dir(None))
-                    .unwrap_or_default();
-                // A capture name and a stream name are the name the file
-                // will really be saved under; so is a URL that names one.
-                let named = captured.name.is_some()
-                    || stream.is_some()
-                    || engine::url_file_name(&url).is_some();
-                let file = collision_file(&dir, &name, named);
-                if existing.is_some() || file.is_some() {
-                    // Logged: the dialog names a path, and the report that
-                    // it names one that "does not exist" cannot be told
-                    // apart from a real leftover without knowing what Hydra
-                    // saw at this instant.
-                    crate::log::info(&format!(
-                        "duplicate: list={} disk={}",
-                        existing
-                            .map(|i| i.to_string())
-                            .unwrap_or_else(|| "-".into()),
-                        file.as_deref().unwrap_or("-")
-                    ));
-                    self.pending_add = Some(PendingAdd {
-                        url,
-                        auth,
-                        capture: captured,
-                    });
-                    self.confirm = Some(ConfirmKind::Duplicate { existing, file });
-                    self.add_url = AddUrlState::default();
-                    let close = self.close_window(WinKind::AddUrl);
-                    return Task::batch([close, self.open_window(WinKind::Confirm)]);
-                }
-                let id = self.add_item(url, auth, None);
-                self.apply_capture_extras(id, captured);
-                if let Some(si) = stream {
-                    let cat = crate::model::categorize(&name, &self.cfg.categories);
-                    let dir = self
-                        .cat_dir(cat.as_deref())
-                        .or_else(|| self.cat_dir(None))
-                        .unwrap_or_default();
-                    if let Some(d) = self.item_mut(id) {
-                        d.file_name = name.clone();
-                        d.category = cat;
-                        d.save_dir = dir;
-                        // Resumable by whole segments, not byte ranges.
-                        d.resume = Some(true);
-                        d.stream = Some(si);
-                    }
-                }
-                self.add_url = AddUrlState::default();
-                let close = self.close_window(WinKind::AddUrl);
-                // A signed URL is perishable, and the File Info dialog waits for
-                // a person. An S3 presigned link can allow as little as ten
-                // seconds — `s3q.ait.dtu.dk` issues exactly that — so parking one
-                // behind a confirmation is not a delay, it is a guaranteed 403:
-                // the deadline is checked when each request ARRIVES, and no
-                // human clicks that fast. Start it now and let the item be
-                // edited in the list, which is the only ordering where the
-                // download can still happen.
-                let perishable = self.item(id).is_some_and(|d| expiring_soon(&d.url));
-                if perishable {
-                    crate::log::info(&format!(
-                        "expiring link: starting at once, skipping the File Info dialog for {}",
-                        self.item(id).map(|d| d.url.as_str()).unwrap_or("-")
-                    ));
-                }
-                if self.cfg.settings.show_file_info_dialog && !perishable {
-                    let d = self.item(id).unwrap();
-                    self.file_info = FileInfoState {
-                        dl: id,
-                        category: d
-                            .category
-                            .clone()
-                            .unwrap_or_else(|| model::DEFAULT_CATEGORY.into()),
-                        save_dir: d.save_dir.clone(),
-                        file_name: d.file_name.clone(),
-                        description: String::new(),
-                        // Off by default: an edited Save As folder applies
-                        // to this one download. Only an explicit tick
-                        // writes it back to the category.
-                        remember: false,
-                        is_new: true,
-                        url: d.url.clone(),
-                        login: d.auth.clone().map(|a| a.0).unwrap_or_default(),
-                        password: d.auth.clone().map(|a| a.1).unwrap_or_default(),
-                        cookies: d.cookies.clone().unwrap_or_default(),
-                        proxy_pick: d.proxy.pick(),
-                        proxy_spec: d.proxy.spec().to_string(),
-                        bg_blocked: !self.auto_start_type(id),
-                        ..FileInfoState::default()
-                    };
-                    let bg = self.file_info_prefetch(id);
-                    Task::batch([close, self.open_window(WinKind::FileInfo(id)), bg])
-                } else if self
-                    .item(id)
-                    .map(|d| site_blocked(&d.url, &self.cfg.settings.dont_start_sites))
-                    .unwrap_or(false)
-                {
-                    // Blocked site, no File Info dialog to surface the block
-                    // through: the item is added, queued, but left for the
-                    // user to start by hand.
-                    close
-                } else {
-                    Task::batch([close, self.start_download(id, true)])
-                }
-            }
+            Message::AddUrlOk => self.add_url_ok(),
 
-            // ------------------------------------------- browser extension
-            Message::Ext(ev) => match ev {
-                crate::extbus::ExtEvent::Download(dl, ack) => {
-                    // Same flow as a manual Add URL, so duplicate detection,
-                    // categorization, and the File Info dialog all behave
-                    // consistently for browser capture.
-                    crate::log::info(&format!("ext: capture dialog for {}", dl.url));
-                    self.capture_raise = true;
-                    self.add_url = AddUrlState {
-                        address: dl.url,
-                        capture: CaptureExtras {
-                            cookies: dl.cookies,
-                            cookie_source: None,
-                            name: dl.filename,
-                            referer: dl.referer,
-                            proxy: dl.proxy,
-                        },
-                        ..AddUrlState::default()
-                    };
-                    let task = self.update(Message::AddUrlOk);
-                    // The item is listed (or a duplicate dialog is up over
-                    // it): hydra owns this download, so the browser may drop
-                    // its own paused copy. Until this, it must not.
-                    ack.confirm();
-                    task
-                }
-                crate::extbus::ExtEvent::Stream(s) => {
-                    // Not the capture dialog: a manifest cannot be probed
-                    // for a size or a name, so the entry is built from what
-                    // the extension already read out of it and started.
-                    crate::log::info(&format!("ext: stream capture for {}", s.url));
-                    self.capture_raise = true;
-                    let container = s.container.clone().unwrap_or_else(|| "MP4".into());
-                    let ext = if container.eq_ignore_ascii_case("ts") {
-                        "ts"
-                    } else {
-                        "mp4"
-                    };
-                    let base = s
-                        .filename
-                        .as_deref()
-                        .map(sanitize_file_name)
-                        .filter(|b| !b.is_empty())
-                        .unwrap_or_else(|| "stream".to_string());
-                    let file_name = format!("{base}.{ext}");
-                    // The URL says `.m3u8`; the FILE is a video, so the
-                    // category has to be decided from the name we chose.
-                    let category = categorize(&file_name, &self.cfg.categories);
-                    let save_dir = self
-                        .cat_dir(category.as_deref())
-                        .or_else(|| self.cat_dir(None))
-                        .unwrap_or_else(|| ".".into());
-                    let id = self.add_item(s.url.clone(), None, None);
-                    if let Some(d) = self.item_mut(id) {
-                        d.file_name = file_name;
-                        d.category = category;
-                        d.save_dir = save_dir;
-                        d.cookies = s.cookies.clone();
-                        d.size = s.size;
-                        if let Some(px) = captured_proxy(s.proxy.clone()) {
-                            d.proxy = px;
-                        }
-                        // Resumable, but by whole segments rather than byte
-                        // ranges: a paused stream carries on from the last
-                        // segment that landed.
-                        d.resume = Some(true);
-                        d.stream = Some(crate::model::StreamInfo {
-                            protocol: s.protocol.clone().unwrap_or_else(|| "hls".into()),
-                            variant_url: s
-                                .variant_url
-                                .clone()
-                                .or_else(|| s.variant.as_ref().and_then(|v| v.url.clone())),
-                            height: s.variant.as_ref().and_then(|v| v.height),
-                            bandwidth: s.variant.as_ref().and_then(|v| v.bandwidth),
-                            container,
-                            referer: s.referer.clone().or_else(|| s.tab_url.clone()),
-                            user_agent: s.user_agent.clone(),
-                            live: s.live,
-                            max_seconds: None,
-                        });
-                    }
-                    self.start_download(id, true)
-                }
-                crate::extbus::ExtEvent::Links(urls) => {
-                    self.capture_raise = true;
-                    // "Download all links": the batch window, like a
-                    // multi-line clipboard capture.
-                    self.batch = BatchState::default();
-                    self.batch.category = model::DEFAULT_CATEGORY.into();
-                    let open = self.open_window(WinKind::Batch);
-                    let text = urls.join("\n");
-                    Task::batch([open, self.update(Message::BatchLoaded(Some(text)))])
-                }
-                crate::extbus::ExtEvent::Open => self.open_window(WinKind::Main),
-                crate::extbus::ExtEvent::Shutdown => {
-                    // A newer build is taking over the single-instance slot
-                    // (extbus::signal_existing): leave the way tray Exit does.
-                    crate::log::info("ext: shutdown requested by a newer build; exiting");
-                    self.save_state();
-                    self.save_config();
-                    self.flush_saves();
-                    iced::exit()
-                }
-            },
+            Message::Ext(ev) => self.on_ext_event(ev),
 
-            // ---------------------------------------------------- file info
             Message::FiCategory(c) => {
                 if let Some(dir) = self.cat_dir(Some(&c)) {
                     if !self.file_info.dir_touched {
@@ -5358,168 +5875,11 @@ impl App {
                 self.file_info.proxy_spec = v;
                 self.resize_open(WinKind::FileInfo(self.file_info.dl))
             }
-            Message::FiDownloadLater | Message::FiStartDownload => {
-                let start = matches!(message, Message::FiStartDownload);
-                // A route the transport cannot take stops here, with the
-                // reason under the row. Letting the dialog close would start
-                // a download that fails a moment later for a reason the user
-                // can no longer see — which is how "empty proxy
-                // specification" ended up in the Result line instead of
-                // beside the box that caused it.
-                self.file_info.proxy_needs_address = true;
-                if crate::windows::file_info::proxy_problem(&self.file_info).is_some() {
-                    return self.resize_open(WinKind::FileInfo(self.file_info.dl));
-                }
-                self.file_info.proxy_needs_address = false;
-                let mut fi = self.file_info.clone();
-                if fi.save_dir.trim().is_empty() {
-                    // A bare file name in Save As: keep the folder the item
-                    // already has, else the category's.
-                    fi.save_dir = self
-                        .item(fi.dl)
-                        .map(|d| d.save_dir.clone())
-                        .filter(|d| !d.is_empty())
-                        .or_else(|| self.cat_dir(Some(&fi.category)))
-                        .unwrap_or_default();
-                }
-                if fi.remember && !fi.save_dir.is_empty() {
-                    // "Remember this folder" writes where the folder is
-                    // actually read from: the named category normally, and
-                    // the General one while category folders are switched
-                    // off — otherwise the tick would silently do nothing.
-                    let target = if self.cfg.settings.no_category_dirs {
-                        self.cfg.categories.first().map(|c| c.name.clone())
-                    } else {
-                        Some(fi.category.clone())
-                    };
-                    if let Some(cat) =
-                        target.and_then(|n| self.cfg.categories.iter_mut().find(|k| k.name == n))
-                    {
-                        cat.dir = fi.save_dir.clone();
-                        self.save_config();
-                    }
-                }
-                let old_path = self.item(fi.dl).map(|d| d.full_path());
-                let mut was = None;
-                let url_changed = self
-                    .item(fi.dl)
-                    .map(|d| !fi.url.trim().is_empty() && d.url != fi.url.trim())
-                    .unwrap_or(false)
-                    && engine::parse_url(fi.url.trim()).is_ok();
-                let (new_proxy, proxy_changed) = match self.item(fi.dl) {
-                    Some(d) => reroute(d, &fi),
-                    None => (
-                        ProxyChoice::from_parts(fi.proxy_pick, &fi.proxy_spec),
-                        false,
-                    ),
-                };
-                if proxy_changed {
-                    crate::log::info(&format!("#{} proxy -> {:?}", fi.dl, new_proxy.pick()));
-                }
-                if url_changed {
-                    // Mirror switch: keep the held byte spans — the engine
-                    // verifies the new source reports the same size and
-                    // continues where mirror A stopped.
-                    crate::log::info(&format!("#{} mirror -> {}", fi.dl, fi.url.trim()));
-                }
-                if (url_changed || proxy_changed)
-                    && self
-                        .item(fi.dl)
-                        .map(|d| d.state.is_active())
-                        .unwrap_or(false)
-                {
-                    engine::send(Cmd::Stop(fi.dl));
-                }
-                if let Some(d) = self.item_mut(fi.dl) {
-                    d.category = Some(fi.category.clone());
-                    d.save_dir = fi.save_dir.clone();
-                    if !fi.file_name.trim().is_empty() {
-                        d.file_name = fi.file_name.trim().to_string();
-                        // Typing in the box is the user naming the file:
-                        // pin it so the probe this Start Download is about
-                        // to fire cannot hand the name back to the server.
-                        d.name_locked |= fi.name_touched;
-                    }
-                    d.description = fi.description.clone();
-                    if url_changed {
-                        d.url = fi.url.trim().to_string();
-                    }
-                    if url_changed || proxy_changed {
-                        d.state = DlState::Paused;
-                        d.error = None;
-                    }
-                    d.auth =
-                        (!fi.login.is_empty()).then(|| (fi.login.clone(), fi.password.clone()));
-                    let typed = fi.cookies.trim();
-                    // An edited value is the user's, whatever it was before:
-                    // leaving the old attribution would credit a browser for
-                    // a session they replaced by hand.
-                    if d.cookies.as_deref().unwrap_or("") != typed {
-                        d.cookie_source =
-                            (!typed.is_empty()).then(|| crate::i18n::tr("edited in Properties"));
-                    }
-                    d.cookies = (!typed.is_empty()).then(|| typed.to_string());
-                    d.proxy = new_proxy;
-                    was = Some(d.state);
-                }
-                // Aim the running transfer at the edited destination; if a
-                // small file already finished under the provisional name,
-                // move it.
-                if let Some(d) = self.item(fi.dl) {
-                    let new_path = d.full_path();
-                    engine::send(Cmd::SetFinalPath(
-                        fi.dl,
-                        new_path.to_string_lossy().into_owned(),
-                    ));
-                    if was == Some(DlState::Complete) {
-                        if let Some(old) = old_path.filter(|o| *o != new_path) {
-                            if let Some(dir) = new_path.parent() {
-                                let _ = std::fs::create_dir_all(dir);
-                            }
-                            let _ = std::fs::rename(old, &new_path);
-                        }
-                    }
-                }
-                self.save_state();
-                let close = self.close_file_info_windows();
-                match (start, was) {
-                    // Reveal the already-running background transfer.
-                    (true, Some(st)) if st.is_active() => {
-                        Task::batch([close, self.open_progress_window(fi.dl)])
-                    }
-                    // "Start Download As New": the finished file is being
-                    // fetched again, so nothing left over from the first
-                    // transfer may be taken for a resume.
-                    (true, Some(DlState::Complete)) => {
-                        if let Some(d) = self.item_mut(fi.dl) {
-                            reset_for_redownload(d);
-                        }
-                        Task::batch([close, self.start_download(fi.dl, true)])
-                    }
-                    (true, _) => Task::batch([close, self.start_download(fi.dl, true)]),
-                    // Download Later: park the background transfer, keep the
-                    // bytes for resume, and leave it Queued for Start Queue.
-                    (false, Some(st)) if st.is_active() => {
-                        self.stop_download(fi.dl);
-                        let main_q = self.cfg.queues.first().map(|q| q.name.clone());
-                        if let Some(d) = self.item_mut(fi.dl) {
-                            if d.queue.is_none() {
-                                d.queue = main_q;
-                            }
-                        }
-                        close
-                    }
-                    (false, _) => {
-                        if let Some(d) = self.item_mut(fi.dl) {
-                            if matches!(d.state, DlState::Paused) {
-                                d.state = DlState::Queued;
-                            }
-                        }
-                        self.save_state();
-                        close
-                    }
-                }
-            }
+            Message::FiDownloadLater | Message::FiStartDownload | Message::FiOk => self
+                .commit_file_info(
+                    matches!(message, Message::FiStartDownload),
+                    matches!(message, Message::FiDownloadLater),
+                ),
             Message::FiCancel => {
                 let fi = self.file_info.clone();
                 let close = self.close_file_info_windows();
@@ -5541,7 +5901,6 @@ impl App {
                 }
             }
 
-            // ----------------------------------------------------- progress
             Message::FiPreview => {
                 let fi = &self.file_info;
                 let dl = fi.dl;
@@ -5696,12 +6055,12 @@ impl App {
                 }
             },
             Message::ProgLimitOn(id, on) => {
-                self.prog.entry(id).or_default().limit_on = on;
-                let kb: u64 = self
-                    .prog
-                    .get(&id)
-                    .and_then(|p| p.limit_kb.parse().ok())
-                    .unwrap_or(10);
+                let p = self.prog.entry(id).or_default();
+                p.limit_on = on;
+                // A blank or zero box is not a cap; the box shows the number
+                // the transfer is actually held to.
+                let kb = p.limit_kb.parse().ok().filter(|kb| *kb > 0).unwrap_or(10);
+                p.limit_kb = kb.to_string();
                 if let Some(d) = self.item_mut(id) {
                     d.speed_limit = on.then_some(kb * 1024);
                 }
@@ -5744,8 +6103,10 @@ impl App {
                 if s.chars().all(|c| c.is_ascii_digit()) && s.len() <= 9 {
                     let p = self.prog.entry(id).or_default();
                     p.limit_kb = s;
-                    if p.limit_on {
-                        let kb: u64 = p.limit_kb.parse().unwrap_or(10);
+                    // Blank or zero mid-edit keeps the cap in force rather
+                    // than lifting it: a box being retyped is not "unlimited".
+                    let kb: Option<u64> = p.limit_kb.parse().ok().filter(|kb| *kb > 0);
+                    if let (true, Some(kb)) = (p.limit_on, kb) {
                         if let Some(d) = self.item_mut(id) {
                             d.speed_limit = Some(kb * 1024);
                         }
@@ -5786,8 +6147,12 @@ impl App {
                 self.save_config();
                 Task::none()
             }
+            Message::ProgShowCompleteDialog(b) => {
+                self.cfg.settings.show_complete_dialog = b;
+                self.save_config();
+                Task::none()
+            }
 
-            // ----------------------------------------------------- complete
             Message::OpenFile(id) => {
                 if let Some(d) = self.item(id) {
                     let _ = open::that_detached(d.full_path());
@@ -5811,7 +6176,6 @@ impl App {
             // and Open / Open folder then act on the file where it now is.
             Message::MoveRename(id) => self.move_rename(id, self.win_of(WinKind::Complete(id))),
 
-            // ------------------------------------------------------ options
             Message::OptTabSet(t) => {
                 self.options.tab = t;
                 Task::none()
@@ -5822,15 +6186,39 @@ impl App {
             }
             Message::OptCopy(value) => iced::clipboard::write(value),
             Message::OptOk => {
+                // A draft the transfers could not act on stays on screen,
+                // on the page that holds the problem, with the reason beside
+                // the buttons.
+                if let Some((tab, why)) = self.options_problem() {
+                    self.options.tab = tab;
+                    self.options.error = Some(why);
+                    return Task::none();
+                }
+                self.options.error = None;
                 self.options.commit_cat_exts();
                 let details = self.options.draft.show_conn_details;
                 let details_changed = details != self.cfg.settings.show_conn_details;
                 let capture_changed =
                     self.options.draft.portable_capture != self.cfg.settings.portable_capture;
-                self.cfg.settings = self.options.draft.clone();
+                let power_save_changed =
+                    self.options.draft.power_save != self.cfg.settings.power_save;
+                let (base, draft) = (self.options.base.clone(), self.options.draft.clone());
+                self.cfg.settings.apply_options_draft(&base, &draft);
                 self.cfg.categories = self.options.draft_cats.clone();
                 self.apply_category_edits();
                 self.save_config();
+                if power_save_changed {
+                    self.set_power_save(self.cfg.settings.power_save);
+                }
+                // A tab switched off here has nothing to show in a progress
+                // box already sitting on it.
+                for p in self.prog.values_mut() {
+                    let gone = (p.tab == ProgTab::Speed && !self.cfg.settings.show_speed_tab)
+                        || (p.tab == ProgTab::Completion && !self.cfg.settings.show_completion_tab);
+                    if gone {
+                        p.tab = ProgTab::Status;
+                    }
+                }
                 // The Speed Limiter is editable here as well as from the
                 // toolbar, and the transfers it applies to are running while
                 // this window is open.
@@ -5894,7 +6282,6 @@ impl App {
             }
             Message::OptDraft(f) => self.on_opt_field(f),
 
-            // ------------------------------------------------------- update
             Message::UpdateChecked(res) => {
                 let manual = std::mem::take(&mut self.updater.manual);
                 match res {
@@ -5902,19 +6289,16 @@ impl App {
                         crate::log::info(&format!("update available: {}", info.version));
                         self.updater = UpdateUiState {
                             info: Some(info),
+                            generation: self.updater.generation,
                             ..UpdateUiState::default()
                         };
                         self.open_window(WinKind::Update)
                     }
-                    Ok(None) if manual => {
-                        self.confirm = Some(ConfirmKind::UpToDate);
-                        self.open_window(WinKind::Confirm)
-                    }
+                    Ok(None) if manual => self.ask(ConfirmKind::UpToDate),
                     Ok(None) => Task::none(),
                     Err(e) if manual => {
                         crate::log::warn(&format!("update check failed: {e}"));
-                        self.confirm = Some(ConfirmKind::UpdateCheckFailed(e));
-                        self.open_window(WinKind::Confirm)
+                        self.ask(ConfirmKind::UpdateCheckFailed(e))
                     }
                     Err(e) => {
                         // A failed startup check is a log line, never a
@@ -5932,10 +6316,11 @@ impl App {
                     "update: user chose Update Now for {}",
                     info.version
                 ));
-                // The dialog does not offer this for a packaged install; a
-                // shortcut or a stale frame must not start a download the
-                // finisher would then be unable to apply.
-                if !info.in_place {
+                // The dialog does not offer this for a packaged install or
+                // a release with nothing for this machine; a shortcut or a
+                // stale frame must not start a download the finisher would
+                // then be unable to apply.
+                if !info.in_place || !info.has_bundle {
                     return Task::none();
                 }
                 if !matches!(
@@ -5950,7 +6335,11 @@ impl App {
                     got: 0,
                     total: (info.size > 0).then_some(info.size),
                 };
-                Task::run(crate::update::run(info, cancel), Message::UpdateEvent)
+                self.updater.generation += 1;
+                let generation = self.updater.generation;
+                Task::run(crate::update::run(info, cancel), move |ev| {
+                    Message::UpdateEvent(generation, ev)
+                })
             }
             Message::UpdateCancel => {
                 match self.updater.phase {
@@ -5963,12 +6352,15 @@ impl App {
                         }
                         Task::none()
                     }
-                    // Too late to stop; ignore.
-                    UpdatePhase::Verifying | UpdatePhase::Preparing | UpdatePhase::Restarting => {
-                        Task::none()
-                    }
+                    // The finisher is live and waiting for this process to
+                    // exit; too late to stop.
+                    UpdatePhase::Restarting => Task::none(),
+                    // Verifying/Preparing: the flag stops the run before the
+                    // finisher is spawned, and the generation bump makes sure
+                    // a ReadyToRestart that slipped through cannot exit the
+                    // app the user just chose to keep.
                     _ => {
-                        self.updater = UpdateUiState::default();
+                        self.cancel_update();
                         self.close_window(WinKind::Update)
                     }
                 }
@@ -5987,8 +6379,12 @@ impl App {
                 }
                 Task::none()
             }
-            Message::UpdateEvent(ev) => {
+            Message::UpdateEvent(generation, ev) => {
                 use crate::update::UpdateEvent as Ev;
+                if generation != self.updater.generation {
+                    crate::log::info(&format!("update: ignoring {ev:?} from a cancelled run"));
+                    return Task::none();
+                }
                 match ev {
                     Ev::Progress(got, total) => {
                         if let UpdatePhase::Downloading { total: known, .. } = self.updater.phase {
@@ -6028,7 +6424,6 @@ impl App {
                 }
             }
 
-            // ---------------------------------------------------- scheduler
             Message::SchQueue(q) => {
                 self.sch.rename_draft = q.clone();
                 self.sch.queue = q.clone();
@@ -6084,13 +6479,13 @@ impl App {
                 Task::none()
             }
             Message::SchStartNow => {
-                let name = self.sch.queue.clone();
+                let name = self.sch_queue();
                 // set_queue_running promotes paused members back to Queued.
                 self.set_queue_running(&name, true);
                 self.queue_tick()
             }
             Message::SchStop => {
-                let name = self.sch.queue.clone();
+                let name = self.sch_queue();
                 self.set_queue_running(&name, false);
                 Task::none()
             }
@@ -6099,13 +6494,18 @@ impl App {
                 // nothing here to commit — what this does is put the queue on
                 // disk now instead of at the next tick, and close the window,
                 // which is the acknowledgement a dialog that saves as you
-                // type otherwise never gives.
+                // type otherwise never gives. The times are the exception:
+                // typed freely, spelled `HH:MM` once the dialog is done.
+                for q in &mut self.cfg.queues {
+                    q.schedule.start_at = model::normalize_hhmm(&q.schedule.start_at);
+                    q.schedule.stop_at = model::normalize_hhmm(&q.schedule.stop_at);
+                }
+                self.save_config();
                 self.flush_saves();
                 self.close_window(WinKind::Scheduler)
             }
             Message::SchNewQueue => {
-                let n = self.cfg.queues.len() + 1;
-                let name = format!("{} {n}", i18n::tr("Queue"));
+                let name = model::free_queue_name(&self.cfg.queues, &i18n::tr("Queue"));
                 let color = Some(crate::model::pick_queue_color(&self.cfg.queues));
                 self.cfg.queues.push(crate::model::QueueDef {
                     name: name.clone(),
@@ -6122,7 +6522,7 @@ impl App {
                 Task::none()
             }
             Message::SchDeleteQueue => {
-                let name = self.sch.queue.clone();
+                let name = self.sch_queue();
                 let builtin = self
                     .cfg
                     .queues
@@ -6240,7 +6640,6 @@ impl App {
                 Task::none()
             }
 
-            // -------------------------------------------------------- batch
             Message::BatchEdit(a) => {
                 let edited = a.is_edit();
                 self.batch.text.perform(a);
@@ -6451,166 +6850,12 @@ impl App {
                 self.batch.to_category = false;
                 Task::none()
             }
-            Message::BatchOk => {
-                self.parse_batch();
-                // Only what the table shows: a hidden duplicate or a hidden
-                // web page is not added however its checkbox was left.
-                let checked: Vec<BatchRow> = self
-                    .batch_rows()
-                    .into_iter()
-                    .filter(|r| r.checked)
-                    .collect();
-                if checked.is_empty() {
-                    self.confirm = Some(ConfirmKind::NoneChecked);
-                    return self.open_window(WinKind::Confirm);
-                }
-                let cat_override = self.batch.to_category.then(|| self.batch.category.clone());
-                let dir_override = self.batch.to_dir.then(|| self.batch.dir.clone());
-                let queue = Some("Main download queue".to_string());
-                let want_height = self.batch.stream_quality.height();
-                let container = if self.batch.stream_container.eq_ignore_ascii_case("ts") {
-                    "TS"
-                } else {
-                    "MP4"
-                };
-                for row in checked {
-                    let url = row.url;
-                    // A mirror list in the batch is not one download but a list
-                    // of them: one item per file entry, each carrying the whole
-                    // mirror list, the document's size and digest, and its
-                    // `<pieces>`. Adding the document itself would save a few
-                    // kilobytes of XML under the name of the object the user
-                    // wanted.
-                    if let Some(doc) = self.batch.metalinks.get(&url).cloned() {
-                        for f in &doc.files {
-                            if self.state.downloads.iter().any(|d| d.url == f.primary) {
-                                continue;
-                            }
-                            let id = self.add_item(f.primary.clone(), None, queue.clone());
-                            let cat = cat_override
-                                .clone()
-                                .or_else(|| categorize(&f.name, &self.cfg.categories));
-                            let dir = dir_override
-                                .clone()
-                                .or_else(|| self.cat_dir(cat.as_deref()));
-                            if let Some(d) = self.item_mut(id) {
-                                // The document names the file; a redirector URL
-                                // names nothing worth using.
-                                d.file_name = f.name.clone();
-                                d.name_locked = true;
-                                d.size = f.info.size;
-                                // Every mirror that survives resolution honours
-                                // ranges, and the document's size is what makes
-                                // resuming across them safe.
-                                d.resume = Some(true);
-                                d.metalink = Some(f.info.clone());
-                                d.category = cat;
-                                if let Some(dir) = dir {
-                                    d.save_dir = dir;
-                                }
-                                d.state = DlState::Queued;
-                            }
-                        }
-                        continue;
-                    }
-                    // A manifest in the list is a STREAM, not a file: the
-                    // batch's one quality choice is resolved against each
-                    // manifest's own ladder when it starts.
-                    let stream = manifest_address(&url).then(|| crate::model::StreamInfo {
-                        protocol: if url
-                            .split(['?', '#'])
-                            .next()
-                            .unwrap_or(&url)
-                            .to_ascii_lowercase()
-                            .ends_with(".mpd")
-                        {
-                            "dash".into()
-                        } else {
-                            "hls".into()
-                        },
-                        variant_url: None,
-                        height: want_height,
-                        bandwidth: None,
-                        container: container.into(),
-                        referer: None,
-                        user_agent: None,
-                        live: false,
-                        max_seconds: None,
-                    });
-                    // A name the probe resolved (a redirector's real target, or
-                    // a `Content-Disposition`) beats the one the pasted URL
-                    // implies, and it decides the category with it.
-                    let probed = self.batch.names.get(&url).cloned();
-                    let stream_name = stream.as_ref().map(|si| {
-                        let ext = if si.container.eq_ignore_ascii_case("ts") {
-                            "ts"
-                        } else {
-                            "mp4"
-                        };
-                        format!("{}.{ext}", stream_base_name(&url))
-                    });
-                    let id = self.add_item(url, None, queue.clone());
-                    if let Some(si) = stream {
-                        if let Some(d) = self.item_mut(id) {
-                            d.resume = Some(true);
-                            d.stream = Some(si);
-                        }
-                    } else if let Some(size) = row.size {
-                        // What the dialog measured is what the list shows. A
-                        // "Download Later" item never starts on its own, so
-                        // without this its Size column stays empty until the
-                        // user runs it — the answer was already on hand.
-                        //
-                        // Not for a stream: the row holds the size of the
-                        // MANIFEST, a couple of kilobytes of text, and the
-                        // media's own size is a projection the transfer
-                        // refines as segments land.
-                        if let Some(d) = self.item_mut(id) {
-                            d.size = Some(size);
-                        }
-                    }
-                    let probed = stream_name.or(probed);
-                    if let Some(name) = probed.filter(|n| !n.is_empty()) {
-                        let cat = categorize(&name, &self.cfg.categories);
-                        let dir = self.cat_dir(cat.as_deref());
-                        if let Some(d) = self.item_mut(id) {
-                            d.file_name = name;
-                            if let Some(c) = cat {
-                                d.category = Some(c);
-                            }
-                            if let Some(dir) = dir {
-                                d.save_dir = dir;
-                            }
-                        }
-                    }
-                    if let Some(c) = &cat_override {
-                        let dir = self.cat_dir(Some(c));
-                        if let Some(d) = self.item_mut(id) {
-                            d.category = Some(c.clone());
-                            if let Some(dir) = dir {
-                                d.save_dir = dir;
-                            }
-                        }
-                    }
-                    if let Some(dir) = &dir_override {
-                        if let Some(d) = self.item_mut(id) {
-                            d.save_dir = dir.clone();
-                        }
-                    }
-                    if let Some(d) = self.item_mut(id) {
-                        d.state = DlState::Queued;
-                    }
-                }
-                self.save_state();
-                self.batch = BatchState::default();
-                self.close_window(WinKind::Batch)
-            }
+            Message::BatchOk => self.batch_ok(),
 
-            // ------------------------------------------------------ dialogs
             Message::ConfirmYes => {
                 let kind = self.confirm.take();
                 let remove_file = self.confirm_remove_file;
-                let close = self.close_window(WinKind::Confirm);
+                let close = self.dismiss_confirm();
                 match kind {
                     Some(ConfirmKind::DeleteItems(ids)) => {
                         let mut tasks = vec![close];
@@ -6647,8 +6892,7 @@ impl App {
             Message::OpenPermissions => {
                 // The guide window explains and deep-links; nothing can be
                 // granted programmatically by design.
-                self.confirm = None;
-                let close = self.close_window(WinKind::Confirm);
+                let close = self.dismiss_confirm();
                 self.refresh_perm_status();
                 Task::batch([close, self.open_window(WinKind::Permissions)])
             }
@@ -6665,27 +6909,39 @@ impl App {
                     Some(ConfirmKind::Duplicate { existing, .. }) => existing,
                     _ => None,
                 };
-                self.pending_add = None;
-                let close = self.close_window(WinKind::Confirm);
+                let close = self.dismiss_confirm();
                 match existing {
                     Some(id) => {
                         self.selected = vec![id];
+                        // A finished entry has nothing to resume: starting
+                        // it again would fetch the file over the copy that
+                        // is already there. Show it instead.
+                        if self.item(id).is_some_and(|d| d.state == DlState::Complete) {
+                            return close;
+                        }
                         Task::batch([close, self.start_download(id, true)])
                     }
                     None => close,
                 }
             }
             Message::DupOpen => {
-                if let Some(ConfirmKind::Duplicate { file: Some(f), .. }) = self.confirm.take() {
-                    let _ = open::that_detached(f);
+                if let Some(ConfirmKind::Duplicate { existing, file, .. }) = self.confirm.take() {
+                    let path = file
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| existing.and_then(|id| self.item(id)).map(|d| d.full_path()));
+                    if let Some(p) = path {
+                        let _ = open::that_detached(p);
+                    }
                 }
-                self.pending_add = None;
-                self.close_window(WinKind::Confirm)
+                self.dismiss_confirm()
             }
             Message::DupNew => {
-                self.confirm = None;
-                let close = self.close_window(WinKind::Confirm);
-                let Some(pending) = self.pending_add.take() else {
+                let pending = match self.confirm.take() {
+                    Some(ConfirmKind::Duplicate { pending, .. }) => Some(pending),
+                    _ => None,
+                };
+                let close = self.dismiss_confirm();
+                let Some(pending) = pending else {
                     return close;
                 };
                 let id = self.add_item(pending.url, pending.auth, None);
@@ -6704,40 +6960,41 @@ impl App {
                     }
                 }
                 self.save_state();
-                // Same rule as the first-time path: a signed URL cannot afford
-                // a second dialog either, and having just spent one on the
-                // duplicate question it can afford it least of all.
-                let perishable = self.item(id).is_some_and(|d| expiring_soon(&d.url));
-                if self.cfg.settings.show_file_info_dialog && !perishable {
-                    let d = self.item(id).unwrap();
-                    self.file_info = FileInfoState {
-                        dl: id,
-                        category: d
-                            .category
-                            .clone()
-                            .unwrap_or_else(|| model::DEFAULT_CATEGORY.into()),
-                        save_dir: d.save_dir.clone(),
-                        file_name: d.file_name.clone(),
-                        description: String::new(),
-                        // Off by default: an edited Save As folder applies
-                        // to this one download. Only an explicit tick
-                        // writes it back to the category.
-                        remember: false,
-                        is_new: true,
-                        url: d.url.clone(),
-                        name_touched: true,
-                        proxy_pick: d.proxy.pick(),
-                        proxy_spec: d.proxy.spec().to_string(),
-                        bg_blocked: !self.auto_start_type(id),
-                        ..FileInfoState::default()
-                    };
-                    let bg = self.file_info_prefetch(id);
-                    Task::batch([close, self.open_window(WinKind::FileInfo(id)), bg])
-                } else {
-                    Task::batch([close, self.start_download(id, true)])
+                let task = self.offer_new_item(id, close);
+                // When that opened the dialog, the name in it is the user's:
+                // the probe must not hand it back to the server's suggestion.
+                if self.file_info.dl == id {
+                    self.file_info.name_touched = true;
                 }
+                task
             }
             Message::MoveRenameTo(id, to) => self.move_rename_to(id, to),
+            Message::ExportListTo(path) => {
+                if let Some(path) = path {
+                    let urls: Vec<&str> = self
+                        .state
+                        .downloads
+                        .iter()
+                        .map(|d| d.url.as_str())
+                        .collect();
+                    if let Err(e) = std::fs::write(&path, urls.join("\n")) {
+                        crate::log::warn(&format!("export {}: {e}", path.display()));
+                    }
+                }
+                Task::none()
+            }
+            Message::ImportListFrom(text) => {
+                for line in text.iter().flat_map(|t| t.lines()).map(str::trim) {
+                    // A list exported from this very app is mostly what is
+                    // already here; each address is added once.
+                    if engine::parse_url(line).is_ok()
+                        && !self.state.downloads.iter().any(|d| d.url == line)
+                    {
+                        self.add_item(line.to_string(), None, None);
+                    }
+                }
+                Task::none()
+            }
             Message::SaveDirRegranted(id, dir) => {
                 self.save_dir_regranted(id, dir);
                 self.start_download(id, false)
@@ -6745,9 +7002,10 @@ impl App {
             Message::CloseThis(id) => {
                 match self.windows.remove(&id) {
                     Some(WinKind::Confirm) => {
-                        self.confirm = None;
-                        self.pending_add = None;
+                        let next = self.next_confirm();
+                        return Task::batch([window::close(id), next]);
                     }
+                    Some(WinKind::Shortcuts) => self.normalize_shortcuts(),
                     Some(WinKind::Complete(dl)) => self.complete_dismissed(dl),
                     // The countdown is normally dismissed by its own Cancel
                     // button; reaching it through the generic close path
@@ -6906,11 +7164,13 @@ impl App {
         self.batch.sel.retain(|i| shown.contains(i));
     }
 
-    // ------------------------------------------------------------ menu bar
-
     fn on_menu(&mut self, action: MenuAction) -> Task<Message> {
         match action {
             MenuAction::AddNewDownload => {
+                // Already up: bring it forward with whatever is typed in it.
+                if self.win_of(WinKind::AddUrl).is_some() {
+                    return self.open_window(WinKind::AddUrl);
+                }
                 self.add_url = AddUrlState::default();
                 // Pre-fill the address when the clipboard holds a
                 // plausible download link.
@@ -6920,6 +7180,9 @@ impl App {
                 ])
             }
             MenuAction::AddBatch => {
+                if self.win_of(WinKind::Batch).is_some() {
+                    return self.open_window(WinKind::Batch);
+                }
                 self.batch = BatchState::default();
                 self.batch.category = model::DEFAULT_CATEGORY.into();
                 self.open_window(WinKind::Batch)
@@ -6950,23 +7213,21 @@ impl App {
             }
             MenuAction::SiteGrabber | MenuAction::DropTarget | MenuAction::Find => Task::none(),
             MenuAction::ExportList => {
-                let urls: Vec<String> =
-                    self.state.downloads.iter().map(|d| d.url.clone()).collect();
-                let path = model::app_dir().join("export.txt");
-                let _ = std::fs::write(&path, urls.join("\n"));
-                let _ = open::that_detached(model::app_dir());
-                Task::none()
+                let ask = Ask {
+                    file_name: Some("hydra-downloads.txt".into()),
+                    filter: Some(("Text", &["txt"])),
+                    ..Ask::default()
+                };
+                picker::save(self.win_of(WinKind::Main), ask).map(Message::ExportListTo)
             }
             MenuAction::ImportList => {
-                let path = model::app_dir().join("export.txt");
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                        if engine::parse_url(line).is_ok() {
-                            self.add_item(line.to_string(), None, None);
-                        }
-                    }
-                }
-                Task::none()
+                let ask = Ask {
+                    filter: Some(("Text", &["txt", "text", "lst"])),
+                    ..Ask::default()
+                };
+                picker::file(self.win_of(WinKind::Main), ask).map(|p| {
+                    Message::ImportListFrom(p.and_then(|p| std::fs::read_to_string(p).ok()))
+                })
             }
             MenuAction::Exit => {
                 self.save_state();
@@ -7004,20 +7265,9 @@ impl App {
                     .collect();
                 self.stop_ids_confirming(ids, true)
             }
-            MenuAction::DeleteAllCompleted => {
-                self.confirm = Some(ConfirmKind::DeleteCompleted);
-                self.confirm_remove_file = false;
-                self.open_window(WinKind::Confirm)
-            }
+            MenuAction::DeleteAllCompleted => self.ask(ConfirmKind::DeleteCompleted),
             MenuAction::Scheduler => {
-                if self.sch.queue.is_empty() {
-                    self.sch.queue = self
-                        .cfg
-                        .queues
-                        .first()
-                        .map(|q| q.name.clone())
-                        .unwrap_or_default();
-                }
+                self.sch_queue();
                 self.sch.rename_draft = self.sch.queue.clone();
                 self.open_window(WinKind::Scheduler)
             }
@@ -7179,8 +7429,7 @@ impl App {
                     )
                 });
                 if face_changes {
-                    self.confirm = Some(ConfirmKind::FontNeedsRestart);
-                    let confirm = self.open_window(WinKind::Confirm);
+                    let confirm = self.ask(ConfirmKind::FontNeedsRestart);
                     return match floor {
                         Some(floor) => Task::batch([floor, confirm]),
                         None => confirm,
@@ -7253,15 +7502,10 @@ impl App {
                 Task::none()
             }
             MenuAction::PowerSaveToggle => {
-                self.cfg.settings.power_save = !self.cfg.settings.power_save;
-                engine::set_power_save(self.cfg.settings.power_save);
-                crate::log::info(&format!("power save: {}", self.cfg.settings.power_save));
+                let on = !self.cfg.settings.power_save;
+                self.cfg.settings.power_save = on;
                 self.save_config();
-                {
-                    let queues: Vec<String> =
-                        self.cfg.queues.iter().map(|q| q.name.clone()).collect();
-                    crate::tray::reinstall(&queues, self.cfg.settings.power_save);
-                }
+                self.set_power_save(on);
                 Task::none()
             }
             MenuAction::OpenSel => {
@@ -7338,292 +7582,36 @@ impl App {
     }
 
     fn on_opt_field(&mut self, f: OptField) -> Task<Message> {
-        // Editor actions first: they need `self.options` whole.
         match f {
-            OptField::AutoTypesEdit(a) => {
-                self.options.auto_types_edit.perform(a);
-                self.options.draft.auto_types = self.options.auto_types_edit.text();
-                return Task::none();
-            }
-            OptField::SitesEdit(a) => {
-                self.options.sites_edit.perform(a);
-                self.options.draft.dont_start_sites = self.options.sites_edit.text();
-                return Task::none();
-            }
-            OptField::CatExtsEdit(a) => {
-                self.options.cat_exts_edit.perform(a);
-                return Task::none();
-            }
-            // The Download-limit numbers keep a text buffer beside the draft:
-            // digits only, and the draft takes the value only when it parses,
-            // so a momentarily empty field is a legal editing state instead of
-            // an ignored keystroke.
-            OptField::DlLimitMb(v) => {
-                let v: String = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect();
-                if let Ok(n) = v.parse() {
-                    self.options.draft.dl_limit_mb = n;
-                }
-                self.options.dl_limit_mb_txt = v;
-                return Task::none();
-            }
-            OptField::DlLimitHours(v) => {
-                let v: String = v.chars().filter(|c| c.is_ascii_digit()).take(5).collect();
-                if let Ok(n) = v.parse() {
-                    self.options.draft.dl_limit_hours = n;
-                }
-                self.options.dl_limit_hours_txt = v;
-                return Task::none();
-            }
-            OptField::SpeedLimitKb(v) => {
-                let v: String = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect();
-                // Blank or zero is "no number yet", not a cap of zero — a
-                // zero cap would stall every transfer under it.
-                self.options.draft.global_speed_limit = v
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|kb| *kb > 0)
-                    .map(|kb| kb * 1024);
-                self.options.speed_limit_kb_txt = v;
-                return Task::none();
-            }
-            _ => {}
-        }
-        let s = &mut self.options.draft;
-        match f {
-            OptField::LaunchStartup(b) => s.launch_on_startup = b,
-            OptField::CheckUpdates(b) => s.check_updates_on_startup = b,
-            OptField::BetaChannel(b) => s.beta_channel = b,
-            OptField::StartInTray(b) => s.start_in_tray = b,
-            OptField::CloseToTray(b) => s.close_to_tray = b,
-            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-            OptField::HideTaskbar(b) => s.hide_from_taskbar = b,
-            OptField::PowerSave(b) => {
-                s.power_save = b;
-                engine::set_power_save(b);
-            }
-            OptField::GpuRender(b) => s.gpu_render = b,
-            OptField::Clipboard(b) => s.monitor_clipboard = b,
-            OptField::PortableCapture(b) => s.portable_capture = b,
-            OptField::Browser(i, b) => {
-                if let Some(x) = s.capture_browsers.get_mut(i) {
-                    x.1 = b;
-                }
-            }
-            OptField::AutoTypesEdit(_)
-            | OptField::SitesEdit(_)
-            | OptField::CatExtsEdit(_)
-            | OptField::DlLimitMb(_)
-            | OptField::DlLimitHours(_)
-            | OptField::SpeedLimitKb(_) => unreachable!(),
-            OptField::ExcDialog(b) => s.show_exception_dialog = b,
-            OptField::RememberLast(b) => s.remember_last_dir = b,
-            OptField::ServerDate(b) => s.server_file_date = b,
-            OptField::NoCatDirs(b) => s.no_category_dirs = b,
-            OptField::ShowFileInfo(b) => s.show_file_info_dialog = b,
-            OptField::BgDownload(b) => s.bg_download = b,
-            OptField::StartMinimized(b) => s.start_minimized = b,
-            OptField::SpeedTab(b) => s.show_speed_tab = b,
-            OptField::CompletionTab(b) => s.show_completion_tab = b,
-            OptField::HideButtons(b) => s.show_hide_buttons = b,
-            OptField::ConnDetails(b) => s.show_conn_details = b,
-            OptField::CompleteDialog(b) => s.show_complete_dialog = b,
-            OptField::RemoveCompleted(b) => s.remove_completed = b,
-            OptField::UserAgent(v) => s.user_agent = v,
-            OptField::VirusScanner(v) => s.virus_scanner = v,
-            OptField::VirusArgs(v) => s.virus_args = v,
-            OptField::BrowseVirus => {
-                return picker::file(self.win_of(WinKind::Options), Ask::default())
-                    .map(|p| Message::OptDraft(OptField::VirusPicked(p.map(picker::into_string))));
-            }
-            OptField::VirusPicked(Some(p)) => s.virus_scanner = p,
-            OptField::VirusPicked(None) => {}
-            OptField::DefaultConns(n) => s.default_conns = n,
-            OptField::AdaptiveConns(b) => s.adaptive_conns = b,
-            // Stored as the one `BROWSER[:PROFILE]` string the CLI parses, so
-            // the two surfaces cannot disagree about what a profile is.
-            OptField::CookiesBrowser(name) => {
-                s.cookies_from_browser =
-                    crate::windows::options::with_browser(&s.cookies_from_browser, &name);
-                return self.check_cookie_source();
-            }
-            OptField::CookiesProfile(v) => {
-                s.cookies_from_browser =
-                    crate::windows::options::with_profile(&s.cookies_from_browser, &v);
-                return self.check_cookie_source();
-            }
-            OptField::ExcSel(i) => {
-                self.options.sel_exc = Some(i);
-                if let Some((server, n)) = self.options.draft.conn_exceptions.get(i) {
-                    self.options.conn_exc_server = server.clone();
-                    self.options.conn_exc_n = n.to_string();
-                }
-            }
-            OptField::ExcServer(v) => self.options.conn_exc_server = v,
-            OptField::ExcConns(v) => self.options.conn_exc_n = v,
-            OptField::ExcAdd => {
-                let server = self.options.conn_exc_server.trim().to_string();
-                let n: usize = self.options.conn_exc_n.trim().parse().unwrap_or(0);
-                if !server.is_empty() && n > 0 {
-                    upsert_exception(
-                        &mut self.options.draft.conn_exceptions,
-                        server,
-                        n.clamp(1, 32),
-                    );
-                    self.options.sel_exc = None;
-                    self.options.conn_exc_server.clear();
-                    self.options.conn_exc_n.clear();
-                }
-            }
-            OptField::ExcRemove => {
-                if let Some(i) = self.options.sel_exc.take() {
-                    if i < self.options.draft.conn_exceptions.len() {
-                        self.options.draft.conn_exceptions.remove(i);
-                    }
-                    self.options.conn_exc_server.clear();
-                    self.options.conn_exc_n.clear();
-                }
-            }
-            OptField::DlLimit(b) => s.dl_limit_enabled = b,
-            OptField::SpeedLimiter(b) => s.speed_limiter_on = b,
-            OptField::ProfileSel(i) => {
-                self.options.sel_profile = Some(i);
-                if let Some(p) = self.options.draft.speed_profiles.get(i) {
-                    self.options.profile_name = p.name.clone();
-                    self.options.profile_kb =
-                        p.limit.map(|b| (b / 1024).to_string()).unwrap_or_default();
-                }
-            }
-            OptField::ProfileName(v) => self.options.profile_name = v,
-            OptField::ProfileKb(v) => {
-                self.options.profile_kb = v.chars().filter(|c| c.is_ascii_digit()).take(9).collect()
-            }
-            OptField::ProfileAdd => {
-                let name = self.options.profile_name.trim().to_string();
-                if !name.is_empty() {
-                    // Blank speed makes an unlimited profile — the one that
-                    // clears the cap, which every profile list needs.
-                    let limit = self
-                        .options
-                        .profile_kb
-                        .trim()
-                        .parse::<u64>()
-                        .ok()
-                        .filter(|kb| *kb > 0)
-                        .map(|kb| kb * 1024);
-                    upsert_profile(&mut self.options.draft.speed_profiles, name, limit);
-                    self.options.sel_profile = None;
-                    self.options.profile_name.clear();
-                    self.options.profile_kb.clear();
-                }
-            }
-            OptField::ProfileRemove => {
-                if let Some(i) = self.options.sel_profile.take() {
-                    if i < self.options.draft.speed_profiles.len() {
-                        self.options.draft.speed_profiles.remove(i);
-                    }
-                    self.options.profile_name.clear();
-                    self.options.profile_kb.clear();
-                }
-            }
-            OptField::WarnStop(b) => s.warn_before_stop = b,
-            OptField::ProxyMode(m) => s.proxy_mode = m,
-            OptField::ProxyScript(v) => s.proxy_script = v,
-            OptField::ProxyHost(v) => s.proxy_host = v,
-            OptField::ProxyPort(v) => s.proxy_port = v,
-            OptField::ProxyUser(v) => s.proxy_user = v,
-            OptField::ProxyPass(v) => s.proxy_pass = v,
-            OptField::ProxyType(t) => s.proxy_type = t,
-            OptField::FtpPasv(b) => s.ftp_pasv = b,
-            OptField::SelCategory(c) => self.options.select_category(c),
-            OptField::CatName(v) => self.options.cat_name = v,
-            OptField::CatAdd => self.options.add_category(),
-            OptField::CatRename => self.options.rename_category(),
-            OptField::CatRemove => self.options.remove_category(),
-            OptField::CatDir(v) => {
-                let sel = self.options.sel_category.clone();
-                if let Some(c) = self.options.draft_cats.iter_mut().find(|c| c.name == sel) {
-                    c.dir = v;
-                }
-            }
-            OptField::BrowseCatDir => {
-                return picker::folder(self.win_of(WinKind::Options), Ask::default()).map(|p| {
-                    Message::OptDraft(OptField::CatDirPicked(p.map(picker::into_string)))
-                });
-            }
-            OptField::CatDirPicked(Some(p)) => {
-                let sel = self.options.sel_category.clone();
-                if let Some(c) = self.options.draft_cats.iter_mut().find(|c| c.name == sel) {
-                    c.dir = p;
-                }
-            }
-            OptField::CatDirPicked(None) => {}
-            OptField::LoginSel(i) => {
-                self.options.sel_login = Some(i);
-                if let Some(l) = self.options.draft.logins.get(i) {
-                    self.options.login_site = l.site.clone();
-                    self.options.login_user = l.user.clone();
-                    self.options.login_pass = l.pass.clone();
-                }
-            }
-            OptField::LoginSite(v) => self.options.login_site = v,
-            OptField::LoginUser(v) => self.options.login_user = v,
-            OptField::LoginPass(v) => self.options.login_pass = v,
-            OptField::LoginAdd => {
-                let site = self.options.login_site.trim().to_string();
-                if !site.is_empty() {
-                    self.options.draft.logins.push(SiteLogin {
-                        site,
-                        user: self.options.login_user.clone(),
-                        pass: self.options.login_pass.clone(),
-                    });
-                    self.options.login_site.clear();
-                    self.options.login_user.clear();
-                    self.options.login_pass.clear();
-                }
-            }
-            OptField::LoginRemove => {
-                if let Some(i) = self.options.sel_login.take() {
-                    if i < self.options.draft.logins.len() {
-                        self.options.draft.logins.remove(i);
-                    }
-                }
-            }
-            OptField::Sound(i, b) => {
-                if let Some(row) = s.sounds.get_mut(i) {
-                    row.enabled = b;
-                }
-            }
+            OptField::BrowseVirus => picker::file(self.win_of(WinKind::Options), Ask::default())
+                .map(|p| Message::OptDraft(OptField::VirusPicked(p.map(picker::into_string)))),
+            OptField::BrowseCatDir => picker::folder(self.win_of(WinKind::Options), Ask::default())
+                .map(|p| Message::OptDraft(OptField::CatDirPicked(p.map(picker::into_string)))),
             OptField::SoundBrowse(i) => {
                 let ask = Ask {
                     filter: Some(("Audio", &["wav", "ogg"])),
                     ..Ask::default()
                 };
-                return picker::file(self.win_of(WinKind::Options), ask).and_then(move |p| {
+                picker::file(self.win_of(WinKind::Options), ask).and_then(move |p| {
                     Task::done(Message::OptDraft(OptField::SoundPicked(
                         i,
                         picker::into_string(p),
                     )))
-                });
+                })
             }
-            OptField::SoundPicked(i, p) => {
-                if let Some(row) = s.sounds.get_mut(i) {
-                    row.file = p;
-                }
+            f @ (OptField::CookiesBrowser(_) | OptField::CookiesProfile(_)) => {
+                self.options.apply(f);
+                self.check_cookie_source()
             }
-            OptField::SoundPlay(i) => {
-                if let Some(row) = s.sounds.get(i) {
-                    sounds::play(
-                        (!row.file.is_empty()).then(|| row.file.clone()),
-                        sounds::Event::from_index(i),
-                    );
-                }
+            f => {
+                self.options.apply(f);
+                Task::none()
             }
         }
-        Task::none()
     }
 
     fn on_sch_field(&mut self, f: SchField) {
-        let name = self.sch.queue.clone();
+        let name = self.sch_queue();
         let Some(q) = self.cfg.queues.iter_mut().find(|q| q.name == name) else {
             return;
         };
@@ -8302,44 +8290,12 @@ pub fn sum_spans(spans: &[(u64, u64)]) -> u64 {
     spans.iter().map(|(lo, hi)| hi.saturating_sub(*lo)).sum()
 }
 
-/// Sort, clamp and merge persisted byte spans. `Scheduler::mark_done` is
-/// told "these bytes arrived, never fetch them again", so spans read back
-/// from disk are not trusted as-is: inverted spans drop, spans past the
-/// object end clamp, and overlapping or adjacent spans merge.
-/// A page title made safe to be a filename on any of the three platforms.
-///
-/// The extension already trims what it can see, but the name arrives from a
-/// web page and must never be trusted to be a leaf name: a `/` or a `..` in
-/// it would place the finished file outside the category directory.
-/// Whether an address is worth reading as a manifest.
-///
-/// The body decides in the end, but fetching every address the user types
-/// would be both slow and rude; the extension is the cheap filter.
 /// A filename for a stream, from its manifest URL.
 ///
 /// Manifests are called `index.m3u8` or `master.mpd` almost universally, so
 /// the directory above is what actually names the asset.
 pub fn stream_base_name(url: &str) -> String {
-    let bare = url.split(['?', '#']).next().unwrap_or(url);
-    let path = match bare.find("://") {
-        Some(i) => {
-            let rest = &bare[i + 3..];
-            rest.find('/').map(|j| &rest[j..]).unwrap_or("")
-        }
-        None => bare,
-    };
-    let mut parts = path.rsplit('/').filter(|p| !p.is_empty());
-    let file = parts.next().unwrap_or("stream");
-    let stem = file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file);
-    const GENERIC: &[&str] = &[
-        "index", "master", "manifest", "playlist", "mono", "stream", "media", "video", "main",
-    ];
-    let picked = if GENERIC.contains(&stem.to_ascii_lowercase().as_str()) {
-        parts.next().unwrap_or(stem)
-    } else {
-        stem
-    };
-    let cleaned = sanitize_file_name(picked);
+    let cleaned = sanitize_file_name(&hya_stream::url::stream_base_name(url));
     if cleaned.is_empty() {
         "stream".into()
     } else {
@@ -8347,6 +8303,10 @@ pub fn stream_base_name(url: &str) -> String {
     }
 }
 
+/// Whether an address is worth reading as a manifest.
+///
+/// The body decides in the end, but fetching every address the user types
+/// would be both slow and rude; the extension is the cheap filter.
 pub fn manifest_address(url: &str) -> bool {
     let lower = url
         .split(['?', '#'])
@@ -8357,6 +8317,11 @@ pub fn manifest_address(url: &str) -> bool {
         && (lower.ends_with(".m3u8") || lower.ends_with(".m3u") || lower.ends_with(".mpd"))
 }
 
+/// A page title made safe to be a filename on any of the three platforms.
+///
+/// The extension already trims what it can see, but the name arrives from a
+/// web page and must never be trusted to be a leaf name: a `/` or a `..` in
+/// it would place the finished file outside the category directory.
 pub fn sanitize_file_name(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
@@ -8386,6 +8351,10 @@ pub fn sanitize_file_name(raw: &str) -> String {
     capped[..cut].trim().to_string()
 }
 
+/// Sort, clamp and merge persisted byte spans. `Scheduler::mark_done` is
+/// told "these bytes arrived, never fetch them again", so spans read back
+/// from disk are not trusted as-is: inverted spans drop, spans past the
+/// object end clamp, and overlapping or adjacent spans merge.
 pub fn sanitize_spans(spans: &[(u64, u64)], size: Option<u64>) -> Vec<(u64, u64)> {
     let mut v: Vec<(u64, u64)> = spans
         .iter()
@@ -8462,6 +8431,63 @@ pub fn part_matches(part: &std::path::Path, size: Option<u64>, held: &[(u64, u64
     true
 }
 
+/// What Escape means in window `kind`: its Cancel button, or nothing for
+/// the windows that have none (the main window, a progress box).
+fn dialog_cancel(app: &App, kind: WinKind, id: window::Id) -> Option<Message> {
+    if !app.windows.contains_key(&id) {
+        return None;
+    }
+    Some(match kind {
+        WinKind::Main | WinKind::Progress(_) => return None,
+        WinKind::FileInfo(_) => Message::FiCancel,
+        WinKind::Power => Message::PowerCancel,
+        WinKind::Update => Message::UpdateCancel,
+        _ => Message::CloseThis(id),
+    })
+}
+
+/// What Enter means in window `kind`: the button the dialog draws as its
+/// default. `None` where pressing it blind would be wrong — a duplicate
+/// question has three equal answers, and the countdown's default is Cancel.
+fn dialog_primary(app: &App, kind: WinKind, id: window::Id) -> Option<Message> {
+    Some(match kind {
+        WinKind::Main | WinKind::Progress(_) => return None,
+        WinKind::Confirm => match &app.confirm {
+            Some(
+                ConfirmKind::DeleteItems(_)
+                | ConfirmKind::DeleteCompleted
+                | ConfirmKind::StopWarn { .. },
+            ) => Message::ConfirmYes,
+            Some(ConfirmKind::PermissionWarn { .. }) => Message::OpenPermissions,
+            Some(ConfirmKind::Duplicate { .. }) | None => return None,
+            Some(_) => Message::CloseThis(id),
+        },
+        WinKind::AddUrl => Message::AddUrlOk,
+        WinKind::FileInfo(_) if app.file_info.is_new => Message::FiStartDownload,
+        WinKind::FileInfo(_) => Message::FiOk,
+        WinKind::Batch => Message::BatchOk,
+        WinKind::Options => Message::OptOk,
+        WinKind::Scheduler => Message::SchSave,
+        WinKind::Complete(dl) => Message::OpenFile(dl),
+        WinKind::Power => Message::PowerCancel,
+        WinKind::Update => match (&app.updater.phase, &app.updater.info) {
+            (UpdatePhase::Idle, Some(info)) if !info.has_bundle => return None,
+            (UpdatePhase::Idle, Some(info)) if info.in_place => Message::UpdateNow,
+            (UpdatePhase::Idle, Some(info)) => match &info.package {
+                Some((_, url, _)) => Message::UpdateOpenUrl(url.clone()),
+                None => return None,
+            },
+            (UpdatePhase::Failed(_), _) => Message::UpdateNow,
+            _ => return None,
+        },
+        WinKind::About
+        | WinKind::Shortcuts
+        | WinKind::Columns
+        | WinKind::Permissions
+        | WinKind::ZipPreview(_) => Message::CloseThis(id),
+    })
+}
+
 /// Is a queue's scheduled start due this minute?
 ///
 /// The day checkboxes belong to the *Daily* mode: "Once" fires at the next
@@ -8475,17 +8501,26 @@ pub fn schedule_start_due(
     weekday: usize,
     running: bool,
 ) -> bool {
-    if !s.start_enabled || s.start_at != hhmm || running {
+    if !s.start_enabled || !same_minute(&s.start_at, hhmm) || running {
         return false;
     }
     s.once || s.days.get(weekday).copied().unwrap_or(false)
 }
 
+/// Whether two typed times name the same minute: `9:00` is `09:00`.
+fn same_minute(a: &str, b: &str) -> bool {
+    match (model::parse_hhmm(a), model::parse_hhmm(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Bytes the Connection tab's download limit allows per window, or `None`
-/// while the limit is switched off.
+/// while the limit is switched off. A zero cap would refuse every start for
+/// good, so it floors at one MB like the hours floor at one.
 pub fn quota_cap(s: &crate::model::Settings) -> Option<u64> {
     s.dl_limit_enabled
-        .then(|| s.dl_limit_mb.saturating_mul(1024 * 1024))
+        .then(|| s.dl_limit_mb.max(1).saturating_mul(1024 * 1024))
 }
 
 /// Window length in seconds. Zero hours would describe a window that never
@@ -10064,6 +10099,10 @@ mod tests {
         // Nothing usable still yields a filename, and never a path.
         assert_eq!(stream_base_name("https://cdn.ex/"), "stream");
         assert!(!stream_base_name("https://e/a/../../etc/passwd.m3u8").contains('/'));
+        // Decoded for the reader, then made a leaf name: an escaped slash
+        // must not become a directory.
+        assert_eq!(stream_base_name("https://cdn.ex/My%20Show.m3u8"), "My Show");
+        assert_eq!(stream_base_name("https://cdn.ex/a%2Fb.m3u8"), "a b");
     }
 
     #[test]
@@ -10927,5 +10966,639 @@ mod tests {
         std::env::set_var("FLATPAK_ID", "io.github.ja7ad.hydra");
         assert_eq!(super::linux_application_id(), "io.github.ja7ad.hydra");
         std::env::remove_var("FLATPAK_ID");
+    }
+
+    fn properties_for(app: &App, id: DlId) -> FileInfoState {
+        let d = app.item(id).expect("item");
+        FileInfoState {
+            dl: id,
+            category: d
+                .category
+                .clone()
+                .unwrap_or_else(|| model::DEFAULT_CATEGORY.into()),
+            save_dir: d.save_dir.clone(),
+            file_name: d.file_name.clone(),
+            url: d.url.clone(),
+            is_new: false,
+            ..FileInfoState::default()
+        }
+    }
+
+    /// The reported bug: Properties > OK was wired to "Download Later", so
+    /// pressing OK on a running transfer stopped it and queued it. OK
+    /// commits the fields and leaves the transfer exactly as it found it.
+    #[test]
+    fn properties_ok_leaves_a_running_download_running() {
+        let mut app = App::default();
+        let id = app.add_item("https://a.b/x.iso".into(), None, None);
+        app.item_mut(id).unwrap().state = DlState::Connecting;
+        app.file_info = FileInfoState {
+            description: "notes".into(),
+            ..properties_for(&app, id)
+        };
+
+        let _ = app.update(Message::FiOk);
+
+        let d = app.item(id).unwrap();
+        assert!(
+            d.state.is_active(),
+            "OK stopped the transfer: {:?}",
+            d.state
+        );
+        assert_eq!(d.description, "notes", "the fields were still committed");
+
+        // Download Later on a new-download dialog still parks it.
+        app.item_mut(id).unwrap().state = DlState::Paused;
+        app.file_info = FileInfoState {
+            is_new: true,
+            ..properties_for(&app, id)
+        };
+        let _ = app.update(Message::FiDownloadLater);
+        assert_eq!(app.item(id).unwrap().state, DlState::Queued);
+    }
+
+    /// Options > Save to > "Change folder for category on last selected"
+    /// was stored and never read. On, a folder edited in the dialog becomes
+    /// the category's; a folder left alone changes nothing.
+    #[test]
+    fn remember_last_dir_moves_the_category_folder_to_the_one_chosen() {
+        let mut app = App::default();
+        app.cfg.categories = model::default_categories();
+        app.cfg.settings.remember_last_dir = true;
+        let id = app.add_item("https://a.b/x.iso".into(), None, None);
+        // The item's own category is the one the folder is remembered for.
+        let cat = properties_for(&app, id).category;
+        let dir_of = |app: &App| {
+            app.cfg
+                .categories
+                .iter()
+                .find(|c| c.name == cat)
+                .map(|c| c.dir.clone())
+                .expect("the item's category exists")
+        };
+        let before = dir_of(&app);
+
+        app.file_info = properties_for(&app, id);
+        let _ = app.update(Message::FiOk);
+        assert_eq!(dir_of(&app), before, "untouched folder");
+
+        app.file_info = FileInfoState {
+            save_dir: "/tmp/elsewhere".into(),
+            dir_touched: true,
+            ..properties_for(&app, id)
+        };
+        let _ = app.update(Message::FiOk);
+        assert_eq!(dir_of(&app), "/tmp/elsewhere");
+
+        app.cfg.settings.remember_last_dir = false;
+        app.file_info = FileInfoState {
+            save_dir: "/tmp/third".into(),
+            dir_touched: true,
+            ..properties_for(&app, id)
+        };
+        let _ = app.update(Message::FiOk);
+        assert_eq!(dir_of(&app), "/tmp/elsewhere", "off means off");
+    }
+
+    /// A draft the transfers could not act on is refused on the page that
+    /// holds the problem, and the settings in force are not touched.
+    #[test]
+    fn options_ok_is_refused_on_the_page_that_holds_the_problem() {
+        let mut app = App::default();
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::Options);
+        app.options.draft = app.cfg.settings.clone();
+        app.options.base = app.cfg.settings.clone();
+        let refused = |app: &mut App, tab: OptTab| {
+            let _ = app.update(Message::OptOk);
+            assert_eq!(app.options.tab, tab);
+            assert!(app.options.error.is_some());
+            assert!(
+                app.win_of(WinKind::Options).is_some(),
+                "the dialog stays up"
+            );
+        };
+
+        let _ = app.update(Message::OptDraft(OptField::SpeedLimiter(true)));
+        let _ = app.update(Message::OptDraft(OptField::SpeedLimitKb(String::new())));
+        refused(&mut app, OptTab::SpeedLimit);
+        assert!(!app.cfg.settings.speed_limiter_on);
+        let _ = app.update(Message::OptDraft(OptField::SpeedLimiter(false)));
+
+        let _ = app.update(Message::OptDraft(OptField::DlLimit(true)));
+        let _ = app.update(Message::OptDraft(OptField::DlLimitMb("0".into())));
+        refused(&mut app, OptTab::Quota);
+        let _ = app.update(Message::OptDraft(OptField::DlLimitMb("200".into())));
+        let _ = app.update(Message::OptDraft(OptField::DlLimitHours(String::new())));
+        refused(&mut app, OptTab::Quota);
+        let _ = app.update(Message::OptDraft(OptField::DlLimit(false)));
+
+        let _ = app.update(Message::OptDraft(OptField::ProxyMode(ProxyMode::Script)));
+        refused(&mut app, OptTab::Proxy);
+        let _ = app.update(Message::OptDraft(OptField::ProxyMode(ProxyMode::Manual)));
+        refused(&mut app, OptTab::Proxy);
+        let _ = app.update(Message::OptDraft(OptField::ProxyHost("10.0.0.1".into())));
+        let _ = app.update(Message::OptDraft(OptField::ProxyPort("99999".into())));
+        refused(&mut app, OptTab::Proxy);
+        let _ = app.update(Message::OptDraft(OptField::ProxyPort("1080".into())));
+        assert_eq!(app.options_problem(), None);
+
+        // Power save is a draft field like any other: the engine is only
+        // told on OK, so Cancel leaves it as it was.
+        let _ = app.update(Message::OptDraft(OptField::PowerSave(true)));
+        assert!(!app.cfg.settings.power_save);
+        let _ = app.update(Message::CloseThis(win));
+        assert!(!app.cfg.settings.power_save);
+    }
+
+    /// The Options-on-completion tab's first checkbox did nothing. Both
+    /// boxes write the same global setting the Options dialog does.
+    #[test]
+    fn the_completion_tab_toggles_the_complete_dialog() {
+        let mut app = App::default();
+        assert!(app.cfg.settings.show_complete_dialog);
+        let _ = app.update(Message::ProgShowCompleteDialog(false));
+        assert!(!app.cfg.settings.show_complete_dialog);
+        assert!(app.cfg_dirty);
+        let _ = app.update(Message::ProgShowCompleteDialog(true));
+        assert!(app.cfg.settings.show_complete_dialog);
+    }
+
+    /// The reported bug: a queue set to start at `9:00` never fired, because
+    /// the clock says `09:00`. The comparison is numeric.
+    #[test]
+    fn a_scheduled_minute_matches_however_it_was_typed() {
+        let due = |typed: &str, now: &str| {
+            let s = Schedule {
+                start_enabled: true,
+                start_at: typed.into(),
+                once: true,
+                ..Schedule::default()
+            };
+            schedule_start_due(&s, now, 0, false)
+        };
+        assert!(due("9:00", "09:00"));
+        assert!(due("21:0", "21:00"));
+        assert!(due("9.00", "09:00"));
+        assert!(due("09:00", "09:00"));
+        assert!(!due("9:00", "09:01"));
+        assert!(!due("nine", "09:00"), "unreadable never fires");
+    }
+
+    /// A zero cap refused every start for good; the floor is one MB.
+    #[test]
+    fn a_zero_download_limit_is_read_as_one_megabyte() {
+        let s = crate::model::Settings {
+            dl_limit_enabled: true,
+            dl_limit_mb: 0,
+            ..Default::default()
+        };
+        assert_eq!(quota_cap(&s), Some(1024 * 1024));
+    }
+
+    /// Queues are addressed by name; a new one must never share a name with
+    /// one already on the list, however the list was edited before.
+    #[test]
+    fn a_new_queue_never_takes_a_name_still_in_use() {
+        let mut app = App::default();
+        let _ = app.update(Message::SchNewQueue);
+        let _ = app.update(Message::SchNewQueue);
+        let _ = app.update(Message::SchNewQueue);
+        let queue = |n: usize| format!("{} {n}", i18n::tr("Queue"));
+        app.sch.queue = queue(2);
+        let _ = app.update(Message::SchDeleteQueue);
+        let _ = app.update(Message::SchNewQueue);
+        let names: Vec<&str> = app.cfg.queues.iter().map(|q| q.name.as_str()).collect();
+        let distinct: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            names.len(),
+            distinct.len(),
+            "a name is used twice: {names:?}"
+        );
+        assert_eq!(app.sch.queue, queue(2), "the smallest free number");
+    }
+
+    /// A batch sent to "one directory" with the directory blank would land
+    /// in the process's working directory. OK refuses it and adds nothing.
+    #[test]
+    fn a_batch_to_a_blank_directory_is_refused() {
+        let mut app = App::default();
+        let _ = app.update(Message::BatchLoaded(Some("https://a.b/x.zip\n".into())));
+        let _ = app.update(Message::BatchSaveMode(2));
+        assert!(app.batch.to_dir);
+        let _ = app.update(Message::BatchDir("   ".into()));
+        let _ = app.update(Message::BatchOk);
+        assert!(app.state.downloads.is_empty());
+        assert_eq!(app.batch.checks.len(), 1, "the list is kept for the retry");
+
+        let _ = app.update(Message::BatchDir("/tmp/batch".into()));
+        let _ = app.update(Message::BatchOk);
+        assert_eq!(app.state.downloads.len(), 1);
+        assert_eq!(app.state.downloads[0].save_dir, "/tmp/batch");
+    }
+
+    fn pending(url: &str) -> Box<PendingAdd> {
+        Box::new(PendingAdd {
+            url: url.into(),
+            auth: None,
+            capture: CaptureExtras::default(),
+        })
+    }
+
+    /// The reported bug: a second question raised while one was on screen
+    /// overwrote it — and with it the capture a duplicate dialog was holding.
+    /// Questions wait their turn, and the capture arrives intact.
+    #[test]
+    fn a_confirmation_raised_over_another_waits_its_turn() {
+        let mut app = App::default();
+        let first = window::Id::unique();
+        app.windows.insert(first, WinKind::Confirm);
+        app.confirm = Some(ConfirmKind::DeleteCompleted);
+
+        let _ = app.ask(ConfirmKind::Duplicate {
+            existing: None,
+            file: Some("/tmp/x.zip".into()),
+            pending: pending("https://a.b/x.zip"),
+        });
+        assert!(matches!(app.confirm, Some(ConfirmKind::DeleteCompleted)));
+        assert_eq!(app.confirm_queue.len(), 1);
+
+        let _ = app.update(Message::CloseThis(first));
+        assert!(matches!(app.confirm, Some(ConfirmKind::Duplicate { .. })));
+        assert!(
+            app.win_of(WinKind::Confirm).is_some(),
+            "the next question opened"
+        );
+        assert!(app.confirm_queue.is_empty());
+
+        let _ = app.update(Message::DupNew);
+        assert_eq!(app.state.downloads.len(), 1);
+        assert_eq!(app.state.downloads[0].url, "https://a.b/x.zip");
+        assert!(app.confirm.is_none());
+        assert!(app.win_of(WinKind::Confirm).is_none());
+    }
+
+    /// "Resume existing" over a finished entry used to start it again from
+    /// zero over the finished file. A finished entry is shown, not restarted.
+    #[test]
+    fn resuming_a_finished_duplicate_does_not_restart_it() {
+        let mut app = App::default();
+        let id = app.add_item("https://a.b/x.zip".into(), None, None);
+        app.item_mut(id).unwrap().state = DlState::Complete;
+        app.windows.insert(window::Id::unique(), WinKind::Confirm);
+        app.confirm = Some(ConfirmKind::Duplicate {
+            existing: Some(id),
+            file: None,
+            pending: pending("https://a.b/x.zip"),
+        });
+        let _ = app.update(Message::DupResume);
+        assert_eq!(app.item(id).unwrap().state, DlState::Complete);
+        assert_eq!(app.selected, vec![id]);
+    }
+
+    /// A site entered twice is one row retuned, not two rows of which only
+    /// the first is ever read; Remove needs a row to act on.
+    #[test]
+    fn a_re_entered_site_login_replaces_its_row() {
+        let mut app = App::default();
+        let enter = |app: &mut App, site: &str, user: &str| {
+            let _ = app.update(Message::OptDraft(OptField::LoginSite(site.into())));
+            let _ = app.update(Message::OptDraft(OptField::LoginUser(user.into())));
+            let _ = app.update(Message::OptDraft(OptField::LoginPass("pw".into())));
+            let _ = app.update(Message::OptDraft(OptField::LoginAdd));
+        };
+        enter(&mut app, "ftp.example", "anna");
+        enter(&mut app, "files.example", "bob");
+        enter(&mut app, "ftp.example", "carl");
+        let logins = &app.options.draft.logins;
+        assert_eq!(logins.len(), 2);
+        assert_eq!(logins[0].user, "carl");
+        assert!(
+            app.options.sel_login.is_none(),
+            "nothing selected after New"
+        );
+        let _ = app.update(Message::OptDraft(OptField::LoginRemove));
+        assert_eq!(
+            app.options.draft.logins.len(),
+            2,
+            "no selection, no removal"
+        );
+    }
+
+    /// Escape is a dialog's Cancel and Enter its default button, whichever
+    /// dialog has the focus.
+    #[test]
+    fn escape_and_enter_drive_the_focused_dialog() {
+        use iced::keyboard::{key::Named, Key, Modifiers};
+        let key =
+            |k: Named, win: window::Id| Message::RawKey(Key::Named(k), Modifiers::empty(), win);
+
+        let mut app = App::default();
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::Confirm);
+        app.confirm = Some(ConfirmKind::UpToDate);
+        let _ = app.update(key(Named::Escape, win));
+        assert!(app.win_of(WinKind::Confirm).is_none());
+        assert!(app.confirm.is_none());
+
+        let id = app.add_item("https://a.b/x.zip".into(), None, None);
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::Confirm);
+        app.confirm = Some(ConfirmKind::DeleteItems(vec![id]));
+        let _ = app.update(key(Named::Enter, win));
+        assert!(app.item(id).is_none(), "Enter answered Yes");
+        assert!(app.win_of(WinKind::Confirm).is_none());
+
+        // A duplicate question has three equal answers: Enter picks none.
+        let id = app.add_item("https://a.b/y.zip".into(), None, None);
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::Confirm);
+        app.confirm = Some(ConfirmKind::Duplicate {
+            existing: Some(id),
+            file: None,
+            pending: pending("https://a.b/y.zip"),
+        });
+        let _ = app.update(key(Named::Enter, win));
+        assert!(app.win_of(WinKind::Confirm).is_some());
+
+        // The main window has no Cancel; Escape there is not a close.
+        let main = window::Id::unique();
+        app.windows.insert(main, WinKind::Main);
+        let _ = app.update(key(Named::Escape, main));
+        assert!(app.win_of(WinKind::Main).is_some());
+    }
+
+    /// The Shortcuts dialog accepted anything. On close the table holds one
+    /// spelling per combo, a combo no press can produce goes back to its
+    /// default, and a conflict is settled for the earlier action.
+    #[test]
+    fn shortcuts_are_settled_when_the_dialog_closes() {
+        let mut app = App::default();
+        for (id, combo, _) in crate::model::SHORTCUT_ACTIONS {
+            app.cfg.shortcuts.insert(id.to_string(), combo.to_string());
+        }
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::Shortcuts);
+        let _ = app.update(Message::ShortcutEdit(
+            "add_url".into(),
+            "Shift+Cmd+N".into(),
+        ));
+        let _ = app.update(Message::ShortcutEdit("scheduler".into(), "e".into()));
+        let _ = app.update(Message::ShortcutEdit(
+            "options".into(),
+            "cmd+shift+n".into(),
+        ));
+        let _ = app.update(Message::CloseThis(win));
+        assert_eq!(app.cfg.shortcuts["add_url"], "cmd+shift+n");
+        assert_eq!(
+            app.cfg.shortcuts["scheduler"], "cmd+e",
+            "unusable goes back to default"
+        );
+        assert_eq!(
+            app.cfg.shortcuts["options"], "cmd+,",
+            "the later action loses the conflict"
+        );
+    }
+
+    /// A pressed combo matches the table through the same normalization,
+    /// so a shortcut typed as `Shift+Cmd+V` fires before the dialog closes.
+    #[test]
+    fn a_pressed_combo_matches_a_differently_spelled_entry() {
+        use iced::keyboard::{Key, Modifiers};
+        let mut app = App::default();
+        app.cfg
+            .shortcuts
+            .insert("select_all".into(), "Cmd+A".into());
+        let id = app.add_item("https://a.b/x.zip".into(), None, None);
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::Main);
+        let command = if cfg!(target_os = "macos") {
+            Modifiers::LOGO
+        } else {
+            Modifiers::CTRL
+        };
+        let _ = app.update(Message::RawKey(Key::Character("a".into()), command, win));
+        assert_eq!(app.selected, vec![id]);
+    }
+
+    /// Tasks > Import added every line, including the ones already listed.
+    #[test]
+    fn importing_a_list_adds_each_address_once() {
+        let mut app = App::default();
+        app.add_item("https://a.b/x.zip".into(), None, None);
+        let text = "https://a.b/x.zip\nhttps://a.b/y.zip\nhttps://a.b/y.zip\nnot a link\n";
+        let _ = app.update(Message::ImportListFrom(Some(text.into())));
+        let urls: Vec<&str> = app.state.downloads.iter().map(|d| d.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.b/x.zip", "https://a.b/y.zip"]);
+        let _ = app.update(Message::ImportListFrom(None));
+        assert_eq!(
+            app.state.downloads.len(),
+            2,
+            "a cancelled picker adds nothing"
+        );
+    }
+
+    /// A deleted row takes every window that describes it with it; a
+    /// "Download complete" box left open would have dead buttons.
+    #[test]
+    fn a_dialog_closed_before_it_opened_is_closed_again_on_arrival() {
+        let mut app = App::default();
+        let id = app.add_item("https://a.b/f.bin".into(), None, None);
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::FileInfo(id));
+        let _ = app.close_file_info_windows();
+        assert!(app.window_is_orphan(win));
+        let _ = app.update(Message::WindowOpened(win));
+        assert!(app.win_of(WinKind::FileInfo(id)).is_none());
+    }
+
+    #[test]
+    fn deleting_a_download_closes_its_complete_and_preview_windows() {
+        let mut app = App::default();
+        let id = app.add_item("https://a.b/x.zip".into(), None, None);
+        app.item_mut(id).unwrap().state = DlState::Complete;
+        app.windows
+            .insert(window::Id::unique(), WinKind::Complete(id));
+        app.windows
+            .insert(window::Id::unique(), WinKind::ZipPreview(id));
+        let _ = app.delete_item(id);
+        assert!(app.item(id).is_none());
+        assert!(app.windows.is_empty(), "{:?}", app.windows.values());
+    }
+
+    /// The Speed Limiter tab parsed a blank box as 10 KB/s while showing
+    /// nothing, and "0" as no cap at all. The box shows the cap in force,
+    /// and a box being retyped does not lift it.
+    #[test]
+    fn the_progress_limiter_shows_the_cap_it_applies() {
+        let mut app = App::default();
+        let id = app.add_item("https://a.b/x.zip".into(), None, None);
+        app.prog.entry(id).or_default().limit_kb = String::new();
+        let _ = app.update(Message::ProgLimitOn(id, true));
+        assert_eq!(app.item(id).unwrap().speed_limit, Some(10 * 1024));
+        assert_eq!(app.prog[&id].limit_kb, "10");
+
+        let _ = app.update(Message::ProgLimitKb(id, "0".into()));
+        assert_eq!(
+            app.item(id).unwrap().speed_limit,
+            Some(10 * 1024),
+            "0 is not unlimited"
+        );
+        let _ = app.update(Message::ProgLimitKb(id, "250".into()));
+        assert_eq!(app.item(id).unwrap().speed_limit, Some(250 * 1024));
+    }
+
+    /// While the address is still being read as a manifest, OK would add
+    /// the manifest itself as a file. It waits.
+    #[test]
+    fn add_url_ok_waits_for_a_running_probe() {
+        let mut app = App::default();
+        app.add_url.address = "https://a.b/live.m3u8".into();
+        app.add_url.stream_probing = true;
+        let _ = app.update(Message::AddUrlOk);
+        assert!(app.state.downloads.is_empty());
+        app.add_url.stream_probing = false;
+        app.add_url.metalink_probing = true;
+        let _ = app.update(Message::AddUrlOk);
+        assert!(app.state.downloads.is_empty());
+    }
+
+    /// The browser was told `ok: false` when the receipt timed out, so it
+    /// kept its own download. A capture that arrives after that must not be
+    /// kept here as well, or the file downloads twice.
+    #[test]
+    fn a_capture_the_browser_kept_is_not_kept_here_too() {
+        let mut app = App::default();
+        let (ack, receipt) = crate::extbus::Ack::pair();
+        drop(receipt);
+        let dl = crate::extbus::ExtDownload {
+            url: "https://a.b/late.zip".into(),
+            ..Default::default()
+        };
+        let _ = app.update(Message::Ext(crate::extbus::ExtEvent::Download(dl, ack)));
+        // The capture auto-started behind its dialog, so the row waits for
+        // the engine's stop before it leaves the list — but it is leaving.
+        for d in &app.state.downloads {
+            assert!(
+                app.pending_delete.iter().any(|(id, _)| *id == d.id),
+                "kept: {d:?}"
+            );
+        }
+        assert!(app
+            .windows
+            .values()
+            .all(|k| !matches!(k, WinKind::FileInfo(_))));
+
+        let (ack, receipt) = crate::extbus::Ack::pair();
+        let waiting = std::thread::spawn(move || receipt.recv().is_ok());
+        let dl = crate::extbus::ExtDownload {
+            url: "https://a.b/ontime.zip".into(),
+            ..Default::default()
+        };
+        let _ = app.update(Message::Ext(crate::extbus::ExtEvent::Download(dl, ack)));
+        assert!(waiting.join().unwrap());
+        assert!(app
+            .state
+            .downloads
+            .iter()
+            .any(|d| d.url == "https://a.b/ontime.zip"
+                && !app.pending_delete.iter().any(|(id, _)| *id == d.id)));
+    }
+
+    fn offer(has_bundle: bool) -> crate::update::UpdateInfo {
+        crate::update::UpdateInfo {
+            version: "9.9.9".into(),
+            notes: String::new(),
+            html_url: "https://example.invalid/release".into(),
+            asset_name: "hydra.tar.gz".into(),
+            asset_url: "https://example.invalid/hydra.tar.gz".into(),
+            size: 1,
+            sums_url: None,
+            in_place: true,
+            needs_auth: false,
+            package: None,
+            has_bundle,
+            package_hint: None,
+        }
+    }
+
+    /// Closing the dialog during Verifying/Preparing looked like a cancel,
+    /// but the run's ReadyToRestart still quit the app and applied the
+    /// update. A cancelled run's events are from a generation nobody is
+    /// listening to any more.
+    #[test]
+    fn a_cancelled_update_cannot_restart_the_app() {
+        let mut app = App::default();
+        let win = window::Id::unique();
+        app.windows.insert(win, WinKind::Update);
+        app.updater.info = Some(offer(true));
+        let _ = app.update(Message::UpdateNow);
+        let started = app.updater.generation;
+        assert!(matches!(app.updater.phase, UpdatePhase::Downloading { .. }));
+
+        app.updater.phase = UpdatePhase::Verifying;
+        let _ = app.update(Message::UpdateCancel);
+        assert!(app.win_of(WinKind::Update).is_none());
+        assert_eq!(app.updater.phase, UpdatePhase::Idle);
+
+        let _ = app.update(Message::UpdateEvent(
+            started,
+            crate::update::UpdateEvent::ReadyToRestart,
+        ));
+        assert_ne!(app.updater.phase, UpdatePhase::Restarting);
+
+        // The OS close button during Preparing is the same cancel.
+        app.windows.insert(win, WinKind::Update);
+        app.updater.info = Some(offer(true));
+        let _ = app.update(Message::UpdateNow);
+        let started = app.updater.generation;
+        app.updater.phase = UpdatePhase::Preparing;
+        let _ = app.update(Message::WindowClosed(win));
+        let _ = app.update(Message::UpdateEvent(
+            started,
+            crate::update::UpdateEvent::ReadyToRestart,
+        ));
+        assert_ne!(app.updater.phase, UpdatePhase::Restarting);
+    }
+
+    /// A newer release with no build for this machine is still news: the
+    /// dialog opens, names the version, and offers nothing to download.
+    #[test]
+    fn a_release_without_a_bundle_is_announced_but_not_downloadable() {
+        let mut app = App::default();
+        let _ = app.update(Message::UpdateChecked(Ok(Some(offer(false)))));
+        let win = app.win_of(WinKind::Update).expect("the dialog opened");
+        let _ = app.update(Message::UpdateNow);
+        assert_eq!(app.updater.phase, UpdatePhase::Idle, "nothing to download");
+        assert!(dialog_primary(&app, WinKind::Update, win).is_none());
+        assert!(matches!(
+            dialog_cancel(&app, WinKind::Update, win),
+            Some(Message::UpdateCancel)
+        ));
+    }
+
+    /// The Scheduler keeps its queue by name. A name renamed from the
+    /// sidebar, or deleted, must not leave the window's buttons acting on
+    /// nothing.
+    #[test]
+    fn the_scheduler_follows_a_renamed_or_deleted_queue() {
+        let mut app = App::default();
+        app.cfg.queues = model::default_queues();
+        app.sch.queue = "no such queue".into();
+        let _ = app.update(Message::SchField(SchField::FilesAtOnce("7".into())));
+        assert_eq!(app.sch.queue, app.cfg.queues[0].name);
+        assert_eq!(app.cfg.queues[0].files_at_once, 7);
+    }
+
+    #[test]
+    // Renaming rebuilds the native menu and the tray, which muda builds on
+    // the main thread only — a test thread is not it.
+    #[cfg_attr(target_os = "macos", ignore = "muda needs the main thread")]
+    fn renaming_a_queue_from_the_sidebar_renames_it_in_the_scheduler() {
+        let mut app = App::default();
+        let _ = app.update(Message::SchNewQueue);
+        let old = app.sch.queue.clone();
+        assert!(app.rename_queue(&old, "Night"));
+        assert_eq!(app.sch.queue, "Night");
     }
 }

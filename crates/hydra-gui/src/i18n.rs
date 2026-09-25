@@ -176,6 +176,87 @@ mod tests {
         }
     }
 
+    /// Every `tr("...")` in the source has to be a key of `en.json`, or the
+    /// string can never be translated — the fallback hides that until a
+    /// translator asks why one line stays English.
+    #[test]
+    fn every_tr_literal_in_the_source_is_in_the_english_catalogue() {
+        let en: HashMap<String, String> =
+            serde_json::from_str(include_str!("../assets/locale/en.json")).expect("en.json");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut missing = std::collections::BTreeSet::new();
+        let mut seen = 0;
+        for file in rust_files(&src) {
+            let text = std::fs::read_to_string(&file).expect("readable source");
+            for literal in tr_literals(&text) {
+                seen += 1;
+                if !en.contains_key(&literal) {
+                    missing.insert(format!("{}: {literal:?}", file.display()));
+                }
+            }
+        }
+        assert!(seen > 300, "the scanner found only {seen} tr() literals");
+        assert!(
+            missing.is_empty(),
+            "not in en.json:\n{}",
+            missing.into_iter().collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("source dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(rust_files(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// The string literals passed straight to `tr(`, unescaped the way rustc
+    /// reads them: `\"`, `\\`, and a backslash before a newline that
+    /// swallows the newline and the indentation after it.
+    fn tr_literals(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("tr(") {
+            let before = rest[..at].chars().next_back();
+            rest = &rest[at + 3..];
+            if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"') {
+                continue;
+            }
+            let body = rest.trim_start();
+            let Some(body) = body.strip_prefix('"') else {
+                continue;
+            };
+            let mut lit = String::new();
+            let mut chars = body.chars();
+            loop {
+                match chars.next() {
+                    None | Some('"') => break,
+                    Some('\\') => match chars.next() {
+                        Some('n') => lit.push('\n'),
+                        Some('t') => lit.push('\t'),
+                        Some('\n') => {
+                            // A continuation: the rest of the indentation goes too.
+                            let tail = chars.as_str();
+                            let trimmed = tail.trim_start();
+                            chars = trimmed.chars();
+                        }
+                        Some(c) => lit.push(c),
+                        None => break,
+                    },
+                    Some(c) => lit.push(c),
+                }
+            }
+            out.push(lit);
+        }
+        out
+    }
+
     /// Every `{name}` token in a string, as a set.
     fn placeholders(s: &str) -> std::collections::BTreeSet<&str> {
         let mut out = std::collections::BTreeSet::new();

@@ -34,7 +34,10 @@ pub enum TrackKind {
     Audio,
 }
 
-/// One Representation, resolved to concrete URLs.
+/// One Representation, resolved to concrete URLs. A Representation that
+/// continues across Periods under the same `id` is one track: the Periods'
+/// segments follow each other, and [`Track::init_changes`] marks where a new
+/// initialisation segment takes over.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Track {
     pub id: String,
@@ -50,6 +53,12 @@ pub struct Track {
     pub numbers: Vec<u64>,
     /// Each segment's length in seconds, in step with `segments`.
     pub durations: Vec<f64>,
+    /// `(index, init)`: the initialisation segment to write before
+    /// `segments[index]`, wherever a later Period changed it.
+    pub init_changes: Vec<(usize, Segment)>,
+    /// Why this Representation resolved to no segments, when the reason is
+    /// one to tell the user rather than a quirk of a live window.
+    pub unsupported: Option<String>,
 }
 
 /// A parsed MPD.
@@ -67,6 +76,11 @@ pub struct Manifest {
     pub audio: Vec<Track>,
 }
 
+/// Ceiling on the segments one Representation may describe. A timeline
+/// entry with `r="4000000000"`, or a microsecond duration over a long
+/// presentation, would otherwise be expanded into memory as URLs.
+pub const MAX_SEGMENTS: u64 = 1_000_000;
+
 // ------------------------------------------------------------ xml scanner
 
 #[derive(Debug, PartialEq)]
@@ -77,7 +91,7 @@ enum Node {
     Empty(String, Vec<(String, String)>),
     /// `</Tag>`
     Close(String),
-    /// Character data between tags.
+    /// Character data between tags, entities resolved.
     Text(String),
 }
 
@@ -129,8 +143,8 @@ fn attributes(src: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The five predefined XML entities. An MPD's attribute values are URLs and
-/// numbers, so `&amp;` in a query string is the one that actually turns up.
+/// The five predefined XML entities. An MPD's values are URLs and numbers,
+/// so `&amp;` in a query string is the one that actually turns up.
 fn unescape(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
@@ -150,7 +164,7 @@ fn scan(text: &str) -> Vec<Node> {
     while let Some(lt) = rest.find('<') {
         let text_before = &rest[..lt];
         if !text_before.trim().is_empty() {
-            out.push(Node::Text(text_before.trim().to_string()));
+            out.push(Node::Text(unescape(text_before.trim())));
         }
         rest = &rest[lt + 1..];
 
@@ -204,6 +218,16 @@ fn attr<'a>(list: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 fn num<T: std::str::FromStr>(list: &[(String, String)], name: &str) -> Option<T> {
     attr(list, name).and_then(|v| v.trim().parse().ok())
+}
+
+/// `first-last` byte positions, as `mediaRange`, `indexRange` and
+/// `Initialization@range` spell them, to `(offset, length)`.
+fn byte_range(v: &str) -> Option<(u64, u64)> {
+    let (first, last) = v.trim().split_once('-')?;
+    let first: u64 = first.trim().parse().ok()?;
+    let last: u64 = last.trim().parse().ok()?;
+    let len = last.checked_sub(first)?.checked_add(1)?;
+    Some((first, len))
 }
 
 /// ISO 8601 duration in seconds. Years and months are not meaningful for a
@@ -314,16 +338,40 @@ fn expand(template: &str, id: &str, number: u64, time: u64, bandwidth: u64) -> S
     out
 }
 
-/// A `SegmentTemplate`, plus any `SegmentTimeline` under it.
+/// Which of the three segment-addressing forms the manifest used last.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Addressing {
+    #[default]
+    Template,
+    List,
+    Base,
+}
+
+/// One `<S>` of a `SegmentTimeline`, as written: expanded only once the
+/// period's length is known, because a negative `r` runs to its end.
+#[derive(Clone, Debug, PartialEq)]
+struct TimelineEntry {
+    t: Option<u64>,
+    d: u64,
+    r: i64,
+}
+
+/// Segment addressing, merged down the tree: a `SegmentTemplate`,
+/// `SegmentList` or `SegmentBase` with everything inherited from the
+/// levels above it.
 #[derive(Clone, Debug, Default)]
 struct Template {
+    form: Addressing,
     init: Option<String>,
+    init_range: Option<(u64, u64)>,
     media: Option<String>,
     timescale: f64,
     duration: Option<f64>,
-    start_number: u64,
-    /// `(start time, duration, repeat)` from `<S>` entries, already expanded.
-    timeline: Vec<(u64, u64)>,
+    start_number: Option<u64>,
+    presentation_time_offset: u64,
+    timeline: Vec<TimelineEntry>,
+    /// `SegmentURL` entries: `(media, mediaRange)`.
+    list: Vec<(String, Option<(u64, u64)>)>,
 }
 
 impl Template {
@@ -341,11 +389,14 @@ impl Template {
             self.duration = Some(v);
         }
         if let Some(v) = num::<u64>(attrs, "startNumber") {
-            self.start_number = v;
+            self.start_number = Some(v);
+        }
+        if let Some(v) = num::<u64>(attrs, "presentationTimeOffset") {
+            self.presentation_time_offset = v;
         }
     }
 
-    /// Seconds one timescale tick is worth.
+    /// Timescale ticks per second.
     fn scale(&self) -> f64 {
         if self.timescale > 0.0 {
             self.timescale
@@ -354,33 +405,69 @@ impl Template {
         }
     }
 
-    /// `(number, time, seconds)` for every segment this template describes.
-    fn ticks(&self, period_seconds: f64) -> Vec<(u64, u64, f64)> {
-        let first = if self.start_number == 0 {
-            1
-        } else {
-            self.start_number
-        };
+    fn first_number(&self) -> u64 {
+        self.start_number.unwrap_or(1)
+    }
+
+    /// `(number, time, seconds)` for every segment this template describes,
+    /// or why there are too many to spell out.
+    fn ticks(&self, period_seconds: f64) -> Result<Vec<(u64, u64, f64)>, String> {
+        let first = self.first_number();
+        let scale = self.scale();
+        let too_many = || format!("the manifest describes more than {MAX_SEGMENTS} segments");
         if !self.timeline.is_empty() {
-            let scale = self.scale();
-            return self
-                .timeline
-                .iter()
-                .enumerate()
-                .map(|(i, (t, d))| (first + i as u64, *t, *d as f64 / scale))
-                .collect();
+            let mut out: Vec<(u64, u64, f64)> = Vec::new();
+            let period_end = self
+                .presentation_time_offset
+                .saturating_add((period_seconds.max(0.0) * scale) as u64);
+            let mut start = 0u64;
+            for e in &self.timeline {
+                if let Some(t) = e.t {
+                    start = t;
+                }
+                // A negative `r` repeats to the end of the period.
+                let count = if e.r >= 0 {
+                    (e.r as u64).saturating_add(1)
+                } else if e.d == 0 || period_end <= start {
+                    1
+                } else {
+                    (period_end - start).div_ceil(e.d).max(1)
+                };
+                if (out.len() as u64).saturating_add(count) > MAX_SEGMENTS {
+                    return Err(too_many());
+                }
+                for _ in 0..count {
+                    out.push((
+                        first.saturating_add(out.len() as u64),
+                        start,
+                        e.d as f64 / scale,
+                    ));
+                    start = start.saturating_add(e.d);
+                }
+            }
+            return Ok(out);
         }
         let Some(d) = self.duration.filter(|d| *d > 0.0) else {
-            return vec![];
+            return Ok(vec![]);
         };
-        let per = d / self.scale();
+        let per = d / scale;
         if per <= 0.0 || period_seconds <= 0.0 {
-            return vec![];
+            return Ok(vec![]);
         }
-        let count = (period_seconds / per).ceil() as u64;
-        (0..count)
-            .map(|i| (first + i, (i as f64 * d) as u64, per))
-            .collect()
+        let count = (period_seconds / per).ceil();
+        if count > MAX_SEGMENTS as f64 {
+            return Err(too_many());
+        }
+        let pto = self.presentation_time_offset;
+        Ok((0..count as u64)
+            .map(|i| {
+                (
+                    first.saturating_add(i),
+                    pto.saturating_add((i as f64 * d) as u64),
+                    per,
+                )
+            })
+            .collect())
     }
 }
 
@@ -391,7 +478,6 @@ struct Scope {
     base: Option<String>,
     template: Option<Template>,
     content_type: Option<String>,
-    duration: Option<f64>,
     /// Set on a `<Representation>` scope that is still open. The track is
     /// built when the element CLOSES, because `SegmentTemplate` is frequently
     /// a child of the Representation rather than a sibling on the
@@ -406,11 +492,41 @@ struct Pending {
     attrs: Vec<(String, String)>,
     kind: TrackKind,
     base_url: String,
-    seconds: f64,
+    /// The Representation carried a `<BaseURL>` of its own.
+    own_base: bool,
+    period: usize,
+}
+
+/// `<Period start= duration=>`, as written.
+#[derive(Clone, Copy, Debug, Default)]
+struct Period {
+    start: Option<f64>,
+    duration: Option<f64>,
+}
+
+/// Each period's length in seconds: its own `@duration`, else up to the next
+/// period's `@start`, else to the end of the presentation.
+fn period_lengths(periods: &[Period], total: f64) -> Vec<f64> {
+    let mut out = Vec::with_capacity(periods.len());
+    let mut at = 0.0f64;
+    for (i, p) in periods.iter().enumerate() {
+        let start = p.start.unwrap_or(at);
+        let end = match p.duration {
+            Some(d) => start + d,
+            None => periods
+                .get(i + 1)
+                .and_then(|n| n.start)
+                .unwrap_or(total.max(start)),
+        };
+        let secs = (end - start).max(0.0);
+        out.push(secs);
+        at = start + secs;
+    }
+    out
 }
 
 /// Resolve one Representation into a track.
-fn make_track(p: &Pending, template: Option<&Template>) -> Track {
+fn make_track(p: &Pending, template: Option<&Template>, seconds: f64) -> Track {
     let attrs = &p.attrs;
     let id = attr(attrs, "id").unwrap_or("").to_string();
     let bandwidth = num::<u64>(attrs, "bandwidth");
@@ -422,21 +538,99 @@ fn make_track(p: &Pending, template: Option<&Template>) -> Track {
         codecs: attr(attrs, "codecs").map(str::to_string),
         ..Track::default()
     };
-    if let Some(t) = template {
-        let bw = bandwidth.unwrap_or(0);
-        track.init = t
-            .init
-            .as_ref()
-            .map(|i| expand(i, &id, t.start_number, 0, bw))
-            .and_then(|u| crate::url::join(&p.base_url, &u))
-            // DASH never carves segments out of one file the way HLS can;
-            // each is its own object.
-            .map(Segment::new);
-        if let Some(media) = &t.media {
-            for (number, time, secs) in t.ticks(p.seconds) {
-                if let Some(url) =
-                    crate::url::join(&p.base_url, &expand(media, &id, number, time, bw))
-                {
+    let bw = bandwidth.unwrap_or(0);
+    let join = |u: &str| crate::url::join(&p.base_url, u);
+    let Some(t) = template else {
+        if p.own_base {
+            // No addressing at all: the Representation is a single file at
+            // its BaseURL (ISO 23009-1 §5.3.9.1), which carries its own
+            // initialisation.
+            track.segments.push(Segment::new(p.base_url.clone()));
+            track.numbers.push(1);
+            track.durations.push(seconds);
+        } else {
+            track.unsupported = Some(format!(
+                "representation {id} has no segment addressing (no SegmentTemplate, \
+                 SegmentList or SegmentBase)"
+            ));
+        }
+        return track;
+    };
+    let first = t.first_number();
+    let init_of = |url: Option<String>| -> Option<Segment> {
+        let url = url.or_else(|| t.init_range.map(|_| p.base_url.clone()))?;
+        Some(Segment {
+            url,
+            range: t.init_range,
+            key: None,
+        })
+    };
+    match t.form {
+        Addressing::Base => {
+            // The whole file is the segment and begins with its own `moov`;
+            // fetching the `Initialization@range` separately as well would
+            // write those bytes twice.
+            track.segments.push(Segment::new(p.base_url.clone()));
+            track.numbers.push(first);
+            track.durations.push(seconds);
+        }
+        Addressing::List => {
+            track.init = init_of(t.init.as_ref().and_then(|i| join(i)));
+            let n = t.list.len() as u64;
+            if n > MAX_SEGMENTS {
+                track.unsupported = Some(format!(
+                    "the manifest lists more than {MAX_SEGMENTS} segments"
+                ));
+                return track;
+            }
+            let per = t
+                .duration
+                .filter(|d| *d > 0.0)
+                .map(|d| d / t.scale())
+                .unwrap_or(if n > 0 { seconds / n as f64 } else { 0.0 });
+            for (i, (media, range)) in t.list.iter().enumerate() {
+                if let Some(url) = join(media) {
+                    track.segments.push(Segment {
+                        url,
+                        range: *range,
+                        key: None,
+                    });
+                    track.numbers.push(first.saturating_add(i as u64));
+                    track.durations.push(per);
+                }
+            }
+            if track.segments.is_empty() {
+                track.unsupported = Some("the SegmentList names no SegmentURL".into());
+            }
+        }
+        Addressing::Template => {
+            track.init = init_of(
+                t.init
+                    .as_ref()
+                    .map(|i| expand(i, &id, first, 0, bw))
+                    .and_then(|u| join(&u)),
+            );
+            let Some(media) = &t.media else {
+                track.unsupported = Some(format!(
+                    "representation {id} has a SegmentTemplate without a media attribute"
+                ));
+                return track;
+            };
+            let ticks = match t.ticks(seconds) {
+                Ok(ticks) => ticks,
+                Err(why) => {
+                    track.unsupported = Some(why);
+                    return track;
+                }
+            };
+            if ticks.is_empty() {
+                track.unsupported = Some(format!(
+                    "representation {id} has a SegmentTemplate with neither a duration nor a \
+                     SegmentTimeline"
+                ));
+            }
+            for (number, time, secs) in ticks {
+                if let Some(url) = join(&expand(media, &id, number, time, bw)) {
                     track.segments.push(Segment::new(url));
                     track.numbers.push(number);
                     track.durations.push(secs);
@@ -460,6 +654,33 @@ fn drm_name(scheme: &str) -> Option<&'static str> {
     }
 }
 
+/// `contentType`, else the major type of `mimeType`, lower-cased.
+fn content_type(attrs: &[(String, String)]) -> Option<String> {
+    attr(attrs, "contentType")
+        .map(str::to_string)
+        .or_else(|| {
+            attr(attrs, "mimeType")
+                .and_then(|m| m.split('/').next())
+                .map(str::to_string)
+        })
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// A Representation's continuation across Periods is one track.
+fn append_period(into: &mut Track, next: Track) {
+    if next.init != into.init {
+        if let Some(init) = next.init {
+            into.init_changes.push((into.segments.len(), init));
+        }
+    }
+    into.segments.extend(next.segments);
+    into.numbers.extend(next.numbers);
+    into.durations.extend(next.durations);
+    if into.unsupported.is_none() {
+        into.unsupported = next.unsupported;
+    }
+}
+
 /// Parse an MPD into concrete tracks. `base` is the URL it was fetched from.
 pub fn parse(text: &str, base: &str) -> Manifest {
     let mut mf = Manifest::default();
@@ -468,6 +689,10 @@ pub fn parse(text: &str, base: &str) -> Manifest {
     // `<BaseURL>` text arrives after the element opens, so it lands here and
     // is attached to whichever scope was open.
     let mut want_base = false;
+    let mut periods: Vec<Period> = Vec::new();
+    // Representations in document order, resolved once every Period's
+    // length is known.
+    let mut reps: Vec<(Pending, Option<Template>)> = Vec::new();
 
     // Effective base URL: every BaseURL down the open scopes, joined.
     let effective_base = |stack: &Vec<Scope>| -> String {
@@ -485,9 +710,11 @@ pub fn parse(text: &str, base: &str) -> Manifest {
     let effective_type = |stack: &Vec<Scope>| -> Option<String> {
         stack.iter().rev().find_map(|s| s.content_type.clone())
     };
-    let period_seconds = |stack: &Vec<Scope>, total: f64| -> f64 {
-        stack.iter().rev().find_map(|s| s.duration).unwrap_or(total)
-    };
+    // The innermost open scope that carries addressing, for the children
+    // (`S`, `SegmentURL`, `Initialization`) that fill it in.
+    fn addressing(stack: &mut [Scope]) -> Option<&mut Template> {
+        stack.iter_mut().rev().find_map(|s| s.template.as_mut())
+    }
 
     let nodes = scan(text);
     for node in &nodes {
@@ -512,31 +739,29 @@ pub fn parse(text: &str, base: &str) -> Manifest {
                             .template
                             .clone()
                             .or_else(|| stack.iter().rev().find_map(|s| s.template.clone()));
-                        // A Representation may carry its OWN <BaseURL>, and
-                        // like its template that is only known once the
-                        // element closes. The base captured at the opening
-                        // tag covers its ancestors; this folds in the child
-                        // one when there is one.
+                        // A Representation's own <BaseURL> is only known once
+                        // it closes; fold it onto the base captured at the
+                        // opening tag.
                         let p = match &top.base {
                             Some(b) => Pending {
                                 base_url: crate::url::join(&p.base_url, b)
                                     .unwrap_or_else(|| p.base_url.clone()),
+                                own_base: true,
                                 ..p.clone()
                             },
                             None => p.clone(),
                         };
-                        let track = make_track(&p, template.as_ref());
-                        match p.kind {
-                            TrackKind::Video => mf.video.push(track),
-                            TrackKind::Audio => mf.audio.push(track),
-                        }
+                        reps.push((p, template));
                     }
                     // A SegmentTimeline fills its SegmentTemplate only as its
                     // <S> children are read — after the parent scope already
                     // took a copy. Hand the finished template back on the way
                     // out, or the timeline is lost and the Representation
                     // sees an empty one.
-                    if top.name == "SegmentTemplate" {
+                    if matches!(
+                        top.name.as_str(),
+                        "SegmentTemplate" | "SegmentList" | "SegmentBase"
+                    ) {
                         if let (Some(t), Some(parent)) = (top.template.clone(), stack.last_mut()) {
                             parent.template = Some(t);
                         }
@@ -550,7 +775,11 @@ pub fn parse(text: &str, base: &str) -> Manifest {
             Node::Text(t) => {
                 if want_base {
                     if let Some(top) = stack.last_mut() {
-                        top.base = Some(t.clone());
+                        // Sibling BaseURLs are alternatives; the first is the
+                        // default (ISO 23009-1 §5.6).
+                        if top.base.is_none() {
+                            top.base = Some(t.clone());
+                        }
                     }
                     want_base = false;
                 }
@@ -576,29 +805,26 @@ pub fn parse(text: &str, base: &str) -> Manifest {
                 // The URL is this element's TEXT; the next Text node is it.
                 want_base = !is_empty;
             }
-            "Period" => stack.push(Scope {
-                name: name.into(),
-                duration: attr(attrs, "duration").and_then(iso_duration),
-                ..Scope::default()
-            }),
-            "AdaptationSet" => {
-                let ctype = attr(attrs, "contentType")
-                    .map(str::to_string)
-                    .or_else(|| {
-                        attr(attrs, "mimeType")
-                            .and_then(|m| m.split('/').next())
-                            .map(str::to_string)
-                    })
-                    .map(|s| s.to_ascii_lowercase());
-                stack.push(Scope {
-                    name: name.into(),
-                    content_type: ctype,
-                    ..Scope::default()
+            "Period" => {
+                periods.push(Period {
+                    start: attr(attrs, "start").and_then(iso_duration),
+                    duration: attr(attrs, "duration").and_then(iso_duration),
                 });
                 if !is_empty {
-                    continue;
+                    stack.push(Scope {
+                        name: name.into(),
+                        ..Scope::default()
+                    });
                 }
-                stack.pop();
+            }
+            "AdaptationSet" => {
+                if !is_empty {
+                    stack.push(Scope {
+                        name: name.into(),
+                        content_type: content_type(attrs),
+                        ..Scope::default()
+                    });
+                }
             }
             "ContentProtection" => {
                 let scheme = attr(attrs, "schemeIdUri").unwrap_or("");
@@ -612,12 +838,13 @@ pub fn parse(text: &str, base: &str) -> Manifest {
                     None => {}
                 }
             }
-            "SegmentTemplate" => {
-                let mut t = effective_template(&stack).unwrap_or(Template {
-                    timescale: 1.0,
-                    start_number: 1,
-                    ..Template::default()
-                });
+            "SegmentTemplate" | "SegmentList" | "SegmentBase" => {
+                let mut t = effective_template(&stack).unwrap_or_default();
+                t.form = match name {
+                    "SegmentList" => Addressing::List,
+                    "SegmentBase" => Addressing::Base,
+                    _ => Addressing::Template,
+                };
                 t.merge(attrs);
                 if let Some(top) = stack.last_mut() {
                     top.template = Some(t.clone());
@@ -630,43 +857,38 @@ pub fn parse(text: &str, base: &str) -> Manifest {
                     });
                 }
             }
-            "S" => {
-                // A SegmentTimeline entry: t (start), d (duration), r (extra
-                // repeats). `t` is implicit when it just follows the last.
-                let d: u64 = num(attrs, "d").unwrap_or(0);
-                let r: i64 = num(attrs, "r").unwrap_or(0);
-                let mut scope_idx = None;
-                for (i, s) in stack.iter().enumerate().rev() {
-                    if s.template.is_some() {
-                        scope_idx = Some(i);
-                        break;
+            "Initialization" => {
+                if let Some(t) = addressing(&mut stack) {
+                    if let Some(u) = attr(attrs, "sourceURL") {
+                        t.init = Some(u.to_string());
+                    }
+                    t.init_range = attr(attrs, "range").and_then(byte_range);
+                }
+            }
+            "SegmentURL" => {
+                if let Some(t) = addressing(&mut stack) {
+                    if let Some(m) = attr(attrs, "media") {
+                        t.list.push((
+                            m.to_string(),
+                            attr(attrs, "mediaRange").and_then(byte_range),
+                        ));
                     }
                 }
-                let Some(i) = scope_idx else { continue };
-                let Some(t) = stack[i].template.as_mut() else {
-                    continue;
-                };
-                let mut start = num::<u64>(attrs, "t")
-                    .or_else(|| t.timeline.last().map(|(lt, ld)| lt + ld))
-                    .unwrap_or(0);
-                // A negative `r` means "repeat to the end of the period",
-                // which needs a period length this element does not have;
-                // treated as one segment rather than guessed at.
-                for _ in 0..=r.max(0) {
-                    t.timeline.push((start, d));
-                    start += d;
+            }
+            "S" => {
+                if let Some(t) = addressing(&mut stack) {
+                    if t.timeline.len() as u64 >= MAX_SEGMENTS {
+                        continue;
+                    }
+                    t.timeline.push(TimelineEntry {
+                        t: num(attrs, "t"),
+                        d: num(attrs, "d").unwrap_or(0),
+                        r: num(attrs, "r").unwrap_or(0),
+                    });
                 }
             }
             "Representation" => {
-                let ctype = attr(attrs, "contentType")
-                    .map(str::to_string)
-                    .or_else(|| {
-                        attr(attrs, "mimeType")
-                            .and_then(|m| m.split('/').next())
-                            .map(str::to_string)
-                    })
-                    .map(|s| s.to_ascii_lowercase())
-                    .or_else(|| effective_type(&stack));
+                let ctype = content_type(attrs).or_else(|| effective_type(&stack));
                 let kind = match ctype.as_deref() {
                     Some("video") => TrackKind::Video,
                     Some("audio") => TrackKind::Audio,
@@ -686,17 +908,13 @@ pub fn parse(text: &str, base: &str) -> Manifest {
                     attrs: attrs.to_vec(),
                     kind,
                     base_url: effective_base(&stack),
-                    seconds: period_seconds(&stack, mf.duration),
+                    own_base: false,
+                    period: periods.len().saturating_sub(1),
                 };
                 if is_empty {
                     // Nothing can be nested in it, so the inherited template
                     // is the whole story.
-                    let template = effective_template(&stack);
-                    let track = make_track(&pending, template.as_ref());
-                    match kind {
-                        TrackKind::Video => mf.video.push(track),
-                        TrackKind::Audio => mf.audio.push(track),
-                    }
+                    reps.push((pending, effective_template(&stack)));
                 } else {
                     stack.push(Scope {
                         name: name.into(),
@@ -712,6 +930,36 @@ pub fn parse(text: &str, base: &str) -> Manifest {
                         ..Scope::default()
                     });
                 }
+            }
+        }
+    }
+
+    let lengths = period_lengths(&periods, mf.duration);
+    if mf.duration <= 0.0 && !mf.live {
+        mf.duration = lengths.iter().sum();
+    }
+    // `(period, id)` of each track placed so far, in step with the lists.
+    let mut placed_video: Vec<(usize, String)> = Vec::new();
+    let mut placed_audio: Vec<(usize, String)> = Vec::new();
+    for (p, template) in &reps {
+        let seconds = lengths.get(p.period).copied().unwrap_or(mf.duration);
+        let track = make_track(p, template.as_ref(), seconds);
+        let (list, placed) = match p.kind {
+            TrackKind::Video => (&mut mf.video, &mut placed_video),
+            TrackKind::Audio => (&mut mf.audio, &mut placed_audio),
+        };
+        // The same Representation id in a LATER period continues the track.
+        match placed
+            .iter()
+            .position(|(period, id)| *period < p.period && *id == track.id)
+        {
+            Some(i) => {
+                placed[i].0 = p.period;
+                append_period(&mut list[i], track);
+            }
+            None => {
+                placed.push((p.period, track.id.clone()));
+                list.push(track);
             }
         }
     }
@@ -737,19 +985,18 @@ impl Manifest {
         )
     }
 
-    /// The window as `($Number$, url)`, for a live recorder tracking what it
-    /// has already taken.
-    /// The window with each entry's duration, for a recorder reporting how
-    /// much time it has captured.
+    /// The window as `($Number$, segment, seconds)`, for a live recorder
+    /// tracking what it has already taken and how much time that is.
     pub fn timed_window(track: &Track) -> Vec<(u64, Segment, f64)> {
         track
             .numbers
             .iter()
+            .zip(&track.segments)
             .enumerate()
-            .map(|(i, n)| {
+            .map(|(i, (n, s))| {
                 (
                     *n,
-                    track.segments[i].clone(),
+                    s.clone(),
                     track.durations.get(i).copied().unwrap_or(0.0),
                 )
             })
@@ -799,18 +1046,20 @@ impl Manifest {
             return Err(Refusal::Live);
         }
         if track.segments.is_empty() {
-            return Err(Refusal::Empty);
+            return Err(match &track.unsupported {
+                Some(why) => Refusal::Unsupported(why.clone()),
+                None => Refusal::Empty,
+            });
         }
-        Ok(Plan {
-            init: track.init.clone(),
-            segments: track.segments.clone(),
-            kind: Segments::Fmp4,
-            duration: self.duration,
-            estimated_size: track
-                .bandwidth
-                .filter(|_| self.duration > 0.0)
-                .map(|b| (b as f64 * self.duration / 8.0) as u64),
-        })
+        Ok(Plan::assemble(
+            track.init.clone(),
+            track.init_changes.clone(),
+            track.segments.clone(),
+            Segments::Fmp4,
+            None,
+            self.duration,
+            track.bandwidth,
+        ))
     }
 }
 
@@ -1124,5 +1373,275 @@ mod tests {
         assert_eq!(iso_duration("PT2M"), Some(120.0));
         assert_eq!(iso_duration("P1DT1S"), Some(86401.0));
         assert_eq!(iso_duration("nonsense"), None);
+    }
+
+    #[test]
+    fn start_number_zero_is_respected_and_only_an_absent_one_defaults() {
+        let mpd = |attr: &str| {
+            format!(
+                r#"<MPD type="static" mediaPresentationDuration="PT8S"><Period>
+                  <AdaptationSet contentType="video">
+                    <SegmentTemplate media="$Number$.m4s" duration="4" timescale="1" {attr}/>
+                    <Representation id="v0" bandwidth="1" width="10" height="10"/>
+                  </AdaptationSet></Period></MPD>"#
+            )
+        };
+        let zero = parse(&mpd(r#"startNumber="0""#), "https://e/m.mpd");
+        assert_eq!(zero.video[0].numbers, [0, 1]);
+        assert_eq!(zero.video[0].segments[0].url, "https://e/0.m4s");
+        let absent = parse(&mpd(""), "https://e/m.mpd");
+        assert_eq!(absent.video[0].numbers, [1, 2]);
+    }
+
+    #[test]
+    fn a_segment_list_names_each_segment_and_its_byte_range() {
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT9S"><Period>
+          <AdaptationSet contentType="video">
+            <Representation id="v0" bandwidth="1" width="10" height="10">
+              <BaseURL>all.mp4</BaseURL>
+              <SegmentList timescale="1000" duration="3000">
+                <Initialization sourceURL="all.mp4" range="0-863"/>
+                <SegmentURL media="all.mp4" mediaRange="864-5000"/>
+                <SegmentURL media="all.mp4" mediaRange="5001-9000"/>
+                <SegmentURL media="tail.m4s"/>
+              </SegmentList>
+            </Representation>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(mpd, "https://e/d/m.mpd");
+        let v = &mf.video[0];
+        assert_eq!(v.unsupported, None);
+        assert_eq!(
+            v.init,
+            Some(Segment {
+                url: "https://e/d/all.mp4".into(),
+                range: Some((0, 864)),
+                key: None
+            })
+        );
+        assert_eq!(v.segments.len(), 3);
+        assert_eq!(v.segments[0].range, Some((864, 5000 - 864 + 1)));
+        assert_eq!(v.segments[1].range, Some((5001, 4000)));
+        assert_eq!(v.segments[2], Segment::new("https://e/d/tail.m4s"));
+        assert_eq!(v.numbers, [1, 2, 3]);
+        assert_eq!(v.durations, [3.0, 3.0, 3.0]);
+        let plan = mf.plan(v).unwrap();
+        assert_eq!(
+            plan.segments[0].range_header().as_deref(),
+            Some("bytes=864-5000")
+        );
+
+        // Without a duration the period's length is shared out evenly, and a
+        // list that names nothing is refused by name.
+        let bare = mpd
+            .replace(r#"timescale="1000" duration="3000""#, "")
+            .replace(r#"<SegmentURL media="tail.m4s"/>"#, "");
+        let mf = parse(&bare, "https://e/d/m.mpd");
+        assert_eq!(mf.video[0].durations, [4.5, 4.5]);
+        let empty = mpd.replace(
+            r#"<SegmentURL media="all.mp4" mediaRange="864-5000"/>
+                <SegmentURL media="all.mp4" mediaRange="5001-9000"/>
+                <SegmentURL media="tail.m4s"/>"#,
+            "",
+        );
+        let mf = parse(&empty, "https://e/d/m.mpd");
+        assert!(matches!(
+            mf.plan(&mf.video[0]),
+            Err(Refusal::Unsupported(w)) if w.contains("SegmentURL")
+        ));
+    }
+
+    #[test]
+    fn a_segment_base_is_one_whole_file_carrying_its_own_init() {
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT30S"><Period>
+          <AdaptationSet contentType="video">
+            <Representation id="v0" bandwidth="1" width="10" height="10">
+              <BaseURL>movie.mp4</BaseURL>
+              <SegmentBase indexRange="864-1500"><Initialization range="0-863"/></SegmentBase>
+            </Representation>
+          </AdaptationSet>
+          <AdaptationSet contentType="audio">
+            <Representation id="a0" bandwidth="1"><BaseURL>sound.mp4</BaseURL></Representation>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(mpd, "https://e/d/m.mpd");
+        let v = &mf.video[0];
+        // The init lives inside the same file, so fetching it separately
+        // would write those bytes twice.
+        assert_eq!(v.init, None);
+        assert_eq!(v.segments, [Segment::new("https://e/d/movie.mp4")]);
+        assert_eq!(v.durations, [30.0]);
+        assert!(mf.plan(v).is_ok());
+        // No addressing at all plus its own BaseURL is the same thing.
+        assert_eq!(
+            mf.choose_audio().unwrap().segments,
+            [Segment::new("https://e/d/sound.mp4")]
+        );
+    }
+
+    #[test]
+    fn a_representation_with_no_addressing_is_refused_by_name() {
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT8S"><Period>
+          <AdaptationSet contentType="video">
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(mpd, "https://e/m.mpd");
+        let Err(Refusal::Unsupported(why)) = mf.plan(&mf.video[0]) else {
+            panic!("a representation with nothing to fetch must say so");
+        };
+        assert!(why.contains("no segment addressing"), "{why}");
+        assert!(why.contains("v0"), "{why}");
+    }
+
+    #[test]
+    fn periods_sharing_a_representation_id_continue_one_track_in_order() {
+        // Period one has no duration; its length is the gap to period two's
+        // start. Period two runs to the end of the presentation.
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT18S">
+          <Period id="p1" start="PT0S">
+            <AdaptationSet contentType="video">
+              <SegmentTemplate media="p1/$Number$.m4s" initialization="p1/init.mp4" duration="2" timescale="1" startNumber="1"/>
+              <Representation id="v0" bandwidth="1" width="10" height="10"/>
+            </AdaptationSet>
+          </Period>
+          <Period id="p2" start="PT10S">
+            <AdaptationSet contentType="video">
+              <SegmentTemplate media="p2/$Number$.m4s" initialization="p2/init.mp4" duration="2" timescale="1" startNumber="1"/>
+              <Representation id="v0" bandwidth="1" width="10" height="10"/>
+              <Representation id="v1" bandwidth="2" width="20" height="20"/>
+            </AdaptationSet>
+          </Period></MPD>"#;
+        let mf = parse(mpd, "https://e/m.mpd");
+        // v0 spans both periods; v1 exists only in the second.
+        assert_eq!(mf.video.len(), 2);
+        let v0 = mf.video.iter().find(|t| t.id == "v0").unwrap();
+        assert_eq!(v0.segments.len(), 5 + 4, "10 s then 8 s of 2 s segments");
+        assert!(v0.segments[4].url.ends_with("p1/5.m4s"));
+        assert!(v0.segments[5].url.ends_with("p2/1.m4s"));
+        assert_eq!(
+            v0.init.as_ref().map(|s| s.url.as_str()),
+            Some("https://e/p1/init.mp4")
+        );
+        assert_eq!(
+            v0.init_changes,
+            [(5, Segment::new("https://e/p2/init.mp4"))],
+            "the second period's init must be written before its first segment"
+        );
+        let plan = mf.plan(v0).unwrap();
+        assert_eq!(plan.init_changes.len(), 1);
+        assert_eq!(plan.segments.len(), 9);
+        let v1 = mf.video.iter().find(|t| t.id == "v1").unwrap();
+        assert_eq!(v1.segments.len(), 4);
+        assert!(v1.init_changes.is_empty());
+    }
+
+    #[test]
+    fn an_unbounded_timeline_is_refused_rather_than_expanded() {
+        let repeat = r#"<MPD type="static" mediaPresentationDuration="PT8S"><Period>
+          <AdaptationSet contentType="video">
+            <SegmentTemplate media="$Number$.m4s" timescale="1">
+              <SegmentTimeline><S t="0" d="1" r="4000000000"/></SegmentTimeline>
+            </SegmentTemplate>
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(repeat, "https://e/m.mpd");
+        assert!(mf.video[0].segments.is_empty());
+        let Err(Refusal::Unsupported(why)) = mf.plan(&mf.video[0]) else {
+            panic!("four billion segments must be refused");
+        };
+        assert!(why.contains("1000000"), "{why}");
+
+        // A microsecond duration over an hour is the same problem spelled
+        // with arithmetic instead of a repeat count.
+        let tiny = r#"<MPD type="static" mediaPresentationDuration="PT1H"><Period>
+          <AdaptationSet contentType="video">
+            <SegmentTemplate media="$Number$.m4s" duration="1" timescale="1000000"/>
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(tiny, "https://e/m.mpd");
+        assert!(matches!(
+            mf.plan(&mf.video[0]),
+            Err(Refusal::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn base_url_text_is_unescaped_and_the_first_sibling_is_the_default() {
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT4S">
+          <BaseURL>https://a.example/v/a&amp;b/</BaseURL>
+          <BaseURL>https://b.example/v/</BaseURL>
+          <Period><AdaptationSet contentType="video">
+            <SegmentTemplate media="s$Number$.m4s" duration="4" timescale="1"/>
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(mpd, "https://origin.example/m.mpd");
+        assert_eq!(
+            mf.video[0].segments[0].url,
+            "https://a.example/v/a&b/s1.m4s"
+        );
+    }
+
+    #[test]
+    fn time_in_a_duration_only_template_advances_from_the_presentation_offset() {
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT12S"><Period>
+          <AdaptationSet contentType="video">
+            <SegmentTemplate media="v/$Time$.m4s" duration="4000" timescale="1000" presentationTimeOffset="100"/>
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(mpd, "https://e/m.mpd");
+        assert_eq!(
+            mf.video[0]
+                .segments
+                .iter()
+                .map(|s| s.url.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "https://e/v/100.m4s",
+                "https://e/v/4100.m4s",
+                "https://e/v/8100.m4s"
+            ]
+        );
+        // A timeline's `t` values already include the offset and are used as
+        // written.
+        let timeline = r#"<MPD type="static" mediaPresentationDuration="PT8S"><Period>
+          <AdaptationSet contentType="video">
+            <SegmentTemplate media="v/$Time$.m4s" timescale="1000" presentationTimeOffset="100">
+              <SegmentTimeline><S t="100" d="4000" r="1"/></SegmentTimeline>
+            </SegmentTemplate>
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(timeline, "https://e/m.mpd");
+        assert_eq!(mf.video[0].segments[1].url, "https://e/v/4100.m4s");
+    }
+
+    #[test]
+    fn a_negative_repeat_runs_to_the_end_of_the_period() {
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT14S"><Period>
+          <AdaptationSet contentType="video">
+            <SegmentTemplate media="v/$Number$.m4s" timescale="1000">
+              <SegmentTimeline><S t="0" d="4000" r="-1"/></SegmentTimeline>
+            </SegmentTemplate>
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(mpd, "https://e/m.mpd");
+        assert_eq!(mf.video[0].numbers, [1, 2, 3, 4], "14 s of 4 s segments");
+        // With no period length to run to, it is one segment, not a guess.
+        let live = mpd.replace(
+            r#"type="static" mediaPresentationDuration="PT14S""#,
+            r#"type="dynamic""#,
+        );
+        assert_eq!(parse(&live, "https://e/m.mpd").video[0].numbers, [1]);
+    }
+
+    #[test]
+    fn absurd_timeline_values_saturate_instead_of_overflowing() {
+        let mpd = r#"<MPD type="static" mediaPresentationDuration="PT8S"><Period>
+          <AdaptationSet contentType="video">
+            <SegmentTemplate media="v/$Number$-$Time$.m4s" timescale="1" startNumber="18446744073709551615">
+              <SegmentTimeline><S t="18446744073709551610" d="10" r="2"/><S d="18446744073709551615"/></SegmentTimeline>
+            </SegmentTemplate>
+            <Representation id="v0" bandwidth="1" width="10" height="10"/>
+          </AdaptationSet></Period></MPD>"#;
+        let mf = parse(mpd, "https://e/m.mpd");
+        assert_eq!(mf.video[0].segments.len(), 4);
+        assert!(mf.video[0].numbers.iter().all(|&n| n == u64::MAX));
     }
 }

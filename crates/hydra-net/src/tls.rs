@@ -81,11 +81,23 @@ impl tokio::io::AsyncWrite for MaybeTls {
 /// requests work because the proxy parses the request line, and an encrypted
 /// request line cannot be parsed. A 2xx means the tunnel is open and the socket is
 /// now end-to-end with the origin.
-async fn connect_tunnel(sock: &mut TcpStream, authority: &str) -> io::Result<()> {
+///
+/// `proxy_auth` is the `Proxy-Authorization` value the proxy is owed. The
+/// tunnel is the proxy hop, so a proxy that wants a login on every
+/// absolute-form request wants it here too, and answers 407 without it.
+async fn connect_tunnel(
+    sock: &mut TcpStream,
+    authority: &str,
+    proxy_auth: Option<&str>,
+) -> io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let req = format!(
-        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    let mut req = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n"
     );
+    if let Some(auth) = proxy_auth {
+        req.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+    }
+    req.push_str("\r\n");
     sock.write_all(req.as_bytes()).await?;
     let mut buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
@@ -116,6 +128,11 @@ async fn connect_tunnel(sock: &mut TcpStream, authority: &str) -> io::Result<()>
         .unwrap_or(0);
     if (200..300).contains(&status) {
         Ok(())
+    } else if status == 407 {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("proxy refused CONNECT to {authority}: status 407, it wants a login"),
+        ))
     } else {
         Err(io::Error::other(format!(
             "proxy refused CONNECT to {authority}: status {status}"
@@ -362,32 +379,26 @@ impl TlsCapableConnector {
     pub fn new() -> io::Result<Self> {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut config = ClientConfig::builder()
+        let config = ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
-        // Session resumption lowers the handshake cost of the SECOND and later
-        // connections to a host, which matters here because a multi-source
-        // transfer opens several per source.
+        Ok(Self::finish(config))
+    }
+
+    /// The tail every constructor shares: session resumption, because a
+    /// multi-source transfer opens several connections per host, and an
+    /// explicit HTTP/1.1 ALPN offer. HTTP/1.1 is the deliberate choice, not a
+    /// limitation: HTTP/2 would ride every range on one congestion window
+    /// (see docs/HTTP2-ASSESSMENT.md).
+    fn finish(mut config: ClientConfig) -> Self {
         config.resumption = rustls::client::Resumption::in_memory_sessions(64);
-        // Offer HTTP/1.1 explicitly. Without any ALPN list rustls offers none, and
-        // the negotiated protocol is whatever the server assumes — which is
-        // HTTP/1.1 today, but by accident rather than by decision.
-        //
-        // HTTP/1.1 is the DELIBERATE choice here, not a limitation. See
-        // docs/HTTP2-ASSESSMENT.md: HTTP/2 would multiplex every range onto one
-        // TCP connection, which is one flow's share of a contended path. Against
-        // an origin that rate-limits per connection that is an 8x throughput
-        // penalty, set against a best-case saving of 1.34% in setup round trips.
-        // It would also collapse the per-connection rate differences the
-        // scheduler makes its decisions from, since every stream would ride one
-        // congestion window.
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Self {
+        Self {
             config: Arc::new(config),
             proxy: crate::socks::Proxy::none(),
             family: IpFamily::Any,
             pool: std::sync::Arc::new(crate::pool::ConnPool::new()),
-        })
+        }
     }
 
     /// Route every connection through a SOCKS proxy.
@@ -411,32 +422,13 @@ impl TlsCapableConnector {
     pub fn insecure() -> io::Result<Self> {
         let provider = rustls::crypto::ring::default_provider();
         let verifier = Arc::new(AcceptAnyCert(Arc::new(provider.clone())));
-        let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
+        let config = ClientConfig::builder_with_provider(Arc::new(provider))
             .with_safe_default_protocol_versions()
             .map_err(|e| io::Error::other(format!("tls config: {e}")))?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-        config.resumption = rustls::client::Resumption::in_memory_sessions(64);
-        // Offer HTTP/1.1 explicitly. Without any ALPN list rustls offers none, and
-        // the negotiated protocol is whatever the server assumes — which is
-        // HTTP/1.1 today, but by accident rather than by decision.
-        //
-        // HTTP/1.1 is the DELIBERATE choice here, not a limitation. See
-        // docs/HTTP2-ASSESSMENT.md: HTTP/2 would multiplex every range onto one
-        // TCP connection, which is one flow's share of a contended path. Against
-        // an origin that rate-limits per connection that is an 8x throughput
-        // penalty, set against a best-case saving of 1.34% in setup round trips.
-        // It would also collapse the per-connection rate differences the
-        // scheduler makes its decisions from, since every stream would ride one
-        // congestion window.
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Self {
-            config: Arc::new(config),
-            proxy: crate::socks::Proxy::none(),
-            family: IpFamily::Any,
-            pool: std::sync::Arc::new(crate::pool::ConnPool::new()),
-        })
+        Ok(Self::finish(config))
     }
 
     /// Pick the verifying or accept-anything client.
@@ -501,7 +493,7 @@ impl Connector for TlsCapableConnector {
             // already end-to-end with the origin, so a CONNECT would be sent TO the
             // origin as a bogus request.
             if t.origin.is_some() && !socks.kind.is_socks() {
-                connect_tunnel(&mut tcp, t.proxy_authority()).await?;
+                connect_tunnel(&mut tcp, t.proxy_authority(), t.proxy_authorization()).await?;
             }
             // SNI must be the ORIGIN name, not the socket peer: when routing
             // through a proxy the socket connects to the proxy but the certificate
@@ -621,6 +613,97 @@ mod tests {
         // Both is rejected by the CLI (`conflicts_with`); if one ever reaches
         // here it must not silently become a restriction the user did not choose.
         assert_eq!(IpFamily::from_flags(true, true), IpFamily::Any);
+    }
+
+    /// A forward proxy that wants a login: `CONNECT` is answered 407 without
+    /// the header and 200 with it, and the request head it saw is handed
+    /// back so the test can read what went over the wire.
+    fn authenticating_proxy(want: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut sock) = conn else { continue };
+                let Ok(peek) = sock.try_clone() else { continue };
+                let mut r = BufReader::new(peek);
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                let resp = if head.lines().any(|l| l == want) {
+                    "HTTP/1.1 200 Connection established\r\n\r\n"
+                } else {
+                    "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                     Proxy-Authenticate: Basic realm=\"p\"\r\nContent-Length: 0\r\n\r\n"
+                };
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = tx.send(head);
+            }
+        });
+        (port, rx)
+    }
+
+    /// The reported bug: plain-HTTP requests through an authenticated proxy
+    /// carried `Proxy-Authorization` and worked, while an https URL through
+    /// the same proxy was refused at the tunnel with 407 because the
+    /// `CONNECT` went out without it.
+    #[tokio::test]
+    async fn a_connect_tunnel_carries_the_proxy_login() {
+        let (port, seen) = authenticating_proxy("Proxy-Authorization: Basic cHU6cHc=");
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        connect_tunnel(&mut sock, "origin.example:443", Some("Basic cHU6cHc="))
+            .await
+            .expect("an authenticated CONNECT must open the tunnel");
+        let head = seen.recv().unwrap();
+        assert!(
+            head.starts_with("CONNECT origin.example:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("Proxy-Authorization: Basic cHU6cHc=\r\n"),
+            "{head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_tunnel_without_the_login_reports_the_407() {
+        let (port, seen) = authenticating_proxy("Proxy-Authorization: Basic cHU6cHc=");
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let e = connect_tunnel(&mut sock, "origin.example:443", None)
+            .await
+            .expect_err("no login, no tunnel");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("407"), "{e}");
+        assert!(
+            !seen.recv().unwrap().contains("Proxy-Authorization"),
+            "nothing to send, nothing sent"
+        );
+    }
+
+    /// The connector reads the login off the target, where the front-ends
+    /// already put it for their plain requests, so both hops through one
+    /// proxy authenticate the same way.
+    #[tokio::test]
+    async fn the_connector_sends_the_targets_proxy_login_on_connect() {
+        let (port, seen) = authenticating_proxy("Proxy-Authorization: Basic cHU6cHc=");
+        let mut t = Target::via_proxy("127.0.0.1", port, "origin.example:443", "/f")
+            .with_headers(vec!["Proxy-Authorization: Basic cHU6cHc=".into()], None);
+        t.tls = true;
+        // The tunnel opens; the handshake that follows fails, because the
+        // proxy is not an origin. What the test pins is what the proxy saw.
+        let _ = TlsCapableConnector::new().unwrap().connect(&t).await;
+        let head = seen.recv().unwrap();
+        assert!(head.starts_with("CONNECT origin.example:443"), "{head}");
+        assert!(
+            head.contains("Proxy-Authorization: Basic cHU6cHc="),
+            "{head}"
+        );
     }
 
     /// A family with no matching address must report which host and which flag.

@@ -260,14 +260,14 @@ async function refresh() {
     st.className = "status off";
     st.title = state.hydraSeen
       ? "Hydra is not running (it starts automatically on capture)"
-      : "Hydra native host not reachable — run the install script";
+      : "Hydra native host not reachable — start Hydra once so it registers the host";
   }
 
   const hint = $("hint");
   if (!state.guiCapture) {
     hint.textContent = "Capture is off in Hydra's Options (Google Chrome unchecked).";
   } else if (!(ping && ping.ok) && !state.hydraSeen) {
-    hint.textContent = "Install the native host: scripts/install-native-host.sh";
+    hint.textContent = "Start Hydra once so it registers the host with this browser.";
   } else {
     hint.textContent = "Alt+click a link to bypass capture once.";
   }

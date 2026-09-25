@@ -84,6 +84,18 @@ fn spin<'a>(
     .into()
 }
 
+/// A time box goes red while what is in it names no minute: a queue
+/// scheduled for "9.00" or "25:00" would otherwise sit there never firing.
+fn time_style(
+    typed: &str,
+) -> fn(&iced::Theme, iced::widget::text_input::Status) -> iced::widget::text_input::Style {
+    if crate::model::parse_hhmm(typed).is_some() {
+        theme::input
+    } else {
+        theme::input_invalid
+    }
+}
+
 /// A dialog button that takes the width it is given rather than the fixed
 /// dialog-button width, for a row sized to something else.
 fn wide_btn<'a>(label: String, msg: Option<Message>) -> El<'a> {
@@ -211,7 +223,7 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
             text_input("23:00", &sc.start_at)
                 .on_input(|v| s(SchField::StartAt(v)))
                 .size(theme::FONT_SIZE)
-                .style(theme::input)
+                .style(time_style(&sc.start_at))
                 .width(90.0),
             text(tr("(HH:MM)")).size(theme::FONT_SIZE - 1.0),
         ]
@@ -233,7 +245,7 @@ fn schedule_tab<'a>(q: &'a QueueDef) -> El<'a> {
             text_input("07:30", &sc.stop_at)
                 .on_input(|v| s(SchField::StopAt(v)))
                 .size(theme::FONT_SIZE)
-                .style(theme::input)
+                .style(time_style(&sc.stop_at))
                 .width(90.0),
         ]
         .spacing(10)

@@ -19,10 +19,15 @@
 //!  - the ephemeral line-protocol port, used by `hydra-host`, authenticated
 //!    by the ipc.json token (browsers cannot read files, hosts can);
 //!  - a WebSocket listener on a KNOWN port (6799, fallback 16799), spoken
-//!    directly by the browser extension, authenticated by the `Origin`
-//!    header (browsers always send `chrome-extension://...` and never let a
-//!    page forge it). A live WS connection doubles as the extension's
-//!    "hydra is running" indicator.
+//!    directly by the browser extension. The `Origin` header (browsers
+//!    always send `chrome-extension://...` and never let a page forge it)
+//!    admits extension contexts to the handshake; the socket then stays
+//!    unauthenticated until its first frame, `{"type":"auth","token":...}`,
+//!    carries the same ipc.json token — which the extension obtains from
+//!    the native host with `{"type":"ws-token"}`, so any extension the host
+//!    manifest allow-lists can prove itself. The pinned Chromium ids in
+//!    `nmhost::CHROMIUM_EXT_IDS` skip the token. A live, authenticated WS
+//!    connection doubles as the extension's "hydra is running" indicator.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -133,12 +138,25 @@ pub struct ExtStream {
 /// native-messaging job the moment the host answers) takes the download
 /// with it, having already told the browser to let go.
 #[derive(Clone, Debug)]
-pub struct Ack(std::sync::mpsc::Sender<()>);
+pub struct Ack(std::sync::mpsc::SyncSender<()>);
 
 impl Ack {
+    /// A receipt and the end the socket thread waits on. Rendezvous, not
+    /// buffered: `send` only succeeds while someone is still waiting, so
+    /// [`Ack::confirm`] can say whether the browser was told `ok`.
+    pub(crate) fn pair() -> (Ack, std::sync::mpsc::Receiver<()>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        (Ack(tx), rx)
+    }
+
     /// Called from the UI thread once the item is in the download list.
-    pub fn confirm(&self) {
-        let _ = self.0.send(());
+    ///
+    /// `false` when the socket thread has stopped waiting — its timeout ran
+    /// out and the browser has already been told to keep the download. The
+    /// caller then owns a copy the browser is also fetching, and must drop it.
+    #[must_use]
+    pub fn confirm(&self) -> bool {
+        self.0.send(()).is_ok()
     }
 }
 
@@ -300,12 +318,7 @@ fn make_token() -> String {
     for salt in 0u64..2 {
         let mut h = RandomState::new().build_hasher();
         h.write_u64(std::process::id() as u64 ^ salt);
-        h.write_u128(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        );
+        h.write_u128(crate::fmt::since_epoch().as_nanos());
         out.push_str(&format!("{:016x}", h.finish()));
     }
     out
@@ -438,6 +451,7 @@ pub fn start() {
     }
     crate::log::info(&format!("extbus: listening on 127.0.0.1:{port}"));
 
+    let ws_token = token.clone();
     std::thread::Builder::new()
         .name("extbus-accept".into())
         .spawn(move || {
@@ -452,14 +466,16 @@ pub fn start() {
         .ok();
 
     if let Some(ws) = ws {
+        let token = ws_token;
         std::thread::Builder::new()
             .name("extbus-ws-accept".into())
             .spawn(move || {
                 for conn in ws.incoming() {
                     let Ok(stream) = conn else { continue };
+                    let tok = token.clone();
                     let _ = std::thread::Builder::new()
                         .name("extbus-ws".into())
-                        .spawn(move || serve_ws(stream));
+                        .spawn(move || serve_ws(stream, &tok));
                 }
             })
             .ok();
@@ -523,8 +539,8 @@ fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
                         .unwrap_or("-".into()),
                     dl.tab_url.as_deref().unwrap_or("-"),
                 ));
-                let (tx, receipt) = std::sync::mpsc::channel();
-                let _ = sender().send(ExtEvent::Download(dl, Ack(tx)));
+                let (ack, receipt) = Ack::pair();
+                let _ = sender().send(ExtEvent::Download(dl, ack));
                 // Dropped sender (the event never reached the handler) ends
                 // the wait at once; a timeout means a wedged UI thread.
                 match receipt.recv_timeout(ACK_TIMEOUT) {
@@ -660,10 +676,15 @@ fn serve(stream: TcpStream, token: &str) {
 
 // ----------------------------------------------------------- websocket
 
+/// How long a socket may stay unauthenticated. The extension sends `auth`
+/// as its first frame, so anything slower is not the extension.
+const WS_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Minimal RFC 6455 server side: enough for one browser extension speaking
 /// small text frames. No fragmentation, no extensions, no TLS (loopback).
-fn serve_ws(stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(300)));
+fn serve_ws(stream: TcpStream, token: &str) {
+    let _ = stream.set_read_timeout(Some(WS_IDLE_TIMEOUT));
     let _ = stream.set_nodelay(true);
     let mut out = match stream.try_clone() {
         Ok(s) => s,
@@ -697,16 +718,11 @@ fn serve_ws(stream: TcpStream) {
     };
 
     // A browser always stamps extension contexts with their real origin and
-    // pages cannot forge it — this is the authentication. (Native processes
-    // could connect, but a same-user process already owns ~/.config/hydra.)
+    // pages cannot forge it, so only extensions get past the handshake; the
+    // token frame that follows says which one. (Native processes could
+    // connect, but a same-user process already owns ~/.config/hydra.)
     let origin = header("Origin").unwrap_or_default();
-    let origin_ok = [
-        "chrome-extension://",
-        "moz-extension://",
-        "safari-web-extension://",
-    ]
-    .iter()
-    .any(|p| origin.starts_with(p));
+    let origin_ok = origin_is_extension(&origin);
     let key = header("Sec-WebSocket-Key");
     let upgrade_ok = header("Upgrade").is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
     let (Some(key), true, true) = (key, upgrade_ok, origin_ok) else {
@@ -722,7 +738,7 @@ fn serve_ws(stream: TcpStream) {
         let mut h = Sha1::new();
         h.update(key.as_bytes());
         h.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-        b64(&h.finalize())
+        hya_net::base64::encode(&h.finalize())
     };
     if out
         .write_all(
@@ -736,10 +752,40 @@ fn serve_ws(stream: TcpStream) {
     {
         return;
     }
-    crate::log::info(&format!("extbus: ws connected ({origin})"));
+    let mut authed = origin_preauthorized(&origin);
+    crate::log::info(&format!(
+        "extbus: ws connected ({origin}; {})",
+        if authed {
+            "allow-listed"
+        } else {
+            "awaiting token"
+        }
+    ));
+    if !authed {
+        let _ = out.set_read_timeout(Some(WS_AUTH_TIMEOUT));
+    }
 
     // ---- frames --------------------------------------------------------
     while let Some((opcode, payload)) = ws_read_frame(&mut reader) {
+        if !authed {
+            match ws_authenticate(opcode, &payload, token) {
+                Ok(reply) => {
+                    authed = true;
+                    let _ = out.set_read_timeout(Some(WS_IDLE_TIMEOUT));
+                    crate::log::info(&format!("extbus: ws authenticated ({origin})"));
+                    if ws_write_frame(&mut out, 0x1, reply.to_string().as_bytes()).is_err() {
+                        break;
+                    }
+                }
+                Err(reply) => {
+                    crate::log::warn(&format!("extbus: ws refused ({origin}): unauthorized"));
+                    let _ = ws_write_frame(&mut out, 0x1, reply.to_string().as_bytes());
+                    let _ = ws_write_frame(&mut out, 0x8, &[]);
+                    break;
+                }
+            }
+            continue;
+        }
         match opcode {
             0x9 => {
                 // Ping: the extension's keep-alive heartbeat.
@@ -756,6 +802,11 @@ fn serve_ws(stream: TcpStream) {
                     .ok()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                 {
+                    // The extension opens every socket with `auth`; on one
+                    // the origin already vouched for, that is simply agreed.
+                    Some(req) if req.get("type").and_then(|t| t.as_str()) == Some("auth") => {
+                        ws_auth_reply(true, req.get("id"))
+                    }
                     Some(req) => dispatch(&req, false),
                     None => serde_json::json!({"ok": false, "error": "bad json"}),
                 };
@@ -817,32 +868,67 @@ fn ws_write_frame(out: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::R
     out.flush()
 }
 
-/// Standard base64, only needed for the handshake accept key — not worth a
-/// crate dependency.
-fn b64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
-        out.push(T[(n >> 18 & 63) as usize] as char);
-        out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            T[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[(n & 63) as usize] as char
-        } else {
-            '='
-        });
+/// Whether a WebSocket `Origin` is a browser-extension context at all. Any
+/// such peer may open the socket; proving it is one of Hydra's own is the
+/// token frame's job, since Firefox and Safari mint a fresh id per install
+/// and a side-loaded Chromium build gets one of its own too.
+fn origin_is_extension(origin: &str) -> bool {
+    [
+        "chrome-extension://",
+        "moz-extension://",
+        "safari-web-extension://",
+    ]
+    .iter()
+    .any(|p| origin.len() > p.len() && origin.starts_with(p))
+}
+
+/// The Chromium ids Hydra ships under (`nmhost::CHROMIUM_EXT_IDS`) are known
+/// in advance and need no token.
+fn origin_preauthorized(origin: &str) -> bool {
+    origin
+        .strip_prefix("chrome-extension://")
+        .is_some_and(|id| crate::nmhost::CHROMIUM_EXT_IDS.contains(&id.trim_end_matches('/')))
+}
+
+/// The one frame an unauthenticated socket may send: `auth` with the
+/// ipc.json token. `Ok` carries the reply that admits the peer; `Err` the
+/// refusal after which the socket is closed.
+fn ws_authenticate(
+    opcode: u8,
+    payload: &[u8],
+    token: &str,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let req = (opcode == 0x1)
+        .then(|| std::str::from_utf8(payload).ok())
+        .flatten()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    let id = req.as_ref().and_then(|r| r.get("id"));
+    let presented = req
+        .as_ref()
+        .filter(|r| r.get("type").and_then(|t| t.as_str()) == Some("auth"))
+        .and_then(|r| r.get("token"))
+        .and_then(|t| t.as_str());
+    match presented {
+        Some(t) if constant_time_eq(t.as_bytes(), token.as_bytes()) => Ok(ws_auth_reply(true, id)),
+        _ => Err(ws_auth_reply(false, id)),
     }
-    out
+}
+
+fn ws_auth_reply(ok: bool, id: Option<&serde_json::Value>) -> serde_json::Value {
+    let mut v = serde_json::json!({ "ok": ok });
+    if !ok {
+        v["error"] = "unauthorized".into();
+    }
+    if let Some(id) = id {
+        v["id"] = id.clone();
+    }
+    v
+}
+
+/// Equal without an early exit, so a wrong token costs the same time
+/// however many of its bytes happen to match.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -868,7 +954,7 @@ mod tests {
             panic!("a download event should have been queued");
         };
         assert_eq!(dl.url, "https://example.invalid/f.zip");
-        ack.confirm();
+        assert!(ack.confirm(), "the socket thread was still waiting");
         assert!(ok(replying.join().expect("dispatch thread")));
 
         let replying = std::thread::spawn(move || dispatch(&req, true));
@@ -877,6 +963,209 @@ mod tests {
         // whole timeout.
         drop(rx.blocking_recv());
         assert!(!ok(replying.join().expect("dispatch thread")));
+    }
+
+    /// The other half of the same contract: once the socket thread has
+    /// stopped waiting and told the browser `ok: false`, a late confirm must
+    /// say so, or the app keeps a download the browser is also fetching.
+    #[test]
+    fn a_confirm_after_the_receipt_expired_reports_it() {
+        let (ack, receipt) = Ack::pair();
+        drop(receipt);
+        assert!(!ack.confirm());
+
+        let (ack, receipt) = Ack::pair();
+        let waiting = std::thread::spawn(move || receipt.recv().is_ok());
+        assert!(ack.confirm());
+        assert!(waiting.join().expect("receiver thread"));
+    }
+
+    /// Any extension context may open the socket — a side-loaded Chromium
+    /// build, every Firefox and Safari install — but only the ids Hydra
+    /// ships under are trusted on sight; the rest prove themselves with the
+    /// token. A web page never gets past the handshake.
+    #[test]
+    fn any_extension_may_connect_but_only_pinned_ids_skip_the_token() {
+        for id in crate::nmhost::CHROMIUM_EXT_IDS {
+            assert!(origin_is_extension(&format!("chrome-extension://{id}")));
+            assert!(origin_preauthorized(&format!("chrome-extension://{id}")));
+            assert!(origin_preauthorized(&format!("chrome-extension://{id}/")));
+        }
+        let sideloaded = "chrome-extension://kbopajngnjmmidookpofpjllbjfdlbhp";
+        assert!(origin_is_extension(sideloaded));
+        assert!(!origin_preauthorized(sideloaded));
+        for origin in [
+            "moz-extension://8b2c1f0e-1d2e-4c5a-9f00-000000000000",
+            "safari-web-extension://ABCDEF",
+        ] {
+            assert!(origin_is_extension(origin));
+            assert!(!origin_preauthorized(origin));
+        }
+        for origin in ["chrome-extension://", "https://example.com", ""] {
+            assert!(!origin_is_extension(origin), "{origin:?}");
+            assert!(!origin_preauthorized(origin), "{origin:?}");
+        }
+    }
+
+    /// A WebSocket client the way a browser extension is one: the upgrade
+    /// with an `Origin`, then masked text frames. Returns the read and write
+    /// halves once the server has said 101.
+    fn ws_client(port: u16, origin: &str) -> Option<(BufReader<TcpStream>, TcpStream)> {
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut out = stream.try_clone().expect("write half");
+        write!(
+            out,
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nOrigin: {origin}\r\n\r\n"
+        )
+        .expect("handshake");
+        let mut reader = BufReader::new(stream);
+        let mut status = String::new();
+        reader.read_line(&mut status).expect("status line");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("header line");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        status.contains(" 101 ").then_some((reader, out))
+    }
+
+    fn client_send(out: &mut TcpStream, text: &str) {
+        let mask = [0x12, 0x34, 0x56, 0x78];
+        let mut frame = vec![0x81, 0x80 | text.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(text.bytes().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        out.write_all(&frame).expect("send frame");
+    }
+
+    /// (opcode, payload) of the next unmasked server frame; None at EOF.
+    fn client_recv(reader: &mut BufReader<TcpStream>) -> Option<(u8, serde_json::Value)> {
+        let mut hdr = [0u8; 2];
+        reader.read_exact(&mut hdr).ok()?;
+        let len = match hdr[1] & 0x7F {
+            126 => {
+                let mut b = [0u8; 2];
+                reader.read_exact(&mut b).ok()?;
+                u16::from_be_bytes(b) as usize
+            }
+            127 => {
+                let mut b = [0u8; 8];
+                reader.read_exact(&mut b).ok()?;
+                u64::from_be_bytes(b) as usize
+            }
+            n => n as usize,
+        };
+        let mut payload = vec![0u8; len];
+        reader.read_exact(&mut payload).ok()?;
+        let body = serde_json::from_slice(&payload).unwrap_or(serde_json::Value::Null);
+        Some((hdr[0] & 0x0F, body))
+    }
+
+    /// A server serving `serve_ws` with token "tok" on an ephemeral port.
+    fn ws_server() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
+        let port = listener.local_addr().expect("address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || serve_ws(stream, "tok"));
+            }
+        });
+        port
+    }
+
+    const SIDELOADED: &str = "chrome-extension://kbopajngnjmmidookpofpjllbjfdlbhp";
+
+    /// The defect: a freshly loaded unpacked build was thrown out at the
+    /// handshake. Now it gets in, and the ipc.json token — which it can only
+    /// have got from the native host — makes the socket good for the rest
+    /// of its life.
+    #[test]
+    fn a_good_token_authenticates_the_socket_for_its_lifetime() {
+        let (mut reader, mut out) = ws_client(ws_server(), SIDELOADED).expect("admitted");
+        client_send(&mut out, r#"{"type":"auth","token":"tok","id":1}"#);
+        let (op, reply) = client_recv(&mut reader).expect("auth reply");
+        assert_eq!(
+            (op, reply["ok"].as_bool(), reply["id"].as_u64()),
+            (0x1, Some(true), Some(1))
+        );
+
+        for id in 2..4 {
+            client_send(&mut out, &format!(r#"{{"type":"ping","id":{id}}}"#));
+            let (_, reply) = client_recv(&mut reader).expect("ping reply");
+            assert_eq!(reply["ok"], true);
+            assert_eq!(reply["id"], id);
+            assert_eq!(reply["version"], env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    /// A wrong token, or any request before the token, is answered once and
+    /// then the socket is closed: nothing else is learned from it.
+    #[test]
+    fn a_bad_token_or_an_early_request_is_refused_and_the_socket_closed() {
+        let port = ws_server();
+        for first in [
+            r#"{"type":"auth","token":"nope","id":7}"#,
+            r#"{"type":"auth","id":7}"#,
+            r#"{"type":"ping","id":7}"#,
+            r#"{"type":"download","url":"https://example.invalid/f.zip","id":7}"#,
+        ] {
+            let (mut reader, mut out) = ws_client(port, SIDELOADED).expect("admitted");
+            client_send(&mut out, first);
+            let (op, reply) = client_recv(&mut reader).expect("refusal");
+            assert_eq!(op, 0x1, "{first}");
+            assert_eq!(reply["ok"], false, "{first}");
+            assert_eq!(reply["error"], "unauthorized", "{first}");
+            assert_eq!(reply["id"], 7, "{first}");
+            assert_eq!(
+                client_recv(&mut reader).map(|(op, _)| op),
+                Some(0x8),
+                "close frame"
+            );
+            assert_eq!(client_recv(&mut reader), None, "the socket is gone");
+        }
+    }
+
+    /// The ids Hydra ships under are trusted on sight: a request goes
+    /// through at once, and the `auth` the extension sends anyway (it does
+    /// not know which id it has) is agreed to whatever it carries.
+    #[test]
+    fn an_allow_listed_id_needs_no_token() {
+        let port = ws_server();
+        let origin = format!("chrome-extension://{}", crate::nmhost::CHROMIUM_EXT_IDS[0]);
+        let (mut reader, mut out) = ws_client(port, &origin).expect("admitted");
+        client_send(&mut out, r#"{"type":"ping","id":1}"#);
+        let (_, reply) = client_recv(&mut reader).expect("ping reply");
+        assert_eq!(
+            (reply["ok"].as_bool(), reply["id"].as_u64()),
+            (Some(true), Some(1))
+        );
+
+        client_send(&mut out, r#"{"type":"auth","id":2}"#);
+        let (_, reply) = client_recv(&mut reader).expect("auth reply");
+        assert_eq!(
+            (reply["ok"].as_bool(), reply["id"].as_u64()),
+            (Some(true), Some(2))
+        );
+    }
+
+    /// A page is not an extension, and no token helps it.
+    #[test]
+    fn a_web_page_is_rejected_at_the_handshake() {
+        assert!(ws_client(ws_server(), "https://example.com").is_none());
+    }
+
+    #[test]
+    fn a_token_comparison_does_not_stop_at_the_first_difference() {
+        assert!(constant_time_eq(b"abcd", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abce"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     /// The browser's proxy is the route for THAT download, so it has to

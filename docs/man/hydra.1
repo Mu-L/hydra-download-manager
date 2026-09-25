@@ -48,6 +48,9 @@ hydra, hya \- multi-source file retriever with reassignable byte ranges
 .br
 .B hydra compat\-link
 .RI [ options ]
+.br
+.B hydra update
+.RI [ options ]
 .
 .SH DESCRIPTION
 .B hydra
@@ -134,26 +137,34 @@ Name the output from the URL's last path component
 .RB ( curl " " \-O ).
 .TP
 .B \-\-content\-disposition
-Name the output from a
+Name the output from the server's
 .B Content\-Disposition
 response header
 .RB ( curl " " \-J ).
-Accepted but not implemented in this release; see
-.BR BUGS .
+Without it the name comes from the URL, as wget and curl do by default; an
+explicit
+.B \-O
+always wins.
 .TP
 \fB\-P\fI DIR\fR, \fB\-\-output\-dir\fI DIR\fR Save into
-.IR DIR .
-The directory must exist unless
-.B \-\-create\-dirs
-is also given.
+.IR DIR ,
+creating it when it does not exist, as wget does.
 .TP
 .B \-\-create\-dirs
-Create missing parent directories of the output path.
+Create missing parent directories of an
+.B \-O
+path.
 .TP
 .B \-\-stdout
 Write the payload to standard output.
 Everything human moves to standard error, so the stream stays a single clean
 object.
+The object is staged in a temporary file of hydra's own (ranges land out of
+order) and copied once complete; with
+.B \-\-range
+only the span is emitted.
+A write failure on standard output \(em a closed pipe \(em exits non-zero.
+Several URLs are emitted one after another, in the order given.
 .TP
 .BR \-\-no\-save ", " \-\-discard
 Run the transfer but discard the bytes.
@@ -228,10 +239,29 @@ One connection per host, for volunteer mirrors.
 Overrides an ambitious
 .BR \-x .
 .TP
-.B \-\-no\-probe
-Do not measure the useful concurrency; open what
+.BR \-\-no\-probe ", " \-\-single
+Use one connection when no
 .B \-x
-asked for.
+is given, instead of opening the politeness budget.
+.TP
+.B \-\-adaptive
+Treat
+.B \-x
+as a ceiling: start with one connection and admit more only while the
+aggregate rate says they pay for themselves.
+Conflicts with
+.BR \-\-no\-probe .
+.PP
+Small objects are never split finely whatever
+.B \-x
+says: at most one connection per 256 KiB of object, so a 1 KiB file is one
+request.
+.B \-x
+together with
+.B \-\-mirrors
+names the sources explicitly and is exempt.
+A server that does not support byte ranges gets one connection and one
+request, from offset zero, whatever was asked for.
 .TP
 .BI \-\-limit\-rate " RATE"
 Cap the aggregate transfer rate, e.g.\&
@@ -263,27 +293,39 @@ Begin at this byte offset
 .BI \-\-max\-filesize " BYTES"
 Refuse an object larger than this.
 .TP
-\fB\-t\fI N\fR, \fB\-\-tries\fI N\fR Retries per range before giving up on a
-source.
-Default 4.
+\fB\-t\fI N\fR, \fB\-\-tries\fI N\fR Attempts per range request before a
+source is given up on.
+Default 4; must be at least 1.
+Governs the byte-range fetches, the resume prefix check and chunk repair; the
+probe (HEAD and redirects) is made once and a failure there is reported, not
+retried.
+The pause between attempts is fixed;
+.B \-\-retry\-delay
+and
+.B \-\-waitretry
+are refused under the compatibility dialects rather than accepted and
+ignored.
 .TP
-.BI \-\-retry\-delay " SECS"
-Seconds between retries.
-Default 0.5.
-Accepted but not implemented in this release; see
-.BR BUGS .
-.TP
-\fB\-T\fI SECS\fR, \fB\-\-timeout\fI SECS\fR Per-request timeout.
+\fB\-T\fI SECS\fR, \fB\-\-timeout\fI SECS\fR Seconds a single request may
+take to connect and answer.
 Default 30.
+Applies to the probe, to every byte-range request, to the resume prefix check
+and to chunk repair; it is a per-request limit, not a cap on the whole
+transfer.
+A proxy that accepts the connection and never answers its handshake is
+reported when this expires.
 .TP
 .BI \-\-connect\-timeout " SECS"
-Connection timeout.
-Accepted but not implemented in this release; see
-.BR BUGS .
+Seconds the probe (connect, HEAD, redirects) may take.
+Defaults to
+.BR \-\-timeout .
 .TP
 .BI \-\-wait " SECS"
-Seconds to wait between separate URLs.
+Seconds to pause between separate URLs
+.RB ( wget " " \-\-wait ).
 Default 0.
+Implies
+.BR "\-\-mode queue" .
 .
 .SS Several URLs
 .TP
@@ -305,14 +347,20 @@ Requires that all sources agree on size and on a strong validator.
 .BR \-Z ", " \-\-parallel
 Retrieve several URLs concurrently
 .RB ( curl " " \-Z ).
-Distinct objects, not mirrors.
+Already the default
+.RB ( "\-\-mode same" );
+accepted so curl scripts run unchanged.
 .TP
 .BI \-\-parallel\-max " N"
-Maximum concurrent transfers under
-.BR \-\-parallel .
-Default 4.
-Accepted but not implemented in this release; see
-.BR BUGS .
+Most URLs transferring at once under
+.BR "\-\-mode same" .
+Default 4; the rest start as slots free up.
+.PP
+.B \-O
+names one file, so passing it with several URLs is a usage error (exit 2)
+unless
+.B \-\-mirrors
+makes them one object.
 .TP
 .BI \-\-input\-file " FILE"
 Read URLs from
@@ -353,13 +401,19 @@ Container for the finished file:
 .BR ts .
 MPEG-TS segments become MP4 through a system
 .BR ffmpeg (1);
-with no ffmpeg on this machine, ask for
+with no ffmpeg on this machine the run is refused before the first segment
+is fetched, and asking for
 .B ts
-and keep the assembled transport stream.
-Any other value is treated as
-.BR mp4 ;
-see
-.BR BUGS .
+keeps the assembled transport stream instead.
+Any other value is a usage error.
+When ffmpeg is present but declines the remux, the assembled tracks are kept
+beside the intended output under names that say what they are
+.RB ( name.ts ,
+or
+.B name.video.ts
+and
+.BR name.audio.ts )
+and the failure names them.
 .TP
 .B \-\-list\-streams
 Print the renditions a manifest offers, then exit.
@@ -591,6 +645,22 @@ error and exits 2 at argument parsing, rather than surviving to the comparison
 and being reported as wrong bytes \(em the exit code was right either way, but
 blaming the server for a malformed argument is the more expensive mistake.
 .TP
+.BR \-\-print\-checksum ", " \-\-show\-checksum
+Report the SHA-256 of the finished object.
+Off by default because hashing is a pass over every byte;
+.B \-\-checksum
+and a Metalink digest are always verified without it.
+.TP
+.BI \-\-etag\-save " FILE"
+Save the object's ETag to
+.IR FILE ,
+written only once the transfer is complete and has verified.
+.TP
+.BI \-\-etag\-compare " FILE"
+Skip the transfer when the ETag stored in
+.I FILE
+still matches.
+.TP
 .BI \-\-emit\-manifest " FILE"
 Write a per-chunk digest manifest for what arrived.
 The manifest localizes future corruption to a single chunk, which turns a
@@ -635,10 +705,8 @@ and
 Suppress all output except errors.
 .TP
 .B \-\-no\-verbose
-Reduce output without silencing it
+Drop the progress display but keep the summary line
 .RB ( wget " " \-nv ).
-Accepted but not implemented in this release; see
-.BR BUGS .
 .TP
 .BR \-v ", " \-\-verbose
 Verbose.
@@ -658,9 +726,7 @@ below.
 Suppress the live progress display but keep summaries.
 .TP
 .B \-\-show\-progress
-Force the progress display on even when stdout is not a terminal.
-Accepted but not implemented in this release; see
-.BR BUGS .
+Draw the progress display even when stdout is not a terminal.
 .TP
 .BR \-S ", " \-i ", " \-\-server\-response ", " \-\-include
 Print the request and response headers.
@@ -677,24 +743,28 @@ Probe headers and report without retrieving the body
 Writes no file.
 .TP
 .B \-\-fail
-Exit non-zero on an HTTP error
+Exit non-zero on an HTTP error without writing a file
 .RB ( curl " " \-f ).
-Note that in this release the error body is still written to the output path
-before the non-zero exit, where curl's
-.B \-f
-writes nothing.
-Check the exit status; do not read the absence of a file as the signal.
-See
-.BR BUGS .
+Already the default: an error status from the probe is reported and nothing
+is written.
+Accepted so curl scripts run unchanged.
 .TP
 .B \-\-show\-error
 Show errors even when quiet.
-The failure reason goes to stderr under
+The final failure reason goes to stderr under
 .BR \-q ,
 as curl's
 .B \-sS
 pair does; without it a quiet run that failed is indistinguishable from one
-that succeeded except by its exit status.
+that succeeded except by its exit status, which is also what
+.BR "wget \-q"
+and
+.BR "curl \-s"
+do.
+.PP
+Ctrl-C stops the transfer, writes the resume record from the ranges actually
+held, prints one line saying so, and exits 130.
+A second Ctrl-C exits at once.
 .TP
 \fB\-o\fI FILE\fR, \fB\-\-logfile\fI FILE\fR Log to
 .I FILE
@@ -740,9 +810,84 @@ User-Agent to send.
 Default
 .BR hydra/0.1 .
 .TP
+\fB\-u\fI USER[:PASSWORD]\fR, \fB\-\-user\fI USER[:PASSWORD]\fR
+HTTP Basic credentials
+.RB ( curl " " \-u ", " wget " " \-\-user ).
+.B \-\-password
+supplies the password separately
+.RB ( wget " " \-\-password ).
+.BI http:// user : pass @ host /
+in the URL means the same thing.
+Sent to the host named on the command line and dropped on a redirect
+elsewhere.
+.TP
+\fB\-b\fI DATA|FILE\fR, \fB\-\-cookie\fI DATA|FILE\fR
+Send these cookies: a literal
+.B name=value; name2=value2
+or the path of a Netscape
+.B cookies.txt
+file
+.RB ( curl " " \-b ).
+An argument containing
+.B =
+is a cookie string, anything else a filename.
+.TP
+.BI \-\-cookie\-jar " FILE"
+Read cookies from
+.I FILE
+before the first request and write the jar back at the end
+.RB ( curl " " \-\-cookie\-jar ,
+widened to read as well).
+.TP
+.BI \-\-load\-cookies " FILE"
+Read cookies from
+.I FILE
+and do not write it back
+.RB ( wget " " \-\-load\-cookies ).
+.TP
+.BI \-\-save\-cookies " FILE"
+Write the jar to
+.I FILE
+when the transfer finishes, with owner-only permissions
+.RB ( wget " " \-\-save\-cookies ).
+.TP
+.B \-\-keep\-session\-cookies
+Write session cookies to the jar too
+.RB ( wget " " \-\-keep\-session\-cookies ).
+.TP
+.B \-\-junk\-session\-cookies
+Discard session cookies read from a jar
+.RB ( wget " " \-\-junk\-session\-cookies ).
+.TP
+.BI \-\-cookies\-from\-browser " BROWSER[:PROFILE]"
+Take the cookies for the host being downloaded from out of a browser's own
+store, e.g.\&
+.BR firefox ,
+.BR "chrome:Profile 2" ,
+.BR safari .
+Only that host's cookies are kept and nothing is written unless
+.B \-\-cookie\-jar
+or
+.B \-\-save\-cookies
+asked for it.
+Reading a browser store is announced on stderr.
+.TP
 .BI \-\-proxy " URL"
 Proxy to use
 .RB ( curl " " \-x ).
+Defaults to
+.BR https_proxy ", " http_proxy " or " all_proxy
+from the environment, with
+.B no_proxy
+exempting hosts; see
+.BR ENVIRONMENT .
+An HTTP proxy's
+.BI user:pass@
+is sent as
+.B Proxy\-Authorization
+on plain-HTTP requests; a
+.B CONNECT
+tunnel for https does not carry it in this release.
 Accepts
 .BR http:// ,
 .BR socks4:// ,
@@ -1256,15 +1401,26 @@ with a flag that contradicts it exits 2.
 .
 .SH ENVIRONMENT
 .TP
-.BR http_proxy ", " HTTP_PROXY
+.BR https_proxy ", " http_proxy ", " ftp_proxy ", " all_proxy
 Proxy to use when
 .B \-\-proxy
-is not given, checked in that order.
-Only these two are read; the value is parsed as
-.RI [ scheme ://] host : port
-and a port is required.
+is not given: the scheme-specific variable first, then
+.BR all_proxy ,
+each in lower case then upper case.
+The value takes the same forms as
+.B \-\-proxy
+does, credentials and
+.B socks5://
+included.
 .B \-\-no\-proxy
 suppresses them.
+.TP
+.BR no_proxy ", " NO_PROXY
+Comma-separated hosts, or host suffixes
+.RB ( .example.org ),
+that are reached directly;
+.B *
+exempts every host.
 .TP
 .B XDG_STATE_HOME
 Base directory for the interactive queue file.
@@ -1276,14 +1432,6 @@ then to the current directory.
 Used for the queue path when
 .B XDG_STATE_HOME
 is unset.
-.PP
-Note that the
-.B no_proxy
-environment variable is
-.I not
-consulted; per-host proxy exemption must be expressed with the
-.B \-\-no\-proxy
-flag.
 .
 .SH FILES
 .TP
@@ -1546,6 +1694,8 @@ hydra install\-completions \-\-bin\-name hya
 .BR hydra\-bench (1),
 .BR hydra\-completions (1),
 .BR hydra\-host (1),
+.B "hydra update \-\-help"
+(release check),
 .BR ffmpeg (1),
 .BR wget (1),
 .BR curl (1),
@@ -1563,43 +1713,18 @@ fields), RFC 959 and RFC 3659 (FTP, and the
 extensions).
 .
 .SH BUGS
-Several flags are accepted by the parser but have no effect in this release.
-They are documented in place rather than removed, because a script that
-passes one is not told:
-.BR \-\-no\-verbose ,
-.BR \-\-show\-progress ,
-.BR \-\-content\-disposition ,
-.BR \-\-retry\-delay ,
-.BR \-\-connect\-timeout ,
-and
-.BR \-\-parallel\-max .
-This is the one place the project's stated rule \(em a flag that cannot be
-honoured is refused with a reason, never ignored \(em does not hold; it
-holds for the compatibility dialects only.
-.PP
+.BR \-\-remote\-name ,
+.BR \-\-location ,
 .B \-\-fail
-exits non-zero on an HTTP error but still writes the error body to the
-output path, where curl's
-.B \-f
-writes nothing.
-A 404 leaves a short file of response text, or on the range path a
-zero-filled file of the error body's length.
-Do not treat the presence of an output file as evidence of success; check
-the exit status.
+and
+.B \-\-parallel
+name behaviour that is already the default and are accepted for curl
+scripts; every other flag either does what it says or is refused.
 .PP
 Multi-file runs do not deduplicate output names against each other, so URLs
 with colliding basenames overwrite one another while both report success.
 See
 .BR NOTES .
-.PP
-.B \-\-container
-recognises exactly two values.
-.B ts
-asks for the transport stream; every other spelling \(em
-.BR mp4 ", " webm ", " mkv ", " typo
-\(em is treated as
-.BR mp4 ,
-so a container hydra cannot produce is not refused, it is quietly ignored.
 .PP
 .B \-\-json
 produces no JSON for a stream.
@@ -1620,15 +1745,6 @@ stream is assembled from segments rather than across mirrors.
 .PP
 A live recording cannot be resumed or continued: it writes no checkpoint, so
 a second run appends nothing and starts a new file.
-.PP
-The long help for
-.B \-\-proxy
-mentions
-.BR $all_proxy ;
-this release reads only
-.B http_proxy
-and
-.BR HTTP_PROXY .
 .PP
 Report defects with the exact argv, the exit status, and whether the failure
 was on stdout, stderr, or the filesystem \(em the four are asserted

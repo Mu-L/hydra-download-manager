@@ -58,6 +58,7 @@ case "$(uname -s)" in
       "$HOME/Library/Application Support/Microsoft Edge/NativeMessagingHosts"
       "$HOME/Library/Application Support/BraveSoftware/Brave-Browser/NativeMessagingHosts"
       "$HOME/Library/Application Support/Vivaldi/NativeMessagingHosts"
+      "$HOME/Library/Application Support/com.operasoftware.Opera/NativeMessagingHosts"
       "$HOME/Library/Application Support/Arc/User Data/NativeMessagingHosts"
     )
     BROWSER_ROOTS=(
@@ -66,6 +67,7 @@ case "$(uname -s)" in
       "$HOME/Library/Application Support/Microsoft Edge"
       "$HOME/Library/Application Support/BraveSoftware/Brave-Browser"
       "$HOME/Library/Application Support/Vivaldi"
+      "$HOME/Library/Application Support/com.operasoftware.Opera"
       "$HOME/Library/Application Support/Arc/User Data"
     )
     # Firefox keeps its own registry and uses a different manifest dialect.
@@ -93,6 +95,7 @@ case "$(uname -s)" in
       "$HOME/.config/microsoft-edge/NativeMessagingHosts"
       "$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
       "$HOME/.config/vivaldi/NativeMessagingHosts"
+      "$HOME/.config/opera/NativeMessagingHosts"
       "$HOME/snap/chromium/common/chromium/NativeMessagingHosts"
       "$HOME/.var/app/com.google.Chrome/config/google-chrome/NativeMessagingHosts"
       "$HOME/.var/app/org.chromium.Chromium/config/chromium/NativeMessagingHosts"
@@ -105,6 +108,7 @@ case "$(uname -s)" in
       "$HOME/.config/microsoft-edge"
       "$HOME/.config/BraveSoftware/Brave-Browser"
       "$HOME/.config/vivaldi"
+      "$HOME/.config/opera"
       "$HOME/snap/chromium/common/chromium"
       "$HOME/.var/app/com.google.Chrome/config/google-chrome"
       "$HOME/.var/app/org.chromium.Chromium/config/chromium"
@@ -197,6 +201,6 @@ echo "Load the extension:"
 echo "  Chromium family: chrome://extensions -> Developer mode ->"
 echo "    Load unpacked -> $REPO/extensions/chrome"
 echo "  Firefox: about:debugging#/runtime/this-firefox -> Load Temporary"
-echo "    Add-on -> $REPO/extensions/firefox/Resources/manifest.json"
+echo "    Add-on -> $REPO/extensions/firefox/manifest.json"
 echo "    (run scripts/sync-extension-resources.sh firefox first)"
 echo "(Restart the browser after installing the manifest.)"

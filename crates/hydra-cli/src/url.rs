@@ -4,6 +4,7 @@
 //! scheme, authority, and path. Parsing that by hand is a dozen lines and avoids
 //! a dependency that would imply support for schemes this client cannot honour.
 
+use hya_net::url::percent_decode;
 use hya_net::Target;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -24,35 +25,6 @@ pub struct Url {
     /// reason the Endpoint type is.
     pub user: Option<String>,
     pub pass: Option<String>,
-}
-
-/// Percent-decode a URL component.
-///
-/// Credentials containing `@`, `:`, or `/` must be percent-encoded in a URL, so they have to
-/// be decoded before use or the login is sent wrong. Invalid escapes are left verbatim
-/// rather than dropped: silently altering a password produces an authentication failure
-/// that looks like a server problem, and a name is better shown as typed than mangled.
-///
-/// Decoding admits characters the encoded form could not hold, so a caller turning the
-/// result into a filename must reduce it to a basename afterwards — see
-/// [`Url::suggested_filename`].
-pub fn pct_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hex = std::str::from_utf8(&b[i + 1..i + 3]).ok();
-            if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 impl std::fmt::Debug for Url {
@@ -82,7 +54,7 @@ impl std::fmt::Display for Url {
             "ftp" => 21,
             _ => 80,
         };
-        write!(f, "{}://{}", self.scheme, self.host)?;
+        write!(f, "{}://{}", self.scheme, self.host_for_authority())?;
         if self.port != default {
             write!(f, ":{}", self.port)?;
         }
@@ -109,8 +81,8 @@ impl Url {
         };
         let (user, pass) = match userinfo {
             Some(ui) => match ui.split_once(':') {
-                Some((u, p)) => (Some(pct_decode(u)), Some(pct_decode(p))),
-                None => (Some(pct_decode(ui)), None),
+                Some((u, p)) => (Some(percent_decode(u)), Some(percent_decode(p))),
+                None => (Some(percent_decode(ui)), None),
             },
             None => (None, None),
         };
@@ -119,9 +91,22 @@ impl Url {
             "ftp" => 21,
             _ => 80,
         };
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((h, p)) => (h.to_string(), p.parse().ok()?),
-            None => (hostport.to_string(), default_port),
+        // A bracketed IPv6 literal carries colons of its own, so the port is
+        // whatever follows the closing bracket. The brackets are URL syntax,
+        // not part of the address the resolver wants.
+        let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+            let (h, after) = rest.split_once(']')?;
+            let port = match after.strip_prefix(':') {
+                Some(p) => p.parse().ok()?,
+                None if after.is_empty() => default_port,
+                None => return None,
+            };
+            (h.to_string(), port)
+        } else {
+            match hostport.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse().ok()?),
+                None => (hostport.to_string(), default_port),
+            }
         };
         if host.is_empty() {
             return None;
@@ -176,7 +161,10 @@ impl Url {
         if loc.starts_with('/') {
             return Url::parse(&format!(
                 "{}://{}:{}{}",
-                self.scheme, self.host, self.port, loc
+                self.scheme,
+                self.host_for_authority(),
+                self.port,
+                loc
             ));
         }
         // A relative reference resolves against the current directory.
@@ -186,7 +174,11 @@ impl Url {
         };
         Url::parse(&format!(
             "{}://{}:{}{}{}",
-            self.scheme, self.host, self.port, base, loc
+            self.scheme,
+            self.host_for_authority(),
+            self.port,
+            base,
+            loc
         ))
     }
 
@@ -202,7 +194,28 @@ impl Url {
     /// portless form. Conflating the two produced a CONNECT to `x.org` with no
     /// port, which fails every proxied TLS handshake.
     pub fn proxy_authority(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format!("{}:{}", self.host_for_authority(), self.port)
+    }
+
+    /// The host as an authority component spells it: an IPv6 literal goes back
+    /// in its brackets.
+    fn host_for_authority(&self) -> std::borrow::Cow<'_, str> {
+        if self.host.contains(':') {
+            std::borrow::Cow::Owned(format!("[{}]", self.host))
+        } else {
+            std::borrow::Cow::Borrowed(&self.host)
+        }
+    }
+
+    /// `Authorization: Basic` for userinfo in an http(s) URL.
+    ///
+    /// FTP sends its credentials on the control channel and never gets one.
+    pub fn basic_auth_header(&self) -> Option<String> {
+        if self.is_ftp() {
+            return None;
+        }
+        let user = self.user.as_deref()?;
+        Some(basic_auth_line(user, self.pass.as_deref().unwrap_or("")))
     }
 
     /// Filename implied by the URL path, for when `-O` is not given.
@@ -219,7 +232,7 @@ impl Url {
         // segment first names the file after the tail of `?redirect=/a/b.zip`.
         let path = self.path.split(['?', '#']).next().unwrap_or("");
         let segment = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
-        let decoded = pct_decode(segment);
+        let decoded = percent_decode(segment);
         let base = decoded
             .rsplit(['/', '\\'])
             .next()
@@ -256,14 +269,81 @@ impl Url {
     }
 }
 
-/// Proxy configuration from the environment, honouring the conventional vars.
-pub fn proxy_from_env() -> Option<(String, u16)> {
-    let raw = std::env::var("http_proxy")
-        .or_else(|_| std::env::var("HTTP_PROXY"))
-        .ok()?;
-    let rest = raw.split("://").last()?.trim_end_matches('/');
-    let (h, p) = rest.rsplit_once(':')?;
-    Some((h.to_string(), p.parse().ok()?))
+/// `Authorization: Basic` / `Proxy-Authorization: Basic` field line.
+pub fn basic_auth_line(user: &str, pass: &str) -> String {
+    format!("Authorization: Basic {}", hya_net::basic_auth(user, pass))
+}
+
+/// How a run chooses its proxy: `--no-proxy` beats `--proxy` beats the environment.
+#[derive(Clone, Debug, Default)]
+pub struct ProxyPolicy {
+    pub explicit: Option<String>,
+    pub disabled: bool,
+}
+
+impl ProxyPolicy {
+    pub fn new(explicit: Option<&str>, disabled: bool) -> Self {
+        Self {
+            explicit: explicit.map(str::to_string),
+            disabled,
+        }
+    }
+
+    /// The proxy a request to `u` goes through, if any.
+    pub fn for_url(&self, u: &Url) -> Result<Option<hya_net::Proxy>, String> {
+        if self.disabled {
+            return Ok(None);
+        }
+        match &self.explicit {
+            Some(spec) => hya_net::Proxy::parse(spec)
+                .map(Some)
+                .map_err(|e| format!("--proxy: {e}")),
+            None => proxy_from_env(u),
+        }
+    }
+
+    /// The HTTP proxy route for `u`, as `Url::to_target` wants it. A SOCKS proxy
+    /// lives on the connector, so the target is built as if direct.
+    pub fn http_route(&self, u: &Url) -> Result<Option<(String, u16)>, String> {
+        Ok(self
+            .for_url(u)?
+            .filter(|p| !p.kind.is_socks())
+            .map(|p| (p.host, p.port)))
+    }
+
+    /// The `Proxy-Authorization` line an HTTP proxy with credentials needs.
+    pub fn auth_header(&self, u: &Url) -> Option<String> {
+        let p = self.for_url(u).ok()??;
+        if p.kind.is_socks() {
+            return None;
+        }
+        let user = p.username?;
+        Some(format!(
+            "Proxy-{}",
+            basic_auth_line(&user, p.password.as_deref().unwrap_or(""))
+        ))
+    }
+}
+
+/// Proxy for `u` from the environment, following the convention every client
+/// reads: `https_proxy` for https, `http_proxy` for http, `all_proxy` as the
+/// fallback, and `no_proxy` as the exemption list.
+pub fn proxy_from_env(u: &Url) -> Result<Option<hya_net::Proxy>, String> {
+    let var = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()))
+    };
+    let raw = match u.scheme.as_str() {
+        "https" => var(&["https_proxy", "HTTPS_PROXY"]),
+        "ftp" => var(&["ftp_proxy", "FTP_PROXY"]),
+        _ => var(&["http_proxy", "HTTP_PROXY"]),
+    }
+    .or_else(|| var(&["all_proxy", "ALL_PROXY"]));
+    let Some(r) = raw else { return Ok(None) };
+    let proxy = hya_net::Proxy::parse(&r)
+        .map_err(|e| format!("proxy from the environment ({r:?}): {e}"))?;
+    Ok((!proxy.bypasses(&u.host)).then_some(proxy))
 }
 
 /// Resume state, written beside the output file as `<output>.hydra`.
@@ -360,6 +440,177 @@ mod tests {
         );
         assert_eq!(Url::parse("not a url"), None);
         assert_eq!(Url::parse("http:///f"), None, "empty host must be refused");
+    }
+
+    #[test]
+    fn an_ipv6_literal_parses_with_and_without_a_port() {
+        let u = Url::parse("http://[::1]/f").unwrap();
+        assert_eq!(
+            (u.host.as_str(), u.port, u.path.as_str()),
+            ("::1", 80, "/f")
+        );
+        let p = Url::parse("https://[2001:db8::1]:8443/x").unwrap();
+        assert_eq!((p.host.as_str(), p.port), ("2001:db8::1", 8443));
+        assert_eq!(p.proxy_authority(), "[2001:db8::1]:8443");
+        assert_eq!(u.to_string(), "http://[::1]/f");
+        assert_eq!(Url::parse("http://[::1/f"), None, "an unclosed bracket");
+        assert_eq!(
+            Url::parse("http://[::1]x/f"),
+            None,
+            "junk after the bracket"
+        );
+    }
+
+    #[test]
+    fn http_userinfo_becomes_a_basic_authorization_header() {
+        let u = Url::parse("http://alice:secret@h/f").unwrap();
+        assert_eq!(
+            u.basic_auth_header().as_deref(),
+            Some("Authorization: Basic YWxpY2U6c2VjcmV0")
+        );
+        let no_pass = Url::parse("http://alice@h/f").unwrap();
+        assert_eq!(
+            no_pass.basic_auth_header().as_deref(),
+            Some("Authorization: Basic YWxpY2U6")
+        );
+        assert!(Url::parse("http://h/f")
+            .unwrap()
+            .basic_auth_header()
+            .is_none());
+        assert!(
+            Url::parse("ftp://a:b@h/f")
+                .unwrap()
+                .basic_auth_header()
+                .is_none(),
+            "FTP logs in on the control channel"
+        );
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        for (input, want) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(hya_net::base64::encode(input.as_bytes()), want);
+        }
+        assert_eq!(basic_auth_line("pu", "pw"), "Authorization: Basic cHU6cHc=");
+    }
+
+    /// Every test that touches the proxy environment holds this: the
+    /// variables are process-wide and the harness runs tests in parallel.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const PROXY_VARS: [&str; 8] = [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ];
+
+    /// Run `f` with the proxy variables cleared, restoring them afterwards.
+    fn with_clean_proxy_env(f: impl FnOnce()) {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<Option<String>> = PROXY_VARS.iter().map(|v| std::env::var(v).ok()).collect();
+        for v in PROXY_VARS {
+            std::env::remove_var(v);
+        }
+        f();
+        for (v, old) in PROXY_VARS.iter().zip(saved) {
+            match old {
+                Some(o) => std::env::set_var(v, o),
+                None => std::env::remove_var(v),
+            }
+        }
+    }
+
+    #[test]
+    fn no_proxy_entries_match_hosts_and_their_subdomains() {
+        with_clean_proxy_env(|| {
+            let policy = ProxyPolicy::new(None, false);
+            let routed = |host: &str| {
+                policy
+                    .for_url(&Url::parse(&format!("http://{host}/f")).unwrap())
+                    .unwrap()
+                    .is_some()
+            };
+            std::env::set_var("http_proxy", "http://p.test:3128");
+            for (list, host, exempt) in [
+                ("localhost,.example.org", "www.example.org", true),
+                ("example.org", "example.org", true),
+                ("example.org", "notexample.org", false),
+                ("*", "anything.test", true),
+                ("127.0.0.1:8080", "127.0.0.1", true),
+                ("", "h", false),
+            ] {
+                std::env::set_var("no_proxy", list);
+                assert_eq!(!routed(host), exempt, "no_proxy={list:?} host={host}");
+            }
+        });
+    }
+
+    #[test]
+    fn an_explicit_proxy_carries_credentials_and_socks_stays_off_the_target() {
+        let u = Url::parse("http://h/f").unwrap();
+        let http = ProxyPolicy::new(Some("http://pu:pw@127.0.0.1:8094"), false);
+        assert_eq!(
+            http.http_route(&u).unwrap(),
+            Some(("127.0.0.1".into(), 8094))
+        );
+        assert_eq!(
+            http.auth_header(&u).as_deref(),
+            Some("Proxy-Authorization: Basic cHU6cHc=")
+        );
+        let socks = ProxyPolicy::new(Some("socks5://127.0.0.1:1080"), false);
+        assert_eq!(socks.http_route(&u).unwrap(), None);
+        assert!(socks.auth_header(&u).is_none());
+        assert!(socks.for_url(&u).unwrap().unwrap().kind.is_socks());
+        let off = ProxyPolicy::new(Some("http://127.0.0.1:8094"), true);
+        assert_eq!(off.for_url(&u).unwrap(), None, "--no-proxy wins");
+        assert!(ProxyPolicy::new(Some("gopher://x"), false)
+            .for_url(&u)
+            .is_err());
+    }
+
+    #[test]
+    fn the_environment_proxy_is_read_per_scheme_and_honours_no_proxy() {
+        with_clean_proxy_env(the_environment_proxy_case);
+    }
+
+    fn the_environment_proxy_case() {
+        std::env::set_var("https_proxy", "socks5://u:p@sp.test:1080");
+        std::env::set_var("all_proxy", "http://ap.test:3128");
+        std::env::set_var("no_proxy", "localhost,.internal");
+
+        let policy = ProxyPolicy::new(None, false);
+        let https = policy
+            .for_url(&Url::parse("https://h/f").unwrap())
+            .unwrap()
+            .unwrap();
+        assert!(https.kind.is_socks());
+        assert_eq!(https.username.as_deref(), Some("u"));
+        let http = policy
+            .for_url(&Url::parse("http://h/f").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!((http.host.as_str(), http.port), ("ap.test", 3128));
+        assert_eq!(
+            policy
+                .for_url(&Url::parse("http://box.internal/f").unwrap())
+                .unwrap(),
+            None
+        );
+        std::env::set_var("http_proxy", "nonsense://");
+        assert!(policy.for_url(&Url::parse("http://h/f").unwrap()).is_err());
     }
 
     #[test]

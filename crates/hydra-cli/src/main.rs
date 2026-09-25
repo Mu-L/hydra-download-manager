@@ -320,36 +320,6 @@ fn plain_download_conflict(args: &cli::Cli) -> Option<&'static str> {
     None
 }
 
-/// Parse an HTTP byte range: `0-1023`, `1024-`, or `-512` (last 512 bytes).
-///
-/// Returns a [`download::RangeSpec`] rather than a sentinel-encoded pair. An
-/// earlier version encoded "suffix of n bytes" as `u64::MAX - n` and recognised
-/// it with a `> u64::MAX / 2` test; that silently mis-resolved and fetched the
-/// wrong region. A magic number that must be recognised by a threshold is not a
-/// representation, it is a latent bug.
-fn parse_range(spec: &str) -> Option<download::RangeSpec> {
-    use download::RangeSpec;
-    let spec = spec.trim();
-    if let Some(tail) = spec.strip_prefix('-') {
-        let n: u64 = tail.parse().ok()?;
-        return if n == 0 {
-            None
-        } else {
-            Some(RangeSpec::Suffix(n))
-        };
-    }
-    let (a, b) = spec.split_once('-')?;
-    let lo: u64 = a.parse().ok()?;
-    if b.is_empty() {
-        return Some(RangeSpec::From(lo));
-    }
-    let hi: u64 = b.parse().ok()?;
-    if hi < lo {
-        return None;
-    }
-    Some(RangeSpec::Closed(lo, hi))
-}
-
 /// Size the runtime to the WORKLOAD, not to the machine.
 ///
 /// `#[tokio::main]` with no arguments starts one worker thread per CPU core. On a
@@ -402,7 +372,13 @@ async fn async_main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
     let argv0 = argv.first().cloned().unwrap_or_else(|| "hydra".into());
     let rest: Vec<String> = argv.iter().skip(1).cloned().collect();
-    let dialect = compat::detect(&argv0, &rest);
+    let dialect = match compat::detect(&argv0, &rest) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("hydra: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
     let (canon, notes) = match compat::canonicalize(dialect, &rest) {
         Ok(v) => v,
         Err(e) => {
@@ -435,198 +411,26 @@ async fn async_main() -> std::process::ExitCode {
         }
     }
 
-    match &args.command {
-        Some(cli::Command::Parity { what }) => {
-            std::process::exit(run_parity(what));
-        }
+    // One flag for every transfer this process runs. The first Ctrl-C asks the
+    // engine to stop and write its resume record; a second one, or a phase that
+    // cannot be interrupted, gets the plain exit the shell expects.
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                if cancel.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    std::process::exit(INTERRUPTED);
+                }
+            }
+        });
+    }
 
-        Some(cli::Command::Checksum {
-            urls,
-            verify,
-            json,
-            sidecars,
-            download_if_needed,
-        }) => {
-            let mut list = args.urls.clone();
-            list.extend(urls.clone());
-            return checksum_report(
-                &list,
-                verify.as_deref(),
-                *json,
-                *sidecars,
-                *download_if_needed,
-                &args,
-            )
-            .await;
-        }
-        Some(cli::Command::Interactive {
-            urls,
-            queue_file,
-            headless,
-            max_active,
-        }) => {
-            let path = queue_file
-                .clone()
-                .or_else(|| args.queue_file.clone())
-                .unwrap_or_else(queue::Queue::default_path);
-            let max = (*max_active).clamp(1, 16);
-            let mut list = args.urls.clone();
-            list.extend(urls.clone());
-            if let Err(e) = tui::run_with(path, list, max, *headless).await {
-                eprintln!("hydra: {e}");
-                return std::process::ExitCode::FAILURE;
-            }
-            return std::process::ExitCode::SUCCESS;
-        }
-        Some(cli::Command::Metalink { source, json }) => {
-            return metalink_report(source, *json, &args).await;
-        }
-        Some(cli::Command::Formats {
-            json,
-            category,
-            what,
-        }) => {
-            print_formats(*json, category.as_deref(), what.as_deref());
-            return std::process::ExitCode::SUCCESS;
-        }
-        Some(cli::Command::Update { json, beta }) => {
-            return update::run(*json, *beta).await;
-        }
-        Some(cli::Command::Completions { shell, bin_name }) => {
-            let bin = bin_name.as_deref().unwrap_or(completions::DEFAULT_BIN);
-            print!("{}", completions::render(*shell, bin));
-            return std::process::ExitCode::SUCCESS;
-        }
-        Some(cli::Command::CompatLink {
-            dir,
-            names,
-            force,
-            dry_run,
-        }) => {
-            let names: Vec<String> = if names.is_empty() {
-                compat_link::DEFAULT_NAMES
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            } else {
-                names.clone()
-            };
-            let (exe, plans) = match compat_link::plan(dir.as_deref(), &names) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("hydra: {e}");
-                    return std::process::ExitCode::from(2);
-                }
-            };
-            let mut failed = false;
-            for p in &plans {
-                let verb = match &p.action {
-                    compat_link::Action::AlreadyLinked => {
-                        println!("{} -> {} (already linked)", p.path.display(), exe.display());
-                        None
-                    }
-                    compat_link::Action::Occupied(what) if !*force => {
-                        eprintln!(
-                            "hydra: {} already exists ({what}); --force replaces it, \
-                             --dir puts the links elsewhere, or use --name hydra-{} \
-                             to keep the real tool's name free",
-                            p.path.display(),
-                            p.name
-                        );
-                        failed = true;
-                        None
-                    }
-                    compat_link::Action::Occupied(_) => Some("replaced"),
-                    compat_link::Action::Create => Some("linked"),
-                };
-                let Some(verb) = verb else { continue };
-                if *dry_run {
-                    println!(
-                        "would have {verb} {} -> {}",
-                        p.path.display(),
-                        exe.display()
-                    );
-                } else if let Err(e) = compat_link::apply(p, &exe, *force) {
-                    eprintln!("hydra: {e}");
-                    failed = true;
-                    continue;
-                } else {
-                    println!("{verb} {} -> {}", p.path.display(), exe.display());
-                }
-            }
-            // Placing the link is the easy half; being the name the shell
-            // actually resolves is the half that silently fails.
-            for p in &plans {
-                if let Some(note) = compat_link::shadow_note(p) {
-                    eprintln!("hydra: {note}");
-                }
-            }
-            return if failed {
-                std::process::ExitCode::FAILURE
-            } else {
-                std::process::ExitCode::SUCCESS
-            };
-        }
-        Some(cli::Command::InstallCompletions {
-            shell,
-            system,
-            dry_run,
-            bin_name,
-        }) => {
-            let bin = bin_name.as_deref().unwrap_or(completions::DEFAULT_BIN);
-            let shell = match shell.or_else(completions::detect_shell) {
-                Some(s) => s,
-                None => {
-                    eprintln!(
-                        "hydra: could not detect a shell from $SHELL; pass one explicitly, \
-                         e.g. `hydra install-completions zsh`"
-                    );
-                    return std::process::ExitCode::from(2);
-                }
-            };
-            match completions::install(shell, *system, *dry_run, bin) {
-                Ok(dest) => {
-                    if *dry_run {
-                        println!(
-                            "would install {shell} completions for {bin} to {}",
-                            dest.path.display()
-                        );
-                    } else {
-                        println!(
-                            "installed {shell} completions for {bin} to {}",
-                            dest.path.display()
-                        );
-                    }
-                    if let Some(step) = dest.remaining_step {
-                        println!("remaining step: {step}");
-                    }
-                    return std::process::ExitCode::SUCCESS;
-                }
-                Err(e) => {
-                    eprintln!("hydra: {e}");
-                    return std::process::ExitCode::FAILURE;
-                }
-            }
-        }
-        Some(cli::Command::Bench { real, reps, which }) => {
-            if *real {
-                realnet::bench(*reps).await;
-            } else {
-                match which.as_str() {
-                    "memprofile" => memprofile().await,
-                    "xval" => xval::cross_validate().await,
-                    "ticksweep" => xval::tick_sweep().await,
-                    "sizesweep" => xval::size_sweep().await,
-                    "detectab" => xval::detect_ab(*reps).await,
-                    other => {
-                        eprintln!("hydra: unknown harness {other}");
-                        return std::process::ExitCode::from(2);
-                    }
-                }
-            }
-            return std::process::ExitCode::SUCCESS;
-        }
-        None => {}
+    if let Some(cmd) = &args.command {
+        return run_subcommand(cmd, &args, &cancel).await;
     }
 
     if args.demo_multi {
@@ -674,22 +478,22 @@ async fn async_main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
-
-    // --range narrows the retrieval to a byte interval.
-    let range = match args.range.as_deref() {
-        None => args.start_pos.map(download::RangeSpec::From),
-        Some(spec) => match parse_range(spec) {
-            Some(r) => Some(r),
-            None => {
-                eprintln!("hydra: unparsable --range: {spec} (try 0-1023, 1024-, or -512)");
-                return std::process::ExitCode::from(2);
-            }
-        },
-    };
+    // --range narrows the retrieval to a byte interval; parsed here so a typo
+    // is reported before any request, and again by `Job::from_cli` for the engine.
+    if let Some(spec) = args.range.as_deref() {
+        if download::RangeSpec::parse(spec).is_none() {
+            eprintln!("hydra: unparsable --range: {spec} (try 0-1023, 1024-, or -512)");
+            return std::process::ExitCode::from(2);
+        }
+    }
 
     // Several URLs mean several FILES unless mirror assembly is asked for. Building one
     // job per URL rather than one job with many sources is what makes that true.
     let multi = urls.len() > 1 && !args.mirrors;
+    if let Some(why) = output_flag_conflict(&args, urls.len()) {
+        eprintln!("hydra: {why}");
+        return std::process::ExitCode::from(2);
+    }
 
     // `--inspect` and `--list-streams` ask a QUESTION about one object. When
     // the rest of the command line makes that question unanswerable, dropping
@@ -789,7 +593,7 @@ async fn async_main() -> std::process::ExitCode {
             output: args.output.clone(),
             output_dir: args.output_dir.clone(),
             quality: args.quality,
-            container: args.container.clone(),
+            container: args.container.as_str().to_string(),
             headers: args.headers.clone(),
             user_agent: args.user_agent.clone(),
             jar,
@@ -802,6 +606,8 @@ async fn async_main() -> std::process::ExitCode {
             // The same `-n` that governs connections for a file governs
             // segments in flight for a stream.
             conns: args.requested_conns().unwrap_or(0),
+            no_clobber: args.no_clobber,
+            force: args.force,
         };
 
         // `--adaptive` is about ranged file downloads; saying so beats
@@ -852,99 +658,305 @@ async fn async_main() -> std::process::ExitCode {
         }
     }
 
-    let job = download::Job {
-        ticks: None,
-        cookies: cookie_spec,
-        // `multi` implies at least two, so indexing is safe there; the other
-        // arm takes the whole list, which a `--metalink` run leaves empty until
-        // `with_metalink` fills it in from the document.
-        urls: if multi {
-            vec![urls[0].clone()]
-        } else {
-            urls.clone()
-        },
-        output: args.output.clone(),
-        conns: args.requested_conns(),
-        resume: args.resume,
-        limit_rate,
-        max_redirs: args.max_redirs,
-        show_error: args.show_error,
-        // --logfile truncates, --logfile-append appends. Both name the same sink,
-        // so they are collapsed to one field with the mode as a flag; append wins
-        // if somehow both are given, since it is the non-destructive reading.
-        logfile: args
-            .logfile_append
-            .clone()
-            .map(|p| (p, true))
-            .or_else(|| args.logfile.clone().map(|p| (p, false))),
-        ip_family: hya_net::IpFamily::from_flags(args.ipv4, args.ipv6),
-        tries: args.tries,
-        timeout_s: args.timeout,
-        checksum: args.checksum.clone(),
-        headers: args.headers.clone(),
-        user_agent: args.user_agent.clone(),
-        verbose: args.verbose,
-        // --json implies quiet: stdout carries the document, nothing else.
-        quiet: args.quiet || args.json,
-        no_progress: args.no_progress,
-        polite: args.politeness(),
-        adaptive: args.adaptive,
-        probe: !args.no_probe,
-        to_stdout: args.stdout,
-        no_clobber: args.no_clobber,
-        create_dirs: args.create_dirs,
-        output_dir: args.output_dir.clone(),
-        spider: args.spider,
-        server_response: args.server_response,
-        range,
-        max_filesize: args.max_filesize,
-        proxy: args.proxy.clone(),
-        no_proxy: args.no_proxy,
-        remote_time: args.remote_time,
-        etag_save: args.etag_save.clone(),
-        etag_compare: args.etag_compare.clone(),
-        sort_by_type: args.sort_by_type,
-        content_type: None,
-        insecure: args.insecure,
-        force: args.force,
-        no_save: args.no_save,
-        print_checksum: args.print_checksum,
-        emit_manifest: args.emit_manifest.clone(),
-        chunk_digests: args.chunk_digests.clone(),
-        chunk_size: args.chunk_size,
-        source_plans: Vec::new(),
-        attested: None,
-        metalink_notes: Vec::new(),
-        follow_metalink: !args.no_follow_metalink,
-        metalink_select: args.metalink_selection(),
+    // `multi` implies at least two, so indexing is safe there; the other arm
+    // takes the whole list, which a `--metalink` run leaves empty until
+    // `with_metalink` fills it in from the document.
+    let job_urls = if multi {
+        vec![urls[0].clone()]
+    } else {
+        urls.clone()
+    };
+    let job = match download::Job::from_cli(&args, job_urls, &cancel) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("hydra: {e}");
+            return std::process::ExitCode::from(2);
+        }
     };
 
-    // ---- a mirror list replaces the source list ---------------------------
-    //
-    // Handled here rather than inside the engine because a document may describe
-    // SEVERAL files, and one job fetches one object. The engine's own follow path
-    // (a URL discovered at probe time to be serving `application/metalink4+xml`)
-    // can only take the first entry; this one can run them all.
+    // A mirror list replaces the source list. Handled here rather than inside
+    // the engine because a document may describe several files and one job
+    // fetches one object: the engine's own follow path can only take the first
+    // entry, this one runs them all.
     match metalink_origins(&args, &urls) {
         Err(e) => {
             eprintln!("hydra: {e}");
             return std::process::ExitCode::from(2);
         }
-        Ok(list) if !list.is_empty() => return run_metalink(list, job, &args).await,
+        Ok(list) if !list.is_empty() => {
+            return exit_after(run_metalink(list, job, &args).await, &cancel)
+        }
         Ok(_) => {}
     }
 
     if multi {
-        return run_many(job, &urls, args.mode, args.json, args.quiet).await;
+        let code = run_many(
+            job,
+            &urls,
+            effective_mode(&args),
+            args.json,
+            args.quiet,
+            &args,
+        )
+        .await;
+        return exit_after(code, &cancel);
     }
     let out = download::run(job).await;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     }
-    if out.ok {
-        std::process::ExitCode::SUCCESS
+    exit_after(
+        if out.ok {
+            std::process::ExitCode::SUCCESS
+        } else {
+            std::process::ExitCode::FAILURE
+        },
+        &cancel,
+    )
+}
+
+/// Run one subcommand to its exit status. The plain download path never
+/// reaches here.
+async fn run_subcommand(
+    cmd: &cli::Command,
+    args: &cli::Cli,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) -> std::process::ExitCode {
+    match cmd {
+        cli::Command::Parity { what } => std::process::exit(run_parity(what)),
+        cli::Command::Checksum {
+            urls,
+            verify,
+            json,
+            no_sidecars,
+            download_if_needed,
+        } => {
+            let mut list = args.urls.clone();
+            list.extend(urls.clone());
+            checksum_report(
+                &list,
+                verify.as_deref(),
+                *json,
+                !*no_sidecars,
+                *download_if_needed,
+                args,
+            )
+            .await
+        }
+        cli::Command::Interactive {
+            urls,
+            queue_file,
+            headless,
+            max_active,
+        } => {
+            let path = queue_file
+                .clone()
+                .or_else(|| args.queue_file.clone())
+                .unwrap_or_else(queue::Queue::default_path);
+            let max = (*max_active).clamp(1, 16);
+            let mut list = args.urls.clone();
+            list.extend(urls.clone());
+            // The queue's items run with the same download flags a one-shot
+            // transfer would: a proxy, a rate cap or a header given on the
+            // command line applies to everything the queue fetches.
+            let template = match download::Job::from_cli(args, Vec::new(), cancel) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("hydra: {e}");
+                    return std::process::ExitCode::from(2);
+                }
+            };
+            match tui::run_with(path, list, max, *headless, template).await {
+                Ok(0) => std::process::ExitCode::SUCCESS,
+                Ok(_) => std::process::ExitCode::FAILURE,
+                Err(e) => {
+                    eprintln!("hydra: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        cli::Command::Metalink { source, json } => metalink_report(source, *json, args).await,
+        cli::Command::Formats {
+            json,
+            category,
+            what,
+        } => {
+            print_formats(*json, category.as_deref(), what.as_deref());
+            std::process::ExitCode::SUCCESS
+        }
+        cli::Command::Update { json, beta } => update::run(*json, *beta).await,
+        cli::Command::Completions { shell, bin_name } => {
+            let bin = bin_name.as_deref().unwrap_or(completions::DEFAULT_BIN);
+            print!("{}", completions::render(*shell, bin));
+            std::process::ExitCode::SUCCESS
+        }
+        cli::Command::CompatLink {
+            dir,
+            names,
+            force,
+            dry_run,
+        } => {
+            let names: Vec<String> = if names.is_empty() {
+                compat_link::DEFAULT_NAMES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                names.clone()
+            };
+            let (exe, plans) = match compat_link::plan(dir.as_deref(), &names) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("hydra: {e}");
+                    return std::process::ExitCode::from(2);
+                }
+            };
+            let mut failed = false;
+            for p in &plans {
+                let verb = match &p.action {
+                    compat_link::Action::AlreadyLinked => {
+                        println!("{} -> {} (already linked)", p.path.display(), exe.display());
+                        None
+                    }
+                    compat_link::Action::Occupied(what) if !*force => {
+                        eprintln!(
+                            "hydra: {} already exists ({what}); --force replaces it, \
+                             --dir puts the links elsewhere, or use --name hydra-{} \
+                             to keep the real tool's name free",
+                            p.path.display(),
+                            p.name
+                        );
+                        failed = true;
+                        None
+                    }
+                    compat_link::Action::Occupied(_) => Some("replaced"),
+                    compat_link::Action::Create => Some("linked"),
+                };
+                let Some(verb) = verb else { continue };
+                if *dry_run {
+                    println!(
+                        "would have {verb} {} -> {}",
+                        p.path.display(),
+                        exe.display()
+                    );
+                } else if let Err(e) = compat_link::apply(p, &exe, *force) {
+                    eprintln!("hydra: {e}");
+                    failed = true;
+                    continue;
+                } else {
+                    println!("{verb} {} -> {}", p.path.display(), exe.display());
+                }
+            }
+            // Placing the link is the easy half; being the name the shell
+            // actually resolves is the half that silently fails.
+            for p in &plans {
+                if let Some(note) = compat_link::shadow_note(p) {
+                    eprintln!("hydra: {note}");
+                }
+            }
+            if failed {
+                std::process::ExitCode::FAILURE
+            } else {
+                std::process::ExitCode::SUCCESS
+            }
+        }
+        cli::Command::InstallCompletions {
+            shell,
+            system,
+            dry_run,
+            bin_name,
+        } => {
+            let bin = bin_name.as_deref().unwrap_or(completions::DEFAULT_BIN);
+            let shell = match shell.or_else(completions::detect_shell) {
+                Some(s) => s,
+                None => {
+                    eprintln!(
+                        "hydra: could not detect a shell from $SHELL; pass one explicitly, \
+                         e.g. `hydra install-completions zsh`"
+                    );
+                    return std::process::ExitCode::from(2);
+                }
+            };
+            match completions::install(shell, *system, *dry_run, bin) {
+                Ok(dest) => {
+                    if *dry_run {
+                        println!(
+                            "would install {shell} completions for {bin} to {}",
+                            dest.path.display()
+                        );
+                    } else {
+                        println!(
+                            "installed {shell} completions for {bin} to {}",
+                            dest.path.display()
+                        );
+                    }
+                    if let Some(step) = dest.remaining_step {
+                        println!("remaining step: {step}");
+                    }
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("hydra: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        cli::Command::Bench { real, reps, which } => {
+            if *real {
+                realnet::bench(*reps).await;
+            } else {
+                match which.as_str() {
+                    "memprofile" => memprofile().await,
+                    "xval" => xval::cross_validate().await,
+                    "ticksweep" => xval::tick_sweep().await,
+                    "sizesweep" => xval::size_sweep().await,
+                    "detectab" => xval::detect_ab(*reps).await,
+                    other => {
+                        eprintln!("hydra: unknown harness {other}");
+                        return std::process::ExitCode::from(2);
+                    }
+                }
+            }
+            std::process::ExitCode::SUCCESS
+        }
+    }
+}
+
+/// `-O` names ONE file. Applying it to several would write each object over
+/// the last; applying it to the first alone would be a silent surprise.
+fn output_flag_conflict(args: &cli::Cli, n_urls: usize) -> Option<String> {
+    (n_urls > 1 && !args.mirrors && args.output.is_some()).then(|| {
+        format!(
+            "-O names one output file but {n_urls} URLs were given; drop -O to name each \
+             file from its URL, use -P DIR to choose the directory, or pass --mirrors if \
+             they are copies of one object"
+        )
+    })
+}
+
+/// Bytes to stdout must arrive one object after another, and a pause between
+/// transfers only means something when they are sequential.
+fn effective_mode(args: &cli::Cli) -> cli::UrlMode {
+    if args.stdout || args.wait > 0.0 {
+        cli::UrlMode::Queue
     } else {
-        std::process::ExitCode::FAILURE
+        args.mode
+    }
+}
+
+/// The exit status a shell reads as "killed by SIGINT".
+const INTERRUPTED: i32 = 130;
+
+/// A run that was interrupted exits 130 whatever the engine reported: the
+/// user pressed Ctrl-C and a script must not read that as success.
+fn exit_after(
+    code: std::process::ExitCode,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> std::process::ExitCode {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        std::process::ExitCode::from(INTERRUPTED as u8)
+    } else {
+        code
     }
 }
 
@@ -1191,7 +1203,7 @@ async fn metalink_report(source: &str, json: bool, args: &cli::Cli) -> std::proc
             Err(e) => println!("  {} — REFUSED: {}", f.name, e.why),
         }
         match f.size {
-            Some(n) => println!("    size      {} ({n} bytes)", progress::human(n)),
+            Some(n) => println!("    size      {} ({n} bytes)", hya_core::fmt::bytes(n)),
             None => println!("    size      not stated (mirrors cannot be checked against it)"),
         }
         if f.hashes.is_empty() {
@@ -1210,13 +1222,13 @@ async fn metalink_report(source: &str, json: bool, args: &cli::Cli) -> std::proc
             (Some(p), Some(size)) if p.covers(size) => println!(
                 "    pieces    {} x {} ({}) — per-chunk verification and targeted refetch",
                 p.hashes.len(),
-                progress::human(p.length),
+                hya_core::fmt::bytes(p.length),
                 p.algo.as_str()
             ),
             (Some(p), _) => println!(
                 "    pieces    {} x {} ({}) — do NOT tile this object; whole-file digest only",
                 p.hashes.len(),
-                progress::human(p.length),
+                hya_core::fmt::bytes(p.length),
                 p.algo.as_str()
             ),
             (None, _) => println!("    pieces    none (a fault costs a whole re-download)"),
@@ -1299,10 +1311,6 @@ async fn checksum_report(
             all_ok = false;
             continue;
         };
-        // Kept for the sidecar fetches below; the metadata probe resolves its
-        // own proxy per redirect hop.
-        let px = crate::download::proxy_for_public(&parsed, args.proxy.as_deref(), args.no_proxy);
-
         let mut found: Vec<Advertised> = Vec::new();
         let mut size: Option<u64> = None;
         let mut validator: Option<String> = None;
@@ -1345,7 +1353,7 @@ async fn checksum_report(
             for (path, algo) in digest::sidecar_candidates(&parsed.path) {
                 let mut side = parsed.clone();
                 side.path = path.clone();
-                let Ok(t2) = side.to_target(px.as_ref().map(|(h, p)| (h.as_str(), *p))) else {
+                let Ok(t2) = crate::download::target_for_public(&side, args) else {
                     continue;
                 };
                 if let Ok(body) = hya_net::fetch_small(conn.as_ref(), &t2, 1 << 20).await {
@@ -1450,7 +1458,7 @@ async fn checksum_report(
         if !json {
             println!("{u}");
             if let Some(s) = size {
-                println!("  size: {} ({s} bytes)", progress::human(s));
+                println!("  size: {} ({s} bytes)", hya_core::fmt::bytes(s));
             }
             if found.is_empty() && computed.is_none() {
                 println!("  no digest advertised by the server");
@@ -1619,11 +1627,25 @@ async fn resolve_existing(
             });
             continue;
         }
+        // No terminal, no question: a read from a pipe with nobody on the other
+        // end blocks forever, and a cron job has nobody to answer anyway. Keep
+        // the file, which is the one choice that cannot destroy anything.
+        if template.quiet || !prompt::stdin_is_interactive() {
+            eprintln!(
+                "hydra: {} already exists; skipping it (-c continues, --force restarts)",
+                path.display()
+            );
+            out.push(Decision {
+                resume: false,
+                skip: true,
+            });
+            continue;
+        }
         let on_disk = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         eprintln!(
             "hydra: {} already exists ({} on disk)",
             path.display(),
-            progress::human(on_disk)
+            hya_core::fmt::bytes(on_disk)
         );
         eprintln!("  [c] continue it   [r] start over   [s] skip this file");
         eprint!("hydra: what would you like to do? ");
@@ -1631,8 +1653,6 @@ async fn resolve_existing(
         let _ = std::io::stderr().flush();
         let mut line = String::new();
         let n = std::io::stdin().read_line(&mut line).unwrap_or(0);
-        // No answer available (piped, redirected, or EOF): choose the option that cannot
-        // destroy data, as the single-URL prompt does.
         let ans = if n == 0 {
             "s".to_string()
         } else {
@@ -1668,6 +1688,7 @@ async fn run_many(
     mode: cli::UrlMode,
     json: bool,
     quiet: bool,
+    args: &cli::Cli,
 ) -> std::process::ExitCode {
     // Existing files are decided ONCE, before anything starts.
     //
@@ -1721,16 +1742,32 @@ async fn run_many(
     let mut multi = progress::Multi::new(names.clone(), template.verbose, quiet);
 
     let mut outs: Vec<Option<download::Outcome>> = vec![None; jobs.len()];
+    let interrupted = || {
+        template
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    };
     match mode {
         cli::UrlMode::Same => {
+            // At most `--parallel-max` in flight; the rest start as slots free up.
             let mut set = tokio::task::JoinSet::new();
-            for (i, j) in jobs.into_iter().enumerate() {
-                if decisions[i].skip {
-                    continue;
+            let mut pending = jobs
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !decisions[*i].skip)
+                .collect::<std::collections::VecDeque<_>>();
+            let mut start_next = |set: &mut tokio::task::JoinSet<(usize, download::Outcome)>,
+                                  multi: &mut progress::Multi| {
+                while set.len() < args.parallel_max.max(1) {
+                    let Some((i, j)) = pending.pop_front() else {
+                        break;
+                    };
+                    multi.start(i as u64);
+                    set.spawn(async move { (i, download::run(j).await) });
                 }
-                multi.start(i as u64);
-                set.spawn(async move { (i, download::run(j).await) });
-            }
+            };
+            start_next(&mut set, &mut multi);
             loop {
                 tokio::select! {
                     Some(t) = rx.recv() => multi.tick(t),
@@ -1738,6 +1775,9 @@ async fn run_many(
                         Some(Ok((i, o))) => {
                             multi.done(i as u64, &o);
                             outs[i] = Some(o);
+                            if !interrupted() {
+                                start_next(&mut set, &mut multi);
+                            }
                         }
                         Some(Err(_)) | None => break,
                     },
@@ -1745,10 +1785,15 @@ async fn run_many(
             }
         }
         cli::UrlMode::Queue => {
+            let mut started = false;
             for (i, j) in jobs.into_iter().enumerate() {
-                if decisions[i].skip {
+                if decisions[i].skip || interrupted() {
                     continue;
                 }
+                if started && args.wait > 0.0 {
+                    tokio::time::sleep(std::time::Duration::from_secs_f64(args.wait)).await;
+                }
+                started = true;
                 multi.start(i as u64);
                 let h = tokio::spawn(download::run(j));
                 loop {
@@ -2123,6 +2168,51 @@ mod tests {
 
     fn cli(args: &[&str]) -> cli::Cli {
         cli::Cli::try_parse_from(args).expect("parses")
+    }
+
+    #[test]
+    fn dash_o_with_several_urls_is_a_usage_error_unless_they_are_mirrors() {
+        let a = cli(&["hydra", "-O", "x.bin", "http://h/a", "http://h/b"]);
+        let why = output_flag_conflict(&a, 2).expect("two files cannot share one -O");
+        assert!(why.contains("2 URLs") && why.contains("--mirrors"), "{why}");
+        let m = cli(&[
+            "hydra",
+            "--mirrors",
+            "-O",
+            "x.bin",
+            "http://h/a",
+            "http://h/b",
+        ]);
+        assert!(
+            output_flag_conflict(&m, 2).is_none(),
+            "mirrors are one object"
+        );
+        let one = cli(&["hydra", "-O", "x.bin", "http://h/a"]);
+        assert!(output_flag_conflict(&one, 1).is_none());
+    }
+
+    #[test]
+    fn stdout_and_wait_run_several_urls_in_order() {
+        let plain = cli(&["hydra", "http://h/a", "http://h/b"]);
+        assert_eq!(effective_mode(&plain), cli::UrlMode::Same);
+        let piped = cli(&["hydra", "--stdout", "http://h/a", "http://h/b"]);
+        assert_eq!(effective_mode(&piped), cli::UrlMode::Queue);
+        let paced = cli(&["hydra", "--wait", "1.5", "http://h/a", "http://h/b"]);
+        assert_eq!(effective_mode(&paced), cli::UrlMode::Queue);
+    }
+
+    #[test]
+    fn an_interrupted_run_exits_130_whatever_the_engine_said() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(
+            exit_after(std::process::ExitCode::SUCCESS, &flag),
+            std::process::ExitCode::SUCCESS
+        );
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            exit_after(std::process::ExitCode::SUCCESS, &flag),
+            std::process::ExitCode::from(130)
+        );
     }
 
     #[test]

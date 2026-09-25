@@ -90,6 +90,24 @@ jobs:
       - name: Run clippy checks
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+  audit:
+    name: Security Audit
+    needs: [clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Accepted advisories live in .cargo/audit.toml with their rationale;
+      # anything new, including unmaintained or unsound crates, fails here.
+      - name: Audit Cargo.lock against the RustSec database
+        run: cargo audit --deny warnings
+
   test:
     name: Test
     needs: [fmt, clippy]

@@ -23,15 +23,90 @@
 //! through `SFSafariWebExtensionHandler`, so there is no manifest to write.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const HOST_NAME: &str = "com.hydra.host";
 
-/// Chromium extension id, derived from the `key` pinned in
-/// `extensions/chrome/manifest.json` (first 16 bytes of SHA-256 over the DER
-/// public key, hex digits mapped to a–p). Pinning the key is what keeps this
-/// id stable across rebuilds; `scripts/build-extensions.sh` documents the
-/// consequences of signing with a different one.
-const CHROME_EXT_ID: &str = "jpnonmbbkjdpeebdhkjoliklfhkdcomj";
+/// Browsers the host is registered with, as of this session's registration
+/// pass, for Options > Extensions to show.
+static REGISTERED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Names of the browsers whose manifest points at Hydra's host, in the
+/// order they were registered. Empty until [`ensure_registered`] has run.
+pub fn registered() -> Vec<String> {
+    REGISTERED.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn set_registered(names: Vec<String>) {
+    if let Ok(mut g) = REGISTERED.lock() {
+        *g = names;
+    }
+}
+
+/// A container the app may be running in, which changes what a manifest
+/// may point at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sandbox {
+    None,
+    /// The binary lives on a `/tmp/.mount_*` FUSE mount that vanishes with
+    /// the process; `scripts/package-appimage.sh` registers a stable shim.
+    AppImage,
+    /// `/app/bin` is only visible inside the sandbox; the browser outside
+    /// needs a wrapper that goes back in through `flatpak run`.
+    Flatpak,
+}
+
+fn sandbox() -> Sandbox {
+    if std::env::var_os("APPIMAGE").is_some() && std::env::var_os("APPDIR").is_some() {
+        Sandbox::AppImage
+    } else if std::env::var_os("FLATPAK_ID").is_some() || Path::new("/.flatpak-info").exists() {
+        Sandbox::Flatpak
+    } else {
+        Sandbox::None
+    }
+}
+
+/// The Flatpak application id, as published on Flathub.
+const FLATPAK_APP_ID: &str = "io.github.ja7ad.hydra";
+
+/// What the Flatpak wrapper script has to say.
+fn flatpak_wrapper_body() -> String {
+    format!("#!/bin/sh\nexec flatpak run --command=hydra-host {FLATPAK_APP_ID} \"$@\"\n")
+}
+
+/// Write the wrapper the browser can execute from outside the sandbox at
+/// `dir/hydra-host`, and hand its path back to register.
+fn write_flatpak_wrapper(dir: &Path) -> Option<PathBuf> {
+    let path = dir.join("hydra-host");
+    let body = flatpak_wrapper_body();
+    if std::fs::read_to_string(&path).is_ok_and(|cur| cur == body) {
+        return Some(path);
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        crate::log::warn(&format!("nmhost: cannot create {}: {e}", dir.display()));
+        return None;
+    }
+    if let Err(e) = std::fs::write(&path, body) {
+        crate::log::warn(&format!("nmhost: cannot write {}: {e}", path.display()));
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    crate::log::info(&format!("nmhost: flatpak wrapper at {}", path.display()));
+    Some(path)
+}
+
+/// The Chromium extension ids Hydra answers to: the dev build (derived from
+/// the `key` pinned in `extensions/chrome/manifest.json`; see
+/// `scripts/build-extensions.sh`) and the Chrome Web Store listing, which
+/// signs with the store's own key and so gets an id of its own.
+pub const CHROMIUM_EXT_IDS: [&str; 2] = [
+    "jpnonmbbkjdpeebdhkjoliklfhkdcomj",
+    "hcjpgdepggimagiehiampmgamlfkpbhh",
+];
 
 /// Firefox allow-lists by add-on id, not by an extension origin. Mirrors
 /// `browser_specific_settings.gecko.id` in `extensions/firefox/manifest.json`.
@@ -59,10 +134,11 @@ fn manifest(host_path: &Path, gecko: bool) -> String {
     let allow = if gecko {
         format!("\"allowed_extensions\": [{}]", json_str(FIREFOX_EXT_ID))
     } else {
-        format!(
-            "\"allowed_origins\": [{}]",
-            json_str(&format!("chrome-extension://{CHROME_EXT_ID}/"))
-        )
+        let origins: Vec<String> = CHROMIUM_EXT_IDS
+            .iter()
+            .map(|id| json_str(&format!("chrome-extension://{id}/")))
+            .collect();
+        format!("\"allowed_origins\": [{}]", origins.join(", "))
     };
     format!(
         "{{\n  \"name\": {},\n  \"description\": \"Hydra Download Manager native host\",\n  \"path\": {},\n  \"type\": \"stdio\",\n  {allow}\n}}\n",
@@ -92,24 +168,27 @@ fn json_str(s: &str) -> String {
 }
 
 /// Write `body` to `dir/com.hydra.host.json`, but only when `root` exists —
-/// that is the test for "this browser is installed for this user". Returns
-/// the path when something was actually written.
+/// that is the test for "this browser is installed for this user". `None`
+/// when the browser is absent or the write failed; otherwise whether the
+/// file changed (an identical manifest is left alone, mtime and all).
 #[cfg(any(not(target_os = "windows"), test))]
-fn write_manifest(root: &Path, dir: &Path, body: &str) -> Option<PathBuf> {
+fn write_manifest(root: &Path, dir: &Path, body: &str) -> Option<bool> {
     if !root.is_dir() {
         return None;
     }
     let file = dir.join(format!("{HOST_NAME}.json"));
-    // Rewriting an identical file would still bump its mtime for no reason.
     if std::fs::read_to_string(&file).is_ok_and(|cur| cur == body) {
-        return None;
+        return Some(false);
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         crate::log::warn(&format!("nmhost: cannot create {}: {e}", dir.display()));
         return None;
     }
     match std::fs::write(&file, body) {
-        Ok(()) => Some(file),
+        Ok(()) => {
+            crate::log::info(&format!("nmhost: registered {}", file.display()));
+            Some(true)
+        }
         Err(e) => {
             crate::log::warn(&format!("nmhost: cannot write {}: {e}", file.display()));
             None
@@ -117,36 +196,54 @@ fn write_manifest(root: &Path, dir: &Path, body: &str) -> Option<PathBuf> {
     }
 }
 
-/// `(profile root, manifest directory, is_firefox)` for every browser this
-/// platform knows about. The root is what decides whether the browser is
-/// installed; the directory is where its manifest goes.
+/// One browser's registration point: its name for the Options page, the
+/// profile root that decides whether it is installed, where its manifest
+/// goes, and which dialect it reads.
 #[cfg(not(target_os = "windows"))]
-fn targets(home: &Path) -> Vec<(PathBuf, PathBuf, bool)> {
+struct Target {
+    name: &'static str,
+    root: PathBuf,
+    dir: PathBuf,
+    gecko: bool,
+}
+
+/// Every browser this platform knows about.
+#[cfg(not(target_os = "windows"))]
+fn targets(home: &Path) -> Vec<Target> {
     // Chromium browsers keep NativeMessagingHosts inside the profile root;
     // Firefox uses one shared directory per Mozilla-family application.
-    let chromium = |root: PathBuf| {
-        let dir = root.join("NativeMessagingHosts");
-        (root, dir, false)
+    let chromium = |name: &'static str, root: PathBuf| Target {
+        name,
+        dir: root.join("NativeMessagingHosts"),
+        root,
+        gecko: false,
+    };
+    let gecko = |name: &'static str, root: PathBuf, dir: PathBuf| Target {
+        name,
+        root,
+        dir,
+        gecko: true,
     };
 
     #[cfg(target_os = "macos")]
     {
         let sup = home.join("Library/Application Support");
-        let gecko = |root: PathBuf, dir: PathBuf| (root, dir, true);
         vec![
-            chromium(sup.join("Google/Chrome")),
-            chromium(sup.join("Google/Chrome Beta")),
-            chromium(sup.join("Chromium")),
-            chromium(sup.join("Microsoft Edge")),
-            chromium(sup.join("BraveSoftware/Brave-Browser")),
-            chromium(sup.join("Vivaldi")),
-            chromium(sup.join("com.operasoftware.Opera")),
-            chromium(sup.join("Arc/User Data")),
+            chromium("Chrome", sup.join("Google/Chrome")),
+            chromium("Chrome Beta", sup.join("Google/Chrome Beta")),
+            chromium("Chromium", sup.join("Chromium")),
+            chromium("Edge", sup.join("Microsoft Edge")),
+            chromium("Brave", sup.join("BraveSoftware/Brave-Browser")),
+            chromium("Vivaldi", sup.join("Vivaldi")),
+            chromium("Opera", sup.join("com.operasoftware.Opera")),
+            chromium("Arc", sup.join("Arc/User Data")),
             gecko(
+                "Firefox",
                 home.join("Library/Application Support/Firefox"),
                 sup.join("Mozilla/NativeMessagingHosts"),
             ),
             gecko(
+                "LibreWolf",
                 sup.join("LibreWolf"),
                 sup.join("LibreWolf/NativeMessagingHosts"),
             ),
@@ -156,7 +253,6 @@ fn targets(home: &Path) -> Vec<(PathBuf, PathBuf, bool)> {
     #[cfg(target_os = "linux")]
     {
         let cfg = home.join(".config");
-        let gecko = |root: PathBuf, dir: PathBuf| (root, dir, true);
         // Snap and Flatpak do not use ~/.config or ~/.mozilla at all: each
         // browser gets its own private tree. Ubuntu has shipped Firefox as a
         // SNAP by default since 22.04, so on a stock Ubuntu the classic
@@ -165,38 +261,55 @@ fn targets(home: &Path) -> Vec<(PathBuf, PathBuf, bool)> {
         let snap = home.join("snap");
         let flat = home.join(".var/app");
         vec![
-            chromium(cfg.join("google-chrome")),
-            chromium(cfg.join("google-chrome-beta")),
-            chromium(cfg.join("chromium")),
-            chromium(cfg.join("microsoft-edge")),
-            chromium(cfg.join("BraveSoftware/Brave-Browser")),
-            chromium(cfg.join("vivaldi")),
-            chromium(cfg.join("opera")),
+            chromium("Chrome", cfg.join("google-chrome")),
+            chromium("Chrome Beta", cfg.join("google-chrome-beta")),
+            chromium("Chromium", cfg.join("chromium")),
+            chromium("Edge", cfg.join("microsoft-edge")),
+            chromium("Brave", cfg.join("BraveSoftware/Brave-Browser")),
+            chromium("Vivaldi", cfg.join("vivaldi")),
+            chromium("Opera", cfg.join("opera")),
             // Snap Chromium keeps its profile under the snap's own tree.
-            chromium(snap.join("chromium/common/chromium")),
+            chromium("Chromium (snap)", snap.join("chromium/common/chromium")),
             // Flatpak browsers keep theirs under the app id.
-            chromium(flat.join("com.google.Chrome/config/google-chrome")),
-            chromium(flat.join("org.chromium.Chromium/config/chromium")),
-            chromium(flat.join("com.brave.Browser/config/BraveSoftware/Brave-Browser")),
-            chromium(flat.join("com.microsoft.Edge/config/microsoft-edge")),
+            chromium(
+                "Chrome (flatpak)",
+                flat.join("com.google.Chrome/config/google-chrome"),
+            ),
+            chromium(
+                "Chromium (flatpak)",
+                flat.join("org.chromium.Chromium/config/chromium"),
+            ),
+            chromium(
+                "Brave (flatpak)",
+                flat.join("com.brave.Browser/config/BraveSoftware/Brave-Browser"),
+            ),
+            chromium(
+                "Edge (flatpak)",
+                flat.join("com.microsoft.Edge/config/microsoft-edge"),
+            ),
             gecko(
+                "Firefox",
                 home.join(".mozilla"),
                 home.join(".mozilla/native-messaging-hosts"),
             ),
             gecko(
+                "LibreWolf",
                 home.join(".librewolf"),
                 home.join(".librewolf/native-messaging-hosts"),
             ),
             // The Ubuntu default.
             gecko(
+                "Firefox (snap)",
                 snap.join("firefox/common/.mozilla"),
                 snap.join("firefox/common/.mozilla/native-messaging-hosts"),
             ),
             gecko(
+                "Firefox (flatpak)",
                 flat.join("org.mozilla.firefox/.mozilla"),
                 flat.join("org.mozilla.firefox/.mozilla/native-messaging-hosts"),
             ),
             gecko(
+                "LibreWolf (flatpak)",
                 flat.join("io.gitlab.librewolf-community/.librewolf"),
                 flat.join("io.gitlab.librewolf-community/.librewolf/native-messaging-hosts"),
             ),
@@ -207,17 +320,30 @@ fn targets(home: &Path) -> Vec<(PathBuf, PathBuf, bool)> {
 /// The `HKCU` keys each Windows browser reads. Chromium and Gecko share the
 /// shape; only the vendor path differs.
 #[cfg(target_os = "windows")]
-const WIN_KEYS: &[(&str, bool)] = &[
-    (r"Software\Google\Chrome\NativeMessagingHosts", false),
-    (r"Software\Chromium\NativeMessagingHosts", false),
-    (r"Software\Microsoft\Edge\NativeMessagingHosts", false),
+const WIN_KEYS: &[(&str, &str, bool)] = &[
     (
+        "Chrome",
+        r"Software\Google\Chrome\NativeMessagingHosts",
+        false,
+    ),
+    ("Chromium", r"Software\Chromium\NativeMessagingHosts", false),
+    (
+        "Edge",
+        r"Software\Microsoft\Edge\NativeMessagingHosts",
+        false,
+    ),
+    (
+        "Brave",
         r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts",
         false,
     ),
-    (r"Software\Vivaldi\NativeMessagingHosts", false),
-    (r"Software\Opera Software\NativeMessagingHosts", false),
-    (r"Software\Mozilla\NativeMessagingHosts", true),
+    ("Vivaldi", r"Software\Vivaldi\NativeMessagingHosts", false),
+    (
+        "Opera",
+        r"Software\Opera Software\NativeMessagingHosts",
+        false,
+    ),
+    ("Firefox", r"Software\Mozilla\NativeMessagingHosts", true),
 ];
 
 /// Point every browser's `HKCU` key at its manifest. Unlike the Unix side
@@ -253,7 +379,8 @@ fn register_windows(host: &Path) {
     }
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    for (key, is_gecko) in WIN_KEYS {
+    let mut names = Vec::new();
+    for (name, key, is_gecko) in WIN_KEYS {
         let want = if *is_gecko { &gecko } else { &chromium }
             .to_string_lossy()
             .to_string();
@@ -266,12 +393,15 @@ fn register_windows(host: &Path) {
                 if cur.ok().as_deref() != Some(want.as_str()) {
                     if let Err(e) = k.set_value("", &want) {
                         crate::log::warn(&format!("nmhost: {sub}: {e}"));
+                        continue;
                     }
                 }
+                names.push(name.to_string());
             }
             Err(e) => crate::log::warn(&format!("nmhost: {sub}: {e}")),
         }
     }
+    set_registered(names);
     crate::log::info(&format!("nmhost: registry keys point at {}", dir.display()));
 }
 
@@ -340,11 +470,33 @@ pub fn ensure_registered(portable_capture: bool) {
     std::thread::Builder::new()
         .name("nmhost-register".into())
         .spawn(move || {
-            let Some(host) = host_binary() else {
-                crate::log::warn(
-                    "nmhost: hydra-host is not next to the app; browser capture cannot launch Hydra",
-                );
-                return;
+            let host = match sandbox() {
+                Sandbox::AppImage => {
+                    crate::log::info(
+                        "nmhost: AppImage — the manifests point at the shim AppRun installed, \
+                         not at this transient mount",
+                    );
+                    return;
+                }
+                Sandbox::Flatpak => {
+                    let Some(dir) = dirs::data_dir().map(|d| d.join("hydra")) else {
+                        crate::log::warn("nmhost: no data directory for the flatpak wrapper");
+                        return;
+                    };
+                    let Some(wrapper) = write_flatpak_wrapper(&dir) else {
+                        return;
+                    };
+                    wrapper
+                }
+                Sandbox::None => match host_binary() {
+                    Some(h) => h,
+                    None => {
+                        crate::log::warn(
+                            "nmhost: hydra-host is not next to the app; browser capture cannot launch Hydra",
+                        );
+                        return;
+                    }
+                },
             };
             // Written before the manifests: a browser that spawns the host
             // the moment a key appears must already find the profile. `None`
@@ -375,13 +527,15 @@ pub fn ensure_registered(portable_capture: bool) {
                 let chromium = manifest(&host, false);
                 let gecko = manifest(&host, true);
                 let mut written = 0;
-                for (root, dir, is_gecko) in targets(&home) {
-                    let body = if is_gecko { &gecko } else { &chromium };
-                    if let Some(p) = write_manifest(&root, &dir, body) {
-                        crate::log::info(&format!("nmhost: registered {}", p.display()));
-                        written += 1;
+                let mut names = Vec::new();
+                for t in targets(&home) {
+                    let body = if t.gecko { &gecko } else { &chromium };
+                    if let Some(changed) = write_manifest(&t.root, &t.dir, body) {
+                        written += usize::from(changed);
+                        names.push(t.name.to_string());
                     }
                 }
+                set_registered(names);
                 crate::log::info(&format!(
                     "nmhost: {} manifest(s) written, host = {}",
                     written,
@@ -399,7 +553,9 @@ mod tests {
     #[test]
     fn chromium_manifest_allow_lists_the_extension_origin() {
         let m = manifest(Path::new("/opt/hydra/hydra-host"), false);
-        assert!(m.contains(&format!("chrome-extension://{CHROME_EXT_ID}/")));
+        for id in CHROMIUM_EXT_IDS {
+            assert!(m.contains(&format!("chrome-extension://{id}/")));
+        }
         assert!(m.contains("\"allowed_origins\""));
         assert!(m.contains("\"path\": \"/opt/hydra/hydra-host\""));
         assert!(!m.contains("allowed_extensions"));
@@ -435,7 +591,7 @@ mod tests {
         let home = std::path::Path::new("/home/tester");
         let dirs: Vec<String> = targets(home)
             .into_iter()
-            .map(|(_, d, _)| d.to_string_lossy().into_owned())
+            .map(|t| t.dir.to_string_lossy().into_owned())
             .collect();
         let has = |p: &str| dirs.iter().any(|d| d == p);
 
@@ -501,11 +657,38 @@ mod tests {
         let dir = tmp.join("NativeMessagingHosts");
         std::fs::create_dir_all(&tmp).unwrap();
         let body = manifest(Path::new("/opt/hydra/hydra-host"), false);
-        assert!(write_manifest(&tmp, &dir, &body).is_some());
-        assert!(write_manifest(&tmp, &dir, &body).is_none());
+        assert_eq!(write_manifest(&tmp, &dir, &body), Some(true));
+        // Still registered, just not rewritten.
+        assert_eq!(write_manifest(&tmp, &dir, &body), Some(false));
         // A changed host path does get written through.
         let moved = manifest(Path::new("/usr/local/bin/hydra-host"), false);
-        assert!(write_manifest(&tmp, &dir, &moved).is_some());
+        assert_eq!(write_manifest(&tmp, &dir, &moved), Some(true));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A browser outside the sandbox cannot run `/app/bin/hydra-host`; what
+    /// it can run is a script that asks flatpak to. The manifest must point
+    /// at that script, and the script must be executable.
+    #[test]
+    fn the_flatpak_wrapper_re_enters_the_sandbox() {
+        let tmp = std::env::temp_dir().join(format!("hydra-flatpak-{}", std::process::id()));
+        let wrapper = write_flatpak_wrapper(&tmp).expect("wrapper written");
+        let body = std::fs::read_to_string(&wrapper).unwrap();
+        assert!(body.starts_with("#!/bin/sh\n"));
+        assert!(body.contains("exec flatpak run --command=hydra-host io.github.ja7ad.hydra \"$@\""));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&wrapper).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "not executable: {mode:o}");
+        }
+        // Idempotent: the second pass finds it and leaves it.
+        assert_eq!(write_flatpak_wrapper(&tmp), Some(wrapper.clone()));
+        let m = manifest(&wrapper, false);
+        assert!(m.contains(&format!(
+            "\"path\": {}",
+            json_str(&wrapper.to_string_lossy())
+        )));
         std::fs::remove_dir_all(&tmp).ok();
     }
 }

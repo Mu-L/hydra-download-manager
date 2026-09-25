@@ -43,6 +43,7 @@
 //! Vectorized paths are covered by differential tests against scalar references,
 //! maintaining safety and high performance across architectures.
 
+pub mod base64;
 pub mod cookies;
 pub mod digest;
 pub mod framebuf;
@@ -60,6 +61,7 @@ pub mod signed;
 pub mod socks;
 pub mod stream_digest;
 pub mod tls;
+pub mod url;
 pub mod xml;
 pub mod zipdir;
 
@@ -68,7 +70,17 @@ pub mod zipdir;
 /// One definition for the whole workspace: the CLI's flag default and the
 /// queue manager reference it too, so a version bump cannot leave the paths
 /// disagreeing about who they say they are.
-pub const DEFAULT_USER_AGENT: &str = "hydra/0.1";
+pub const DEFAULT_USER_AGENT: &str = concat!("hydra/", env!("CARGO_PKG_VERSION"));
+
+/// How many mirrors a mirror-list transfer probes at once.
+///
+/// Each probe goes to a different host, so this is not a politeness limit — the
+/// per-host ceilings answer that — only a guard against a forty-mirror document
+/// opening forty sockets at once and hitting an fd limit. Sixteen because the
+/// cost is latency paid before the first byte: against a twelve-mirror Fedora
+/// document, six in flight took two waves and 4.1 s of setup; one wave removes
+/// almost all of it.
+pub const PROBE_FANOUT: usize = 16;
 
 use std::future::Future;
 use std::io;
@@ -78,6 +90,12 @@ use tokio::net::TcpStream;
 
 /// Per-connection read buffer. The only memory that scales with concurrency.
 pub const READ_BUF: usize = 64 * 1024;
+
+/// The payload of an `Authorization: Basic` (or `Proxy-Authorization`) header
+/// for these credentials: `user:pass`, base64-encoded, without the scheme word.
+pub fn basic_auth(user: &str, pass: &str) -> String {
+    base64::encode(format!("{user}:{pass}").as_bytes())
+}
 
 #[derive(Debug)]
 pub struct Arrival {
@@ -343,8 +361,29 @@ impl Target {
         self.agent.as_deref().unwrap_or(DEFAULT_USER_AGENT)
     }
 
-    fn extra_headers(&self) -> &[String] {
-        &self.headers
+    /// The extra headers the request line is followed by.
+    ///
+    /// Through a CONNECT tunnel the request reaches the ORIGIN, not the proxy
+    /// that was just paid with `Proxy-Authorization`: the login is the
+    /// tunnel's (RFC 9110 §11.7.2) and does not go through it.
+    fn extra_headers(&self) -> impl Iterator<Item = &str> {
+        let tunnelled = self.tls && self.origin.is_some();
+        self.headers
+            .iter()
+            .map(String::as_str)
+            .filter(move |h| !(tunnelled && is_field(h, "proxy-authorization")))
+    }
+
+    /// The `Proxy-Authorization` value among the headers, for the CONNECT
+    /// tunnel a TLS connection through a forward proxy opens first. The
+    /// front-ends attach the line for their plain requests, and a proxy that
+    /// wants a login on those wants it on the tunnel too.
+    pub fn proxy_authorization(&self) -> Option<&str> {
+        const NAME: &str = "proxy-authorization";
+        self.headers
+            .iter()
+            .find(|h| is_field(h, NAME))
+            .map(|h| h[NAME.len() + 1..].trim())
     }
 
     /// Absolute-form target routed through a forward proxy.
@@ -539,6 +578,20 @@ pub use socks::{Proxy, ProxyKind};
 pub use tls::{connect_family, IpFamily, MaybeTls, TlsCapableConnector};
 
 #[cfg(test)]
+mod credential_tests {
+    #[test]
+    fn basic_auth_is_the_padded_base64_of_user_colon_pass() {
+        assert_eq!(super::basic_auth("me", "pw"), "bWU6cHc=");
+        assert_eq!(super::basic_auth("", ""), "Og==");
+        assert_eq!(
+            super::DEFAULT_USER_AGENT,
+            format!("hydra/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_ne!(super::DEFAULT_USER_AGENT, "hydra/0.1");
+    }
+}
+
+#[cfg(test)]
 mod target_jar_tests {
     use super::*;
     use crate::cookies::CookieJar;
@@ -623,6 +676,49 @@ mod target_jar_tests {
         assert_eq!(
             cookie_headers(&Target::direct_tls("example.org", 443, "/").with_jar(&jar, 0)),
             ["Cookie: sid=abc"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_tests {
+    use super::*;
+
+    #[test]
+    fn the_proxy_login_is_read_off_the_headers_whatever_its_case() {
+        let t = Target::via_proxy("proxy.test", 3128, "h:443", "/")
+            .with_headers(vec!["proxy-authorization:  Basic cHc= ".into()], None);
+        assert_eq!(t.proxy_authorization(), Some("Basic cHc="));
+        assert_eq!(
+            Target::direct("h", 80, "/")
+                .with_headers(vec!["Authorization: Basic cHc=".into()], None)
+                .proxy_authorization(),
+            None,
+            "the origin's login is not the proxy's"
+        );
+    }
+
+    /// Through a tunnel the request reaches the origin, which is not owed
+    /// the proxy's password; on a plain proxied request the proxy reads it.
+    #[test]
+    fn a_tunnelled_request_keeps_the_proxy_login_off_the_origin() {
+        let headers = vec![
+            "Proxy-Authorization: Basic cHc=".to_string(),
+            "X-Api-Key: k".to_string(),
+        ];
+        let mut tunnelled =
+            Target::via_proxy("proxy.test", 3128, "h:443", "/").with_headers(headers.clone(), None);
+        tunnelled.tls = true;
+        assert_eq!(
+            tunnelled.extra_headers().collect::<Vec<_>>(),
+            ["X-Api-Key: k"]
+        );
+        assert_eq!(tunnelled.proxy_authorization(), Some("Basic cHc="));
+
+        let plain = Target::via_proxy("proxy.test", 3128, "h:80", "/").with_headers(headers, None);
+        assert_eq!(
+            plain.extra_headers().collect::<Vec<_>>(),
+            ["Proxy-Authorization: Basic cHc=", "X-Api-Key: k"]
         );
     }
 }

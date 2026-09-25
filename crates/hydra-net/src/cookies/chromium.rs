@@ -293,7 +293,8 @@ fn master_key(browser: Browser, store: &Path) -> Result<Key, Error> {
         .and_then(|o| o.get("encrypted_key"))
         .and_then(|k| k.as_str())
         .ok_or_else(|| fail("`Local State` names no `os_crypt.encrypted_key`".into()))?;
-    let wrapped = base64_decode(b64).ok_or_else(|| fail("the stored key is not base64".into()))?;
+    let wrapped =
+        crate::base64::decode(b64).ok_or_else(|| fail("the stored key is not base64".into()))?;
     let dpapi = wrapped
         .strip_prefix(b"DPAPI".as_slice())
         .ok_or_else(|| fail("the stored key has no DPAPI prefix".into()))?;
@@ -370,27 +371,6 @@ fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
     // not been freed; nothing else holds it.
     unsafe { LocalFree(out.pbData as _) };
     Some(plain)
-}
-
-/// Standard base64 with padding, which is what `Local State` holds.
-#[cfg(target_os = "windows")]
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for ch in s.bytes() {
-        if ch == b'=' || ch.is_ascii_whitespace() {
-            continue;
-        }
-        let v = T.iter().position(|&t| t == ch)? as u32;
-        acc = acc << 6 | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]

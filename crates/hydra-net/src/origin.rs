@@ -396,7 +396,6 @@ where
         return Ok(false);
     }
 
-    // parse Range: bytes=lo-hi
     let mut lo = 0u64;
     let mut hi = size;
     let mut partial = false;
@@ -509,16 +508,8 @@ where
         }
         fill(&mut out[..n], off);
         if chunk_sz > 0 {
-            // Frame each slice into chunk_sz pieces, assembled in a REUSED
-            // buffer and written once.
-            //
-            // The obvious spelling — `format!("{take:x}\r\n")` per chunk — makes
-            // this harness allocate once per chunk. That matters because the
-            // allocation profiler this origin feeds counts process-wide, so the
-            // origin's own churn is indistinguishable from the client decoder's
-            // and would be reported as the client's cost. Measured before this
-            // change: ~1027 allocations per MiB at 1 KiB chunks, essentially all
-            // of them this `format!`.
+            // Framed in a reused buffer and written once: a `format!` per chunk
+            // would show up in the process-wide allocation profile as client cost.
             framed.clear();
             let mut w = 0usize;
             let mut hdr = [0u8; 20];

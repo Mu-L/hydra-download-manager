@@ -24,10 +24,12 @@
 
 pub mod admission;
 pub mod detect;
+pub mod fmt;
 pub mod format;
 pub mod intervals;
 pub mod plan;
 pub mod ramp;
+pub mod rate;
 pub mod sched;
 
 pub use admission::{Admission, Admit, DeltaEstimator};
@@ -39,6 +41,7 @@ pub use format::{
 pub use intervals::{IntervalSet, Range};
 pub use plan::{allocate, reserves, SourcePlan};
 pub use ramp::{ConcurrencyRamp, Ramp, Verdict};
+pub use rate::RateMeter;
 pub use sched::{
     greedy_concurrency, Action, Capability, LimitReason, Scheduler, Source, Stats, NO_PRIORITY,
     STEAL_QUANTUM,

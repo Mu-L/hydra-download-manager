@@ -243,10 +243,14 @@ pub fn view(app: &App) -> El<'_> {
         iced::widget::space::horizontal().height(0.0).into()
     };
 
-    let error: El<'_> = match &st.error {
+    // What went wrong reading a manifest or a mirror list is shown, not
+    // logged: the address will otherwise be downloaded as a file, and a
+    // 6 KB playlist named like a video is a puzzle for the user to solve.
+    let probe_error = st.stream_error.as_ref().or(st.metalink_error.as_ref());
+    let error: El<'_> = match st.error.as_ref().or(probe_error) {
         Some(e) => text(e.clone())
             .size(theme::FONT_SIZE)
-            .color(iced::Color::from_rgb8(0xC0, 0x2B, 0x2B))
+            .color(theme::error_text())
             .into(),
         None if !st.address.trim().is_empty()
             && crate::app::site_blocked(st.address.trim(), &app.cfg.settings.dont_start_sites) =>
@@ -261,8 +265,10 @@ pub fn view(app: &App) -> El<'_> {
         None => iced::widget::space::horizontal().height(0.0).into(),
     };
 
+    // Nothing may be added while the address is still being read.
+    let probing = st.stream_probing || st.metalink_probing;
     let buttons = column![
-        dlg_btn_primary(tr("OK"), Some(Message::AddUrlOk)),
+        dlg_btn_primary(tr("OK"), (!probing).then_some(Message::AddUrlOk)),
         dlg_btn(
             tr("Cancel"),
             app.win_of(WinKind::AddUrl).map(Message::CloseThis),

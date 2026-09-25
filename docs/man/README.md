@@ -58,12 +58,14 @@ packaging scripts glob `docs/man/*.1` and pick it up automatically.
 
 The pages document **observed** behaviour. Every claim about exit codes, output
 files, JSON fields, and flag effects was checked by running the release binary,
-which is how the `BUGS` sections got written: nine flags parse but do nothing,
-`--max-redirs` ignores its value, `--fail` still writes the error body, and
-multi-file runs do not deduplicate colliding basenames. None of those are visible
-from the `--help` text, and two of them (`--fail`, basename collision) are the
+which is how the `BUGS` sections got written. The remaining entries are the ones
+still true: multi-file runs do not deduplicate colliding basenames, streams get
+no `--json` document, and an authenticated HTTP proxy does not carry its login
+on the `CONNECT` tunnel an https origin needs. The basename collision is the
 project's recurring failure shape — a file that exists and looks plausible.
 
-When a flag is wired up, delete its "accepted but not implemented" note *and* its
-`BUGS` paragraph. When a new flag is added, `hydra --help` is the starting point
-but not the authority; run it before documenting what it does.
+Flags that name the default (`--remote-name`, `--location`, `--fail`,
+`--parallel`) say so in `--help`; every other flag either does what it says or
+is refused. When a flag is wired up, delete its `BUGS` paragraph. When a new
+flag is added, `hydra --help` is the starting point but not the authority; run
+it before documenting what it does.

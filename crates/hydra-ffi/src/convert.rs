@@ -10,7 +10,7 @@ use crate::mem::{cstr_opt, cstr_req};
 use hydra_error_code_t as E;
 
 /// Maximum allowable size in bytes for a configuration struct.
-const MAX_CONFIG_BYTES: usize = 4096;
+pub(crate) const MAX_CONFIG_BYTES: usize = 4096;
 
 /// Reads a versioned configuration struct from caller memory.
 ///
@@ -110,8 +110,8 @@ pub(crate) unsafe fn engine_cfg(p: *const hydra_engine_config_t) -> Result<Engin
         out.allow_insecure_tls = c.allow_insecure_tls != 0;
     }
 
-    enum_in_range(c.network_policy, 2, "engine_config.network_policy")?;
-    enum_in_range(c.power_mode, 2, "engine_config.power_mode")?;
+    out.network_policy = enum_in_range(c.network_policy, 2, "engine_config.network_policy")?;
+    out.power_mode = enum_in_range(c.power_mode, 2, "engine_config.power_mode")?;
 
     // SAFETY: strings are borrowed for duration of call.
     out.state_path = unsafe { cstr_opt(c.state_path) }
@@ -133,20 +133,51 @@ pub(crate) unsafe fn engine_cfg(p: *const hydra_engine_config_t) -> Result<Engin
     Ok(out)
 }
 
-/// Validates and converts a job configuration from C ABI.
+/// What a job configuration converts to.
+pub(crate) struct JobInput {
+    pub cfg: JobCfg,
+    pub output_path: String,
+    pub creds: Creds,
+    /// `hydra_job_config_t.auto_start`, read only when the caller's struct
+    /// reaches it.
+    pub auto_start: bool,
+}
+
+/// Reads a job configuration from caller memory, honouring its declared `size`.
 ///
-/// Returns parsed configuration, output path, and credentials.
+/// # Safety
+/// `p` must be NULL or point to at least `p->size` readable bytes.
+pub(crate) unsafe fn read_job_config(
+    p: *const hydra_job_config_t,
+) -> Result<hydra_job_config_t, Detail> {
+    // SAFETY: caller's contract.
+    unsafe { read_versioned(p, crate::HYDRA_JOB_CONFIG_VERSION, "job_config") }
+}
+
+/// Validates and converts a job configuration from C ABI.
 ///
 /// # Safety
 /// `p` must point to a readable `hydra_job_config_t` with valid string arrays.
 pub(crate) unsafe fn job_cfg(
     p: *const hydra_job_config_t,
     engine: &EngineCfg,
-) -> Result<(JobCfg, String, Creds), Detail> {
+) -> Result<JobInput, Detail> {
     // SAFETY: caller provides valid pointer to job config struct.
-    let c = unsafe { read_versioned(p, crate::HYDRA_JOB_CONFIG_VERSION, "job_config")? };
+    let c = unsafe { read_job_config(p)? };
+    // SAFETY: `c` is a bounded copy of the caller's struct, and the pointers in
+    // it are valid for this call per the caller's contract.
+    unsafe { job_cfg_from(&c, engine) }
+}
 
-    // ---- urls ------------------------------------------------------------
+/// Validates and converts a job configuration already copied out of caller
+/// memory by [`read_job_config`].
+///
+/// # Safety
+/// Every pointer in `c` must be valid for this call.
+pub(crate) unsafe fn job_cfg_from(
+    c: &hydra_job_config_t,
+    engine: &EngineCfg,
+) -> Result<JobInput, Detail> {
     if c.urls.is_null() || c.url_count == 0 {
         return Err(invalid("job_config.urls is empty"));
     }
@@ -177,7 +208,6 @@ pub(crate) unsafe fn job_cfg(
         urls.push(parsed.redacted());
     }
 
-    // ---- destination -----------------------------------------------------
     // SAFETY: the pointer satisfies this function's documented contract and outlives the call.
     let output = unsafe { cstr_req(c.output_path) }
         .map_err(|_| invalid("job_config.output_path is NULL or not valid UTF-8"))?;
@@ -194,7 +224,6 @@ pub(crate) unsafe fn job_cfg(
         )));
     }
 
-    // ---- headers ---------------------------------------------------------
     if c.header_count > 512 {
         return Err(invalid(format!(
             "job_config.header_count is {}; at most 512 are accepted",
@@ -238,7 +267,6 @@ pub(crate) unsafe fn job_cfg(
         }
     }
 
-    // ---- credentials -----------------------------------------------------
     // SAFETY: the pointer satisfies this function's documented contract and outlives the call.
     let username = unsafe { cstr_opt(c.username) }
         .map_err(|_| invalid("job_config.username is not valid UTF-8"))?
@@ -263,7 +291,6 @@ pub(crate) unsafe fn job_cfg(
         (u, p, _) => (u, p),
     };
 
-    // ---- proxy -----------------------------------------------------------
     let proxy = if c.proxy.is_null() {
         None
     } else {
@@ -302,7 +329,6 @@ pub(crate) unsafe fn job_cfg(
         }
     };
 
-    // ---- checksum --------------------------------------------------------
     let checksum = match enum_in_range(c.checksum.algorithm, 5, "checksum.algorithm")? {
         0 => None,
         n => {
@@ -331,19 +357,17 @@ pub(crate) unsafe fn job_cfg(
         }
     };
 
-    // ---- everything else -------------------------------------------------
     let priority = enum_in_range(c.priority, 2, "job_config.priority")?;
-    // SAFETY: the pointer satisfies this function's documented contract and outlives the call.
-    let reaches = |off: usize| (unsafe { (p as *const u32).read_unaligned() } as usize) >= off;
+    let reaches = |off: usize| (c.size as usize) >= off;
     let flags_off = std::mem::offset_of!(hydra_job_config_t, reserved1) + 1;
-    let (resume, adaptive) = if reaches(flags_off) {
-        (c.resume != 0, c.adaptive != 0)
+    let (resume, adaptive, auto_start) = if reaches(flags_off) {
+        (c.resume != 0, c.adaptive != 0, c.auto_start != 0)
     } else {
-        (true, engine.adaptive_concurrency)
+        (true, engine.adaptive_concurrency, false)
     };
 
-    Ok((
-        JobCfg {
+    Ok(JobInput {
+        cfg: JobCfg {
             urls,
             headers,
             withheld_headers: Vec::new(),
@@ -367,9 +391,10 @@ pub(crate) unsafe fn job_cfg(
             pieces: None,
             attested_by: None,
         },
-        output.to_string(),
-        Creds { username, password },
-    ))
+        output_path: output.to_string(),
+        creds: Creds { username, password },
+        auto_start,
+    })
 }
 
 #[cfg(test)]

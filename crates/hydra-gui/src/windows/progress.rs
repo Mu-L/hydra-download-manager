@@ -276,17 +276,13 @@ fn completion_tab<'a>(app: &'a App, d: &'a DownloadItem) -> El<'a> {
         check(
             app.cfg.settings.show_complete_dialog,
             tr("Show download complete dialog")
-        ),
+        )
+        .on_toggle(Message::ProgShowCompleteDialog),
         check(
             app.cfg.settings.remove_completed,
             tr("Remove completed downloads from the list")
         )
         .on_toggle(Message::ProgRemoveCompleted),
-        text(tr(
-            "These settings are unavailable when \"Show download complete dialog\" is turned on"
-        ))
-        .size(theme::FONT_SIZE)
-        .color(theme::dim_text(&iced::Theme::Light)),
         check(
             d.shutdown_after,
             tr("Shut down / log off / sleep computer when done")
