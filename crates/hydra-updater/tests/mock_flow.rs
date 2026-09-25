@@ -282,14 +282,30 @@ async fn mock_channel_server(
     stable: &str,
     rc: Option<&str>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    let mut list = vec![(stable, false)];
+    if let Some(rc) = rc {
+        list.insert(0, (rc, true));
+    }
+    mock_channel_server_with((stable, false), &list).await
+}
+
+/// The two check routes with explicit answers: `latest` is what
+/// `/releases/latest` says, `list` (newest first) what `/releases` says.
+async fn mock_channel_server_with(
+    latest: (&str, bool),
+    list: &[(&str, bool)],
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let release = |v: &str, pre: bool| format!("{{\"tag_name\":\"v{v}\",\"prerelease\":{pre}}}");
-    let latest_json = release(stable, false);
-    let list_json = match rc {
-        Some(rc) => format!("[{},{latest_json}]", release(rc, true)),
-        None => format!("[{latest_json}]"),
-    };
+    let latest_json = release(latest.0, latest.1);
+    let list_json = format!(
+        "[{}]",
+        list.iter()
+            .map(|(v, pre)| release(v, *pre))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else {
@@ -362,6 +378,46 @@ async fn beta_channel_offers_the_rc_only_while_it_is_ahead() {
         .await
         .unwrap();
     assert_eq!(beta.version(), "0.2.4");
+    server.abort();
+}
+
+#[tokio::test]
+async fn stable_channel_looks_past_a_candidate_published_as_latest() {
+    let ua = "hydra-test/0.0";
+    // An rc tag published WITHOUT the pre-release flag is what GitHub then
+    // answers `/releases/latest` with. Stable users did not ask for it: the
+    // newest release that is stable by tag and flag is offered instead,
+    // while beta gets the candidate as usual.
+    let (base, server) = mock_channel_server_with(
+        ("1.0.0-rc", false),
+        &[("1.0.0-rc", false), ("0.9.4", false)],
+    )
+    .await;
+    let stable = hya_updater::check_channel_at(&base, "ja7ad/hydra", ua, false)
+        .await
+        .unwrap();
+    assert_eq!(stable.version(), "0.9.4");
+    let beta = hya_updater::check_channel_at(&base, "ja7ad/hydra", ua, true)
+        .await
+        .unwrap();
+    assert_eq!(beta.version(), "1.0.0-rc");
+    server.abort();
+
+    // Nothing stable in the list yet: an error, never the candidate.
+    let (base, server) =
+        mock_channel_server_with(("1.0.0-rc", false), &[("1.0.0-rc", false)]).await;
+    let err = hya_updater::check_channel_at(&base, "ja7ad/hydra", ua, false)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no stable release"), "{err}");
+    server.abort();
+
+    // A repository with no release at all says so in words.
+    let (base, server) = mock_channel_server_with(("0.0.0", false), &[]).await;
+    let err = hya_updater::check_latest_at(&base, "ja7ad/nothing", ua)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "no release published yet");
     server.abort();
 }
 
