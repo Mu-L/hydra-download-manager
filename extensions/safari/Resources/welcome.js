@@ -7,9 +7,11 @@
 //   app  — the WebSocket (or the host) reached a running Hydra: nothing to do.
 //   host — the native messaging host answered but Hydra is closed: also
 //          nothing to do, the first capture starts it.
-//   none — the browser cannot find the host at all: the install step was
-//          skipped or the browser has not restarted since, so the page shows
-//          how to fix it.
+//   none — the browser cannot find the host at all: Hydra has not been
+//          started once since it was installed (the app registers the host
+//          on every launch), or the browser has not restarted since, so the
+//          page shows how to fix it. The install script is only for a
+//          checkout, where there is no packaged app to do the registering.
 //
 // Safari exposes `browser`; Chromium and Firefox expose `chrome`.
 globalThis.chrome ??= globalThis.browser;

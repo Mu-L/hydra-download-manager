@@ -5,12 +5,15 @@
 //
 // Architecture:
 //  - Primary transport: a persistent WebSocket to the app's fixed loopback
-//    port (hydra: 6799/16799), reconnecting with backoff forever. The open
-//    socket doubles as the "app is running" indicator (toolbar shows a gray
-//    X when it is down).
+//    port (hydra: 6799/16799), reconnecting with backoff forever. Its first
+//    frame is `auth` with the app's per-run token; the socket is usable
+//    once the app has agreed, and doubles as the "app is running" indicator
+//    (toolbar shows a gray X when it is down).
 //  - Fallback transport: native messaging through `hydra-host`, which can
 //    LAUNCH the app when it is not running, after which the WebSocket
-//    takes over again.
+//    takes over again — and which is the only party that can read the
+//    token (`ws-token`), so reaching the host is what proves this extension
+//    is Hydra's own.
 //  - Capture: the gates a download passes and the hand-off itself live
 //    here (`offerToHydra`, `decideCapture`). WHEN to ask, and what to do
 //    with the browser's own copy, is the one thing the browsers do not
@@ -180,7 +183,7 @@ function absorbReply(reply) {
 // --------------------------------------------------------------- transport
 
 let ws = null;
-let wsReady = false;
+let wsReady = false; // authenticated: requests may go over it
 let wsPortIdx = 0;
 let reconnectTimer = null;
 let heartbeatTimer = null;
@@ -215,9 +218,11 @@ function wsTeardown() {
   }
 }
 
-function wsScheduleReconnect(delayMs = 4000) {
+/// `keepPort`: the port answered (it refused the token, or dropped a live
+/// socket), so it is the one to dial again rather than the fallback.
+function wsScheduleReconnect(delayMs = 4000, keepPort = false) {
   if (reconnectTimer) return;
-  wsPortIdx++; // next attempt tries the fallback port
+  if (!keepPort) wsPortIdx++; // next attempt tries the fallback port
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     wsConnect();
@@ -226,22 +231,16 @@ function wsScheduleReconnect(delayMs = 4000) {
 
 function wsConnect() {
   if (ws) return;
+  let sock;
   try {
-    ws = new WebSocket(`ws://127.0.0.1:${WS_PORTS[wsPortIdx % WS_PORTS.length]}/`);
+    sock = new WebSocket(`ws://127.0.0.1:${WS_PORTS[wsPortIdx % WS_PORTS.length]}/`);
   } catch {
-    ws = null;
     wsScheduleReconnect();
     return;
   }
-  ws.onopen = () => {
-    wsReady = true;
-    setConnected(true);
-    // Heartbeat: keeps the service worker alive (Chrome extends SW life on
-    // WS traffic) and notices a dead app quickly.
-    heartbeatTimer = setInterval(() => wsRequest({ type: "ping" }, 5000), 20000);
-    wsRequest({ type: "config" }, 5000); // sync capture settings on connect
-  };
-  ws.onmessage = (ev) => {
+  ws = sock;
+  sock.onopen = () => wsAuthenticate(sock);
+  sock.onmessage = (ev) => {
     let reply;
     try {
       reply = JSON.parse(ev.data);
@@ -256,18 +255,88 @@ function wsConnect() {
       p.resolve(reply);
     }
   };
-  ws.onclose = ws.onerror = () => {
+  sock.onclose = sock.onerror = () => {
+    if (ws !== sock) return; // already torn down, or replaced meanwhile
     wsTeardown();
     setConnected(false);
     wsScheduleReconnect();
   };
 }
 
+const HEARTBEAT_MS = 20000;
+const HEARTBEAT_REPLY_MS = 5000;
+// How long to leave the socket alone when the host could not be asked for
+// a token: without the host there is nothing new to say to the app.
+const WS_TOKEN_RETRY_MS = 30000;
+
+/// The first frame on a fresh socket: `auth` with the cached token, or with
+/// none — the extension ids Hydra ships under are admitted without one, and
+/// an older app that predates the handshake answers it like any request. A
+/// refusal means the token is missing or stale (the app restarted), so the
+/// native host is asked for the current one and the socket redialled;
+/// without a host to ask, captures fall back to native messaging as before.
+async function wsAuthenticate(sock) {
+  const { ws_token: cached = null } = await sessionStore().get("ws_token");
+  if (ws !== sock) return;
+  const reply = await wsRequest({ type: "auth", token: cached ?? undefined }, HEARTBEAT_REPLY_MS, sock);
+  if (ws !== sock) return;
+  if (reply && reply.error !== "unauthorized") {
+    wsReady = true;
+    setConnected(true);
+    // Heartbeat: keeps the service worker alive (Chrome extends SW life on
+    // WS traffic) and notices a dead app quickly.
+    heartbeatTimer = setInterval(heartbeat, HEARTBEAT_MS);
+    wsRequest({ type: "config" }, 5000); // sync capture settings on connect
+    retryDeferredCaptures();
+    return;
+  }
+  // The app closes a socket it refused; a silent one is as good as gone.
+  wsTeardown();
+  setConnected(false);
+  if (!reply) return wsScheduleReconnect();
+  await sessionStore().remove("ws_token");
+  const token = await fetchWsToken();
+  wsScheduleReconnect(token ? 200 : WS_TOKEN_RETRY_MS, true);
+}
+
+let wsTokenFetch = null;
+
+/// The app's current WebSocket token, by way of the native host (a process
+/// spawn, so concurrent askers share one). Null when there is no host, or
+/// no app for it to ask.
+function fetchWsToken() {
+  wsTokenFetch ??= native({ type: "ws-token" })
+    .then(async (reply) => {
+      if (!reply?.ok || typeof reply.token !== "string") return null;
+      await sessionStore().set({ ws_token: reply.token });
+      return reply.token;
+    })
+    .finally(() => {
+      wsTokenFetch = null;
+    });
+  return wsTokenFetch;
+}
+
+/// One heartbeat. A socket the OS silently dropped — the machine slept, the
+/// app was killed — looks open from here and reports nothing: every request
+/// on it then times out, and each capture paid the full 8 s before falling
+/// back to the native host. A ping that goes unanswered is that socket, so
+/// it is torn down on the spot and the reconnect loop takes over.
+async function heartbeat() {
+  const sock = ws;
+  const pong = await wsRequest({ type: "ping" }, HEARTBEAT_REPLY_MS);
+  if (pong || ws !== sock) return; // answered, or already replaced meanwhile
+  wsTeardown();
+  setConnected(false);
+  wsScheduleReconnect(1000);
+}
+
 /// Returns the reply, or null when the socket is down / timed out — the
-/// caller then falls back to the native host.
-function wsRequest(msg, timeoutMs = 8000) {
+/// caller then falls back to the native host. `sock` is only given by the
+/// handshake, which speaks before the socket is ready for anyone else.
+function wsRequest(msg, timeoutMs = 8000, sock = wsReady ? ws : null) {
   return new Promise((resolve) => {
-    if (!ws || !wsReady) return resolve(null);
+    if (!sock) return resolve(null);
     const id = reqSeq++;
     const timer = setTimeout(() => {
       pendingReqs.delete(id);
@@ -275,7 +344,7 @@ function wsRequest(msg, timeoutMs = 8000) {
     }, timeoutMs);
     pendingReqs.set(id, { resolve, timer });
     try {
-      ws.send(JSON.stringify({ browser: BROWSER, ...msg, id }));
+      sock.send(JSON.stringify({ browser: BROWSER, ...msg, id }));
     } catch {
       clearTimeout(timer);
       pendingReqs.delete(id);
@@ -559,11 +628,51 @@ async function captureProxy(url) {
 
 // ----------------------------------------------------------------- cookies
 
-async function cookieHeader(url) {
+/// The site (scheme + registrable host) a partitioned cookie is keyed on:
+/// the top-level page the request was made under, as the `topLevelSite` of
+/// a cookie partition key spells it. Null when the page is unknown, in
+/// which case every partition is asked.
+function partitionSite(pageUrl) {
   try {
-    const cookies = await chrome.cookies.getAll({ url });
+    const u = new URL(pageUrl);
+    if (!/^https?:$/.test(u.protocol)) return null;
+    return `${u.protocol}//${u.hostname}`;
+  } catch {
+    return null;
+  }
+}
+
+/// Cookies the plain `getAll({url})` leaves out: those set with the
+/// `Partitioned` attribute (CHIPS) are keyed on the top-level site they
+/// were set under and only come back when a partition is named. A player
+/// embedded on one site and a CDN that answers only with such a cookie is
+/// exactly the case that used to reach Hydra with no cookie at all.
+///
+/// A browser that predates the attribute rejects the unknown property
+/// outright; that is the empty list, never a failed capture.
+async function partitionedCookies(url, pageUrl) {
+  const site = partitionSite(pageUrl);
+  const partitionKey = site ? { topLevelSite: site } : {};
+  try {
+    return (await chrome.cookies.getAll({ url, partitionKey })) || [];
+  } catch {
+    return [];
+  }
+}
+
+async function cookieHeader(url, pageUrl = null) {
+  try {
+    const plain = (await chrome.cookies.getAll({ url })) || [];
+    const seen = new Set();
+    const cookies = [];
+    for (const c of plain.concat(await partitionedCookies(url, pageUrl))) {
+      const pair = `${c.name}=${c.value}`;
+      if (seen.has(pair)) continue;
+      seen.add(pair);
+      cookies.push(pair);
+    }
     if (!cookies.length) return null;
-    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    return cookies.join("; ");
   } catch {
     return null;
   }
@@ -626,7 +735,7 @@ async function sendToHydra(url, extras = {}) {
   return request({
     type: "download",
     url,
-    cookies: await cookieHeader(url),
+    cookies: await cookieHeader(url, extras.referer || extras.tab_url || null),
     user_agent: navigator.userAgent,
     proxy: await captureProxy(url),
     ...extras,
@@ -658,7 +767,73 @@ async function offerToHydra({ url, filename, mime, size, referer }) {
     size: size > 0 ? size : null,
     mime: mime || null,
   });
-  return reply && reply.ok ? null : "Hydra did not take it";
+  if (reply && reply.ok) return null;
+  return /^hydra is starting$/i.test(reply?.error || "") ? HYDRA_STARTING : "Hydra did not take it";
+}
+
+// The native host's answer when it launched the app but the app had not
+// published its socket within the host's budget. Not a refusal: the app is
+// coming up, and the download can be offered again the moment the
+// WebSocket attaches.
+const HYDRA_STARTING = "Hydra is still starting";
+
+// How long a download stays parked for an app that is starting before it is
+// handed back to the browser. Generous: a cold start on a slow disk, with
+// the host's own 20 s already spent, can take this long.
+const DEFERRED_CAPTURE_MS = 60000;
+
+// Parked downloads waiting for the app to come up, id -> when they were
+// parked. In session storage rather than a timer: a service worker that is
+// put to sleep in the meantime takes its timers with it, and a download it
+// parked would then stay paused with nobody left to hand it back.
+async function deferredCaptures() {
+  const { deferred = {} } = await sessionStore().get("deferred");
+  return deferred;
+}
+
+/// Keep `item` parked until the WebSocket attaches (then offer it again) or
+/// the wait runs out (then the browser gets it back).
+async function deferCapture(item) {
+  const deferred = await deferredCaptures();
+  if (item.id in deferred) return;
+  deferred[item.id] = Date.now();
+  await sessionStore().set({ deferred });
+  setTimeout(sweepDeferredCaptures, DEFERRED_CAPTURE_MS + 50);
+}
+
+/// Hand back every parked download whose wait has run out. Runs on the
+/// timer, and on every wake-up of the worker in case the timer did not.
+async function sweepDeferredCaptures() {
+  const deferred = await deferredCaptures();
+  const now = Date.now();
+  let changed = false;
+  for (const [id, since] of Object.entries(deferred)) {
+    if (now - since < DEFERRED_CAPTURE_MS) continue;
+    delete deferred[id];
+    changed = true;
+    console.debug(`hydra: app did not come up in time — download ${id} handed back`);
+    chrome.downloads.resume(Number(id)).catch(() => {});
+  }
+  if (changed) await sessionStore().set({ deferred });
+}
+
+/// Offer every parked download again; called when the socket attaches. One
+/// the user resumed or cancelled in the meantime is theirs and is skipped.
+async function retryDeferredCaptures() {
+  const deferred = await deferredCaptures();
+  const ids = Object.keys(deferred).map(Number);
+  if (!ids.length) return;
+  await sessionStore().set({ deferred: {} });
+  for (const id of ids) {
+    let item;
+    try {
+      [item] = await chrome.downloads.search({ id });
+    } catch {
+      continue;
+    }
+    if (!item || item.state !== "in_progress" || !item.paused) continue;
+    decideCapture(item, true).catch((e) => console.debug(`hydra: retry failed — ${e}`));
+  }
 }
 
 // `parked` says whether the browser's own download is being held for us, and
@@ -700,6 +875,12 @@ async function decideCapture(item, parked) {
       await chrome.downloads.cancel(item.id);
       await chrome.downloads.erase({ id: item.id });
     } catch {}
+  } else if (why === HYDRA_STARTING && parked) {
+    // The host launched the app but it has not published its socket yet.
+    // The download stays parked and is offered again when the socket
+    // attaches; the browser gets it back only if that never happens.
+    console.debug(`hydra: app is starting, holding the download — ${url}`);
+    await deferCapture(item);
   } else {
     // A gate turned it away, or Hydra is unreachable: the browser download
     // continues untouched.
@@ -769,8 +950,10 @@ chrome.runtime.onStartup.addListener(() => {
   installMenus();
   wsConnect();
 });
-// Any service-worker wake-up re-establishes the socket.
+// Any service-worker wake-up re-establishes the socket, and hands back any
+// download a previous incarnation parked for an app that never came up.
 wsConnect();
+sweepDeferredCaptures();
 
 (chrome.contextMenus ?? chrome.menus)?.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === "hydra-link" || info.menuItemId === "hydra-media") {
@@ -801,8 +984,28 @@ wsConnect();
 const HLS_MIME =
   /^(?:application\/(?:vnd\.apple\.mpegurl|x-mpegurl|mpegurl|octet-stream-m3u8)|(?:audio|video)\/(?:x-)?mpegurl)$/i;
 const DASH_MIME = /^(?:application\/dash\+xml|video\/vnd\.mpeg\.dash\.mpd)$/i;
-const HLS_PATH = /\.m3u8(?:$|[?#])/i;
+const HLS_PATH = /\.m3u8?(?:$|[?#])/i;
 const DASH_PATH = /\.mpd(?:$|[?#])/i;
+
+// A response that says nothing about being a manifest and may be one
+// anyway: a playlist served as `text/plain` or `application/octet-stream`
+// from a path with no extension (`/playlist?id=…`), an MPD served as
+// `application/xml`. Only a SMALL one is worth a look — a manifest is
+// kilobytes — and only from a script's own request (`xmlhttprequest`, which
+// is also how a `fetch()` is reported, or `other`), which is how every
+// player asks for one; a navigation to a text file is a page the user is
+// reading.
+const SNIFF_MIME = /^(?:text\/(?:plain|xml)|application\/(?:xml|octet-stream|binary))?$/i;
+const SNIFF_TYPES = new Set(["xmlhttprequest", "other"]);
+const SNIFF_MAX_BYTES = 64 * 1024;
+
+function sniffable(type, mime, size) {
+  return SNIFF_TYPES.has(type) && SNIFF_MIME.test(mime) && size > 0 && size < SNIFF_MAX_BYTES;
+}
+
+// Sniff candidates that were fetched and turned out not to be manifests, so
+// a player polling the same endpoint does not have it fetched on every poll.
+const notManifests = expiringNotes(60000);
 
 // Segment shapes, kept out of the direct-media list. fMP4 segments are
 // served as video/mp4 and are big enough to clear MEDIA_MIN_BYTES, so the
@@ -1157,8 +1360,9 @@ async function enrichHlsMaster(info, pageUrl) {
 
 /// Record a manifest against its tab, replacing any variant entries the
 /// manifest turns out to own.
-async function noteStream(tabId, url, mime, tabUrl) {
+async function noteStream(tabId, url, mime, tabUrl, sniff = false) {
   const key = streamKey(url);
+  if (sniff && notManifests.get(key)) return;
   const list = await tabStreams(tabId);
   const known = list.find((s) => s.key === key);
   if (known) {
@@ -1175,10 +1379,21 @@ async function noteStream(tabId, url, mime, tabUrl) {
   if ((await tabStreamKids(tabId)).includes(key)) return; // a listed master owns it
 
   const text = await fetchManifest(url);
-  const protocol =
-    (text && classifyManifest(text)) ||
-    (HLS_MIME.test(mime) || HLS_PATH.test(url) ? "hls" : DASH_PATH.test(url) ? "dash" : null);
-  if (!protocol) return;
+  // A sniff candidate said nothing about being a manifest, so only its
+  // body may say so; anything announced by type or path is listed even
+  // when it could not be read.
+  const announced = sniff
+    ? null
+    : HLS_MIME.test(mime) || HLS_PATH.test(url)
+      ? "hls"
+      : DASH_MIME.test(mime) || DASH_PATH.test(url)
+        ? "dash"
+        : null;
+  const protocol = (text && classifyManifest(text)) || announced;
+  if (!protocol) {
+    if (sniff) notManifests.set(key);
+    return;
+  }
 
   let info;
   if (!text) {
@@ -1273,7 +1488,7 @@ async function sendStreamToHydra(entry, variant, opts = {}) {
       !entry.live && variant?.bandwidth && entry.duration
         ? Math.round((variant.bandwidth * entry.duration) / 8)
         : null,
-    cookies: await cookieHeader(entry.url),
+    cookies: await cookieHeader(entry.url, entry.pageUrl),
     user_agent: navigator.userAgent,
     // The manifest's proxy, not the variant's: segments are served from the
     // same origin, and one route has to carry the whole recording.
@@ -1318,6 +1533,35 @@ async function refreshBadge(tabId) {
   }
 }
 
+/// The page a response was made for, which is what goes to the origin as
+/// the Referer when the file is handed to Hydra. For a request out of an
+/// iframe that is the FRAME's document, not the tab's: a player embedded on
+/// a blog is served by a CDN that checks for the player's own host, and the
+/// blog's address is a Referer it refuses. `webNavigation.getFrame` knows
+/// the frame's URL when that permission is held; without it, Chromium's
+/// `initiator` (the frame's origin) or Gecko's `documentUrl` still beat the
+/// tab. A top-level request keeps the tab's URL, as before.
+async function pageUrlOf(details) {
+  const http = (u) => (/^https?:/i.test(u || "") ? u : null);
+  if (details.frameId > 0) {
+    if (chrome.webNavigation?.getFrame) {
+      try {
+        const frame = await chrome.webNavigation.getFrame({
+          tabId: details.tabId,
+          frameId: details.frameId,
+        });
+        if (http(frame?.url)) return frame.url;
+      } catch {
+        // The frame is gone, or the permission is not held after all.
+      }
+    }
+    const own = http(details.documentUrl) || http(details.initiator);
+    if (own) return own;
+  }
+  const tab = await chrome.tabs.get(details.tabId).catch(() => null);
+  return http(tab?.url) || http(details.initiator) || null;
+}
+
 chrome.webRequest?.onResponseStarted.addListener(
   (details) => {
     if (details.tabId < 0) return;
@@ -1326,13 +1570,18 @@ chrome.webRequest?.onResponseStarted.addListener(
     );
     const mime = (headers["content-type"] || "").split(";")[0].trim();
     const url = details.url.split("#")[0];
+    const size = parseInt(headers["content-length"] || "0", 10) || 0;
 
     // A manifest first: its MIME is often a generic text type, so the path
-    // gets a vote too.
-    if (HLS_MIME.test(mime) || DASH_MIME.test(mime) || HLS_PATH.test(url) || DASH_PATH.test(url)) {
+    // gets a vote too — and a small text or octet-stream body a script
+    // asked for gets read, because a playlist at `/playlist?id=…` served
+    // as text/plain announces itself in no other way.
+    const announced =
+      HLS_MIME.test(mime) || DASH_MIME.test(mime) || HLS_PATH.test(url) || DASH_PATH.test(url);
+    if (announced || sniffable(details.type, mime, size)) {
       withTab(details.tabId, async () => {
-        const tab = await chrome.tabs.get(details.tabId).catch(() => null);
-        await noteStream(details.tabId, url, mime, tab?.url || details.initiator || null);
+        const page = await pageUrlOf(details);
+        await noteStream(details.tabId, url, mime, page, !announced);
         await refreshBadge(details.tabId);
       });
       return;
@@ -1344,7 +1593,6 @@ chrome.webRequest?.onResponseStarted.addListener(
     // there are hundreds of them; the manifest already stands for the lot.
     if (SEGMENT_MIME.test(mime) || SEGMENT_PATH.test(url)) return;
 
-    const size = parseInt(headers["content-length"] || "0", 10) || 0;
     // Range replies of streaming players still reveal the full size here.
     const total = /\/(\d+)$/.exec(headers["content-range"] || "");
     const fullSize = total ? parseInt(total[1], 10) : size;
@@ -1369,7 +1617,7 @@ chrome.webRequest?.onResponseStarted.addListener(
       // path carries no extension, which is most streaming endpoints — so an
       // MP3 offered itself as "MP4 file".
       const kind = MIME_EXT[mime.split(";")[0].trim().toLowerCase()] || null;
-      list.push({ url, mime, kind, size: fullSize || null });
+      list.push({ url, mime, kind, size: fullSize || null, pageUrl: await pageUrlOf(details) });
       if (list.length > MEDIA_PER_TAB) list.shift();
       await sessionStore().set({ [key]: list });
       await refreshBadge(details.tabId);
@@ -1532,7 +1780,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tab = id != null ? await chrome.tabs.get(id).catch(() => null) : null;
         sendResponse(
           await sendToHydra(msg.url, {
-            referer: msg.referer || null,
+            // The frame the file was loaded from outranks the popup's tab
+            // URL: for an embedded player that is the page the CDN expects.
+            referer: hit?.pageUrl || msg.referer || null,
             filename: hit ? mediaName(msg.url, tab?.title, hit.kind) : null,
           })
         );
