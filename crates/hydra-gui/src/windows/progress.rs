@@ -366,6 +366,20 @@ fn marquee<'a>(sweep: f32) -> El<'a> {
         .into()
 }
 
+/// The band behind the connection rows and the scanner log. It fills the
+/// whole viewport, so a window grown past the padded rows stays one band.
+fn row_band(t: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(if theme::is_dark(t) {
+            iced::Color::from_rgb8(0x33, 0x2E, 0x38)
+        } else {
+            iced::Color::from_rgb8(0xC9, 0xBF, 0xC9)
+        })),
+        text_color: Some(theme::text_color(t)),
+        ..Default::default()
+    }
+}
+
 /// The scanner's console output, in the box the per-connection table uses.
 /// Anchored to the bottom so the newest line is the one on screen.
 fn scan_log(st: &ScanState) -> El<'_> {
@@ -387,25 +401,21 @@ fn scan_log(st: &ScanState) -> El<'_> {
                 .padding([1, 6])
                 .height(ROW_H),
             )
-            .width(Length::Fill)
-            .style(|t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(if theme::is_dark(t) {
-                    iced::Color::from_rgb8(0x33, 0x2E, 0x38)
-                } else {
-                    iced::Color::from_rgb8(0xC9, 0xBF, 0xC9)
-                })),
-                text_color: Some(theme::text_color(t)),
-                ..Default::default()
-            }),
+            .width(Length::Fill),
         );
     }
     container(
-        crate::ui::scroll(rows)
-            .height(ROW_H * VISIBLE as f32)
-            .width(Length::Fill)
-            .anchor_bottom(),
+        container(
+            crate::ui::scroll(rows)
+                .height(Length::Fill)
+                .width(Length::Fill)
+                .anchor_bottom(),
+        )
+        .height(Length::Fill)
+        .style(row_band),
     )
     .width(Length::Fill)
+    .height(Length::Fill)
     .style(theme::panel)
     .into()
 }
@@ -456,9 +466,8 @@ fn conn_table<'a>(d: &'a DownloadItem) -> El<'a> {
         cell(tr("Info"), Length::Fill).padding([2, 6]),
     ]
     .spacing(0);
-    // Exactly 8 rows are visible (blank band rows pad shorter transfers so
-    // the box looks identical for 4 vs 8 connections); more connections
-    // scroll inside the same viewport instead of growing the box.
+    // Blank rows pad shorter transfers to 8 so the box looks identical for 4
+    // vs 8 connections; more connections scroll inside the viewport.
     const ROW_H: f32 = 20.0;
     const VISIBLE: usize = 8;
     let mut rows = column![].width(Length::Fill);
@@ -466,44 +475,38 @@ fn conn_table<'a>(d: &'a DownloadItem) -> El<'a> {
     let blank = crate::model::ConnRow::default();
     for i in 0..n_rows {
         let c = d.conns.get(i).unwrap_or(&blank);
-        rows = rows.push(
-            container(
-                row![
-                    cell(format!("{}", i + 1), CONN_N_W).padding([1, 6]),
-                    cell(
-                        if c.downloaded > 0 {
-                            fmt::size3(c.downloaded)
-                        } else {
-                            String::new()
-                        },
-                        CONN_SIZE_W,
-                    )
-                    .padding([1, 6]),
-                    cell(c.info.clone(), Length::Fill).padding([1, 6]),
-                ]
-                .spacing(0)
-                .height(ROW_H),
-            )
-            .style(|t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(if theme::is_dark(t) {
-                    iced::Color::from_rgb8(0x33, 0x2E, 0x38)
-                } else {
-                    iced::Color::from_rgb8(0xC9, 0xBF, 0xC9)
-                })),
-                text_color: Some(theme::text_color(t)),
-                ..Default::default()
-            }),
-        );
+        rows = rows.push(container(
+            row![
+                cell(format!("{}", i + 1), CONN_N_W).padding([1, 6]),
+                cell(
+                    if c.downloaded > 0 {
+                        fmt::size3(c.downloaded)
+                    } else {
+                        String::new()
+                    },
+                    CONN_SIZE_W,
+                )
+                .padding([1, 6]),
+                cell(c.info.clone(), Length::Fill).padding([1, 6]),
+            ]
+            .spacing(0)
+            .height(ROW_H),
+        ));
     }
-    // The viewport is exactly VISIBLE rows tall — the dialog ends right after
-    // the table instead of stretching an empty band below the connections.
+    // The viewport takes whatever height the window leaves it: the default
+    // window is sized for 8 rows, a resized one shows more.
     container(column![
         header,
-        crate::ui::scroll(rows)
-            .height(ROW_H * VISIBLE as f32)
-            .width(Length::Fill),
+        container(
+            crate::ui::scroll(rows)
+                .height(Length::Fill)
+                .width(Length::Fill)
+        )
+        .height(Length::Fill)
+        .style(row_band),
     ])
     .width(Length::Fill)
+    .height(Length::Fill)
     .style(theme::panel)
     .into()
 }
