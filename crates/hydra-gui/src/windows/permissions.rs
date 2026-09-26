@@ -36,10 +36,7 @@ pub fn probe(download_dir: &str, autostart_expected: bool) -> PermStatus {
         .is_ok();
 
     #[cfg(target_os = "macos")]
-    let full_disk = dirs::home_dir().map(|h| {
-        // Readable only with Full Disk Access.
-        std::fs::File::open(h.join("Library/Application Support/com.apple.TCC/TCC.db")).is_ok()
-    });
+    let full_disk = full_disk_access();
     #[cfg(not(target_os = "macos"))]
     let full_disk = None;
 
@@ -56,6 +53,29 @@ pub fn probe(download_dir: &str, autostart_expected: bool) -> PermStatus {
         full_disk,
         login_item,
     }
+}
+
+/// Opens the TCC databases, which only Full Disk Access can read. macOS 27
+/// dropped the per-user copy, so a missing file is skipped rather than
+/// reported as a refusal.
+#[cfg(target_os = "macos")]
+fn full_disk_access() -> Option<bool> {
+    let system = std::path::PathBuf::from("/Library/Application Support/com.apple.TCC/TCC.db");
+    let user = dirs::home_dir().map(|h| h.join("Library/Application Support/com.apple.TCC/TCC.db"));
+    let opens = std::iter::once(system)
+        .chain(user)
+        .map(|path| std::fs::File::open(path).map(drop));
+    access_verdict(opens)
+}
+
+/// The first probe that exists decides; `None` when none of them exist.
+#[cfg(any(target_os = "macos", test))]
+fn access_verdict(opens: impl IntoIterator<Item = std::io::Result<()>>) -> Option<bool> {
+    opens.into_iter().find_map(|open| match open {
+        Ok(()) => Some(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(false),
+    })
 }
 
 fn status_dot<'a>(ok: Option<bool>) -> El<'a> {
@@ -192,4 +212,36 @@ pub fn view(app: &App) -> El<'_> {
     .height(Length::Fill)
     .style(theme::window)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::access_verdict;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn readable_database_means_granted() {
+        assert_eq!(access_verdict([Ok(())]), Some(true));
+    }
+
+    #[test]
+    fn missing_database_falls_through_to_the_next() {
+        let opens = [Err(Error::from(ErrorKind::NotFound)), Ok(())];
+        assert_eq!(access_verdict(opens), Some(true));
+    }
+
+    #[test]
+    fn refused_database_means_denied() {
+        let opens = [Err(Error::from(ErrorKind::PermissionDenied)), Ok(())];
+        assert_eq!(access_verdict(opens), Some(false));
+    }
+
+    #[test]
+    fn no_database_at_all_is_unknown_not_denied() {
+        let opens = [
+            Err(Error::from(ErrorKind::NotFound)),
+            Err(Error::from(ErrorKind::NotFound)),
+        ];
+        assert_eq!(access_verdict(opens), None);
+    }
 }
