@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+## [1.0.1] - 2026-09-26
+
+### Fixed
+
+- **Store-Installed Chromium Extensions Can't Reach Hydra (`hydra-gui`, packaging)**:
+  - Fixed extensions installed from the Chrome Web Store, Edge Add-ons or Opera add-ons failing to connect to the desktop app, because Hydra only trusted the development extension id and not the ids the stores sign with.
+  - Added the store ids to the native-host manifests written by the app, the Windows installer, the macOS `.dmg` and `.pkg`, the `.deb`, `.rpm`, AUR and AppImage packages and the install scripts, so the extension connects even before the app has been started once.
+- **Launch at Startup on macOS 13 and Later (`hydra-gui`)**:
+  - Fixed *Launch Hydra on startup* by registering the app through `SMAppService`, so it appears under System Settings ▸ General ▸ Login Items ▸ *Open at Login* and starts at login again. The LaunchAgent that earlier versions wrote is removed, so it can't start a second copy.
+  - Left the item alone once it is switched off in System Settings instead of re-registering it on every launch. A login launch on macOS 13+ opens the window even when *minimized* is set, because Open at Login items can't take arguments; macOS 11–12 still use the LaunchAgent and still start minimized.
+- **Full Disk Access Shown as Missing on macOS 27 (`hydra-gui`)**:
+  - Fixed the permissions guide reporting Full Disk Access as not granted on macOS 27, which no longer has the per-user TCC database it checked. It now checks the system database first, and shows the status as unknown rather than denied when neither database exists.
+
+---
+
 ## [1.0.0] - 2026-09-25
 
 ### Added
