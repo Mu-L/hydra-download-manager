@@ -101,11 +101,15 @@ fn write_flatpak_wrapper(dir: &Path) -> Option<PathBuf> {
 
 /// The Chromium extension ids Hydra answers to: the dev build (derived from
 /// the `key` pinned in `extensions/chrome/manifest.json`; see
-/// `scripts/build-extensions.sh`) and the Chrome Web Store listing, which
-/// signs with the store's own key and so gets an id of its own.
-pub const CHROMIUM_EXT_IDS: [&str; 2] = [
+/// `scripts/build-extensions.sh`), then the Chrome Web Store, Edge Add-ons
+/// and Opera add-ons listings, each of which signs with its store's own key
+/// and so gets an id of its own. The packaged manifests under `packaging/`
+/// and `scripts/` repeat the store ids.
+pub const CHROMIUM_EXT_IDS: [&str; 4] = [
     "jpnonmbbkjdpeebdhkjoliklfhkdcomj",
-    "hcjpgdepggimagiehiampmgamlfkpbhh",
+    "oieelfilllghmbnhofajpgpmmilfihmo",
+    "obemipfpeenmhkdpkobdkeedhdakaoai",
+    "hcmgiggmiblkfgkndbjkfonlhbmllonb",
 ];
 
 /// Firefox allow-lists by add-on id, not by an extension origin. Mirrors
@@ -561,6 +565,31 @@ mod tests {
         assert!(!m.contains("allowed_extensions"));
         // Must parse: a browser silently ignores a malformed manifest.
         serde_json::from_str::<serde_json::Value>(&m).unwrap();
+    }
+
+    /// Installers write their own manifest before the app first runs, and a
+    /// system-wide one is all a browser finds for a user who never started
+    /// it, so each must allow the store listings the app itself does.
+    #[test]
+    fn packaged_manifests_allow_every_store_listing() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for file in [
+            "packaging/debian/com.hydra.host.chrome.json",
+            "packaging/aur-bin/PKGBUILD",
+            "packaging/rpm/hydra.spec",
+            "scripts/install-native-host.sh",
+            "scripts/install-native-host.ps1",
+            "scripts/package-appimage.sh",
+            "scripts/package-linux.sh",
+            "scripts/package-macos-dmg.sh",
+            "scripts/package-macos-pkg.sh",
+            "scripts/windows/hydra-installer.nsi",
+        ] {
+            let body = std::fs::read_to_string(repo.join(file)).unwrap();
+            for id in &CHROMIUM_EXT_IDS[1..] {
+                assert!(body.contains(id), "{file} does not allow {id}");
+            }
+        }
     }
 
     #[test]

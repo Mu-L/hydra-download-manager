@@ -125,7 +125,12 @@ write_chromium_manifest() { # <out.json>
   "description": "Hydra Download Manager native host",
   "path": "/usr/bin/hydra-host",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://$EXT_ID/"]
+  "allowed_origins": [
+    "chrome-extension://$EXT_ID/",
+    "chrome-extension://oieelfilllghmbnhofajpgpmmilfihmo/",
+    "chrome-extension://obemipfpeenmhkdpkobdkeedhdakaoai/",
+    "chrome-extension://hcmgiggmiblkfgkndbjkfonlhbmllonb/"
+  ]
 }
 EOF
 }
