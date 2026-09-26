@@ -1814,6 +1814,20 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// An extension installed from a listing this page links to must be one
+    /// the native host allow-lists and the WebSocket trusts; a mismatch left
+    /// every Web Store install unable to reach the app (#262).
+    #[test]
+    fn every_chromium_store_listing_is_an_allowed_extension() {
+        for url in [CHROME_STORE, EDGE_STORE] {
+            let id = url.rsplit('/').next().unwrap();
+            assert!(
+                crate::nmhost::CHROMIUM_EXT_IDS.contains(&id),
+                "{id} from {url} is not in nmhost::CHROMIUM_EXT_IDS"
+            );
+        }
+    }
+
     /// Every page belongs to exactly one group. A page listed twice would draw
     /// under whichever group `group_of` found first; a page listed nowhere
     /// would be unreachable, and `view` would silently fall back to General

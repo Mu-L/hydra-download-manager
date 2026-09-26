@@ -93,7 +93,12 @@ EOF
   "description": "Hydra Download Manager native host",
   "path": "/usr/bin/hydra-host",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://jpnonmbbkjdpeebdhkjoliklfhkdcomj/"]
+  "allowed_origins": [
+    "chrome-extension://jpnonmbbkjdpeebdhkjoliklfhkdcomj/",
+    "chrome-extension://oieelfilllghmbnhofajpgpmmilfihmo/",
+    "chrome-extension://obemipfpeenmhkdpkobdkeedhdakaoai/",
+    "chrome-extension://hcmgiggmiblkfgkndbjkfonlhbmllonb/"
+  ]
 }
 EOF
   done

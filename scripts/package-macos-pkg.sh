@@ -120,7 +120,7 @@ for root in "Google/Chrome" "Chromium" "Microsoft Edge" \
             "BraveSoftware/Brave-Browser" "Vivaldi" "Arc/User Data"; do
   [ -d "$AS/$root" ] || continue
   write_manifest "$AS/$root/NativeMessagingHosts" \
-    "\"allowed_origins\": [\"chrome-extension://@EXT_ID@/\"]"
+    "\"allowed_origins\": [\"chrome-extension://@EXT_ID@/\", \"chrome-extension://oieelfilllghmbnhofajpgpmmilfihmo/\", \"chrome-extension://obemipfpeenmhkdpkobdkeedhdakaoai/\", \"chrome-extension://hcmgiggmiblkfgkndbjkfonlhbmllonb/\"]"
 done
 for app in Firefox LibreWolf; do
   [ -d "/Applications/$app.app" ] || continue

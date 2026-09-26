@@ -285,7 +285,12 @@ HOSTEOF
   "description": "Hydra Download Manager native host",
   "path": "$DATA/hydra-host",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://$HYDRA_EXT_ID/"]
+  "allowed_origins": [
+    "chrome-extension://$HYDRA_EXT_ID/",
+    "chrome-extension://oieelfilllghmbnhofajpgpmmilfihmo/",
+    "chrome-extension://obemipfpeenmhkdpkobdkeedhdakaoai/",
+    "chrome-extension://hcmgiggmiblkfgkndbjkfonlhbmllonb/"
+  ]
 }
 MANIFESTEOF
   done

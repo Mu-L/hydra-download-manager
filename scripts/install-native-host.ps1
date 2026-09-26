@@ -63,7 +63,12 @@ $chromeManifest = Join-Path $OutDir "$HostName.json"
   "description": "Hydra Download Manager native host",
   "path": "$escaped",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://$ExtId/"]
+  "allowed_origins": [
+    "chrome-extension://$ExtId/",
+    "chrome-extension://oieelfilllghmbnhofajpgpmmilfihmo/",
+    "chrome-extension://obemipfpeenmhkdpkobdkeedhdakaoai/",
+    "chrome-extension://hcmgiggmiblkfgkndbjkfonlhbmllonb/"
+  ]
 }
 "@ | Set-Content -Encoding UTF8 $chromeManifest
 

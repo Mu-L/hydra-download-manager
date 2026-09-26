@@ -57,6 +57,11 @@ SetCompressor /SOLID lzma
 ; drift as long as the key stays pinned. Recompute if the key ever changes:
 ;   python3 -c "import json,hashlib,base64;k=json.load(open('extensions/chrome/manifest.json'))['key'];h=hashlib.sha256(base64.b64decode(k)).digest()[:16];print(''.join(chr(97+(b>>4))+chr(97+(b&15)) for b in h))"
 !define CHROME_EXT_ID  "jpnonmbbkjdpeebdhkjoliklfhkdcomj"
+; The Chrome Web Store, Edge Add-ons and Opera add-ons sign with their own keys, so their
+; listings get ids of their own (mirrors nmhost::CHROMIUM_EXT_IDS).
+!define CHROME_STORE_EXT_ID "oieelfilllghmbnhofajpgpmmilfihmo"
+!define EDGE_STORE_EXT_ID   "obemipfpeenmhkdpkobdkeedhdakaoai"
+!define OPERA_STORE_EXT_ID  "hcmgiggmiblkfgkndbjkfonlhbmllonb"
 !define FIREFOX_EXT_ID "hydra@ja7ad.github.io"
 
 !ifndef VERSION
@@ -232,7 +237,12 @@ Section "Browser IPC Host" SEC_HOST
   FileWrite $0 '  "description": "Hydra Download Manager native host",$\r$\n'
   FileWrite $0 '  "path": "$1",$\r$\n'
   FileWrite $0 '  "type": "stdio",$\r$\n'
-  FileWrite $0 '  "allowed_origins": ["chrome-extension://${CHROME_EXT_ID}/"]$\r$\n'
+  FileWrite $0 '  "allowed_origins": [$\r$\n'
+  FileWrite $0 '    "chrome-extension://${CHROME_EXT_ID}/",$\r$\n'
+  FileWrite $0 '    "chrome-extension://${CHROME_STORE_EXT_ID}/",$\r$\n'
+  FileWrite $0 '    "chrome-extension://${EDGE_STORE_EXT_ID}/",$\r$\n'
+  FileWrite $0 '    "chrome-extension://${OPERA_STORE_EXT_ID}/"$\r$\n'
+  FileWrite $0 '  ]$\r$\n'
   FileWrite $0 '}$\r$\n'
   FileClose $0
 

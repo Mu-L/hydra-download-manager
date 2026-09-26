@@ -119,7 +119,12 @@ cat > %{buildroot}%{_sysconfdir}/opt/chrome/native-messaging-hosts/com.hydra.hos
   "description": "Hydra Download Manager native host",
   "path": "/usr/bin/hydra-host",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://jpnonmbbkjdpeebdhkjoliklfhkdcomj/"]
+  "allowed_origins": [
+    "chrome-extension://jpnonmbbkjdpeebdhkjoliklfhkdcomj/",
+    "chrome-extension://oieelfilllghmbnhofajpgpmmilfihmo/",
+    "chrome-extension://obemipfpeenmhkdpkobdkeedhdakaoai/",
+    "chrome-extension://hcmgiggmiblkfgkndbjkfonlhbmllonb/"
+  ]
 }
 EOF
 cp %{buildroot}%{_sysconfdir}/opt/chrome/native-messaging-hosts/com.hydra.host.json %{buildroot}%{_sysconfdir}/chromium/native-messaging-hosts/com.hydra.host.json

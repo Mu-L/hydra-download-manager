@@ -78,7 +78,12 @@ for root in "Google/Chrome" "Chromium" "Microsoft Edge" \\
   "description": "Hydra Download Manager native host",
   "path": "\$HOST_BIN",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://$EXT_ID/"]
+  "allowed_origins": [
+    "chrome-extension://$EXT_ID/",
+    "chrome-extension://oieelfilllghmbnhofajpgpmmilfihmo/",
+    "chrome-extension://obemipfpeenmhkdpkobdkeedhdakaoai/",
+    "chrome-extension://hcmgiggmiblkfgkndbjkfonlhbmllonb/"
+  ]
 }
 MANIFEST
   echo "installed: \$root"
