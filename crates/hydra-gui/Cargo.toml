@@ -139,6 +139,13 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSGraphics",
 ] }
 
+objc2-service-management = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "objc2-foundation",
+    "SMAppService",
+] }
+
 # System light/dark detection, on every platform the GUI ships a desktop
 # for. Two readers: the tray glyph — white on dark panels, black on light,
 # since Windows has no template-icon mechanism — and View > Theme > System
