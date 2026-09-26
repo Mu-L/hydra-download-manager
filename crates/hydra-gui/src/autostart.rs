@@ -3,9 +3,11 @@
 
 //! "Launch Hydra on startup": registers/unregisters the app as a login item.
 //!
-//! macOS: a LaunchAgent plist (appears under System Settings > General >
-//! Login Items as an allowed background item; no extra permission dialogs
-//! required). Linux: an XDG autostart entry. Windows: a value under
+//! macOS 13+: `SMAppService.mainApp`, listed under System Settings > General >
+//! Login Items > Open at Login. It takes no arguments, so a login launch there
+//! opens the window whatever `minimized` says. macOS 11–12: a LaunchAgent
+//! plist, which can carry `--minimized`. Linux: an XDG autostart entry.
+//! Windows: a value under
 //! `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — which launches
 //! the exe directly (no console flash, unlike the Startup-folder .cmd
 //! shipped before 0.2.x) and lets Task Manager's
@@ -37,12 +39,7 @@ fn exe() -> Option<String> {
 /// nothing rather than write a dead entry.
 #[cfg(target_os = "macos")]
 fn stable_bundle_exe(cur: PathBuf) -> Option<PathBuf> {
-    let text = cur.to_string_lossy();
-    let transient = text.contains("/AppTranslocation/")
-        || text.starts_with("/Volumes/")
-        || text.starts_with("/private/var/folders/")
-        || text.starts_with("/var/folders/");
-    if !transient {
+    if !is_transient(&cur) {
         return Some(cur);
     }
     let comps: Vec<_> = cur.components().collect();
@@ -71,6 +68,15 @@ fn stable_bundle_exe(cur: PathBuf) -> Option<PathBuf> {
         cur.display()
     ));
     None
+}
+
+#[cfg(target_os = "macos")]
+fn is_transient(exe: &std::path::Path) -> bool {
+    let text = exe.to_string_lossy();
+    text.contains("/AppTranslocation/")
+        || text.starts_with("/Volumes/")
+        || text.starts_with("/private/var/folders/")
+        || text.starts_with("/var/folders/")
 }
 
 #[cfg(target_os = "macos")]
@@ -157,8 +163,104 @@ fn apply_platform(enabled: bool, minimized: bool) {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 fn apply_platform(enabled: bool, minimized: bool) {
+    if objc2::available!(macos = 13.0) {
+        remove_launch_agent();
+        main_app::apply(enabled);
+    } else {
+        apply_entry(enabled, minimized);
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn apply_platform(enabled: bool, minimized: bool) {
+    apply_entry(enabled, minimized);
+}
+
+/// The LaunchAgent older versions wrote would start a second copy next to
+/// the Open at Login item.
+#[cfg(target_os = "macos")]
+fn remove_launch_agent() {
+    let Some(path) = entry_path() else { return };
+    if path.exists() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => crate::log::info("legacy LaunchAgent login item removed"),
+            Err(e) => crate::log::warn(&format!("legacy LaunchAgent remove failed: {e}")),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod main_app {
+    use objc2_service_management::{SMAppService, SMAppServiceStatus};
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Change {
+        Register,
+        Unregister,
+    }
+
+    /// A disabled-by-user item reports `RequiresApproval`; registering it
+    /// again only fails, and the switch in System Settings is theirs.
+    pub(super) fn change(enabled: bool, status: SMAppServiceStatus) -> Option<Change> {
+        match (enabled, status) {
+            (true, SMAppServiceStatus::NotRegistered | SMAppServiceStatus::NotFound) => {
+                Some(Change::Register)
+            }
+            (false, SMAppServiceStatus::Enabled | SMAppServiceStatus::RequiresApproval) => {
+                Some(Change::Unregister)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn apply(enabled: bool) {
+        // SAFETY: class method with no arguments, available on macOS 13+,
+        // which the caller has checked.
+        let service = unsafe { SMAppService::mainAppService() };
+        // SAFETY: plain property read on a live service object.
+        let status = unsafe { service.status() };
+        match change(enabled, status) {
+            Some(Change::Register) => {
+                let exe = std::env::current_exe().unwrap_or_default();
+                if super::is_transient(&exe) {
+                    crate::log::warn(&format!(
+                        "login item: running from transient {}; not registered",
+                        exe.display()
+                    ));
+                    return;
+                }
+                // SAFETY: registers the running bundle; no arguments.
+                match unsafe { service.registerAndReturnError() } {
+                    Ok(()) => crate::log::info("login item registered (Open at Login)"),
+                    Err(e) => crate::log::warn(&format!("login item register failed: {e}")),
+                }
+            }
+            Some(Change::Unregister) => {
+                // SAFETY: as above.
+                match unsafe { service.unregisterAndReturnError() } {
+                    Ok(()) => crate::log::info("login item unregistered"),
+                    Err(e) => crate::log::warn(&format!("login item unregister failed: {e}")),
+                }
+            }
+            None if enabled && status == SMAppServiceStatus::RequiresApproval => {
+                crate::log::info("login item switched off in System Settings; left as is");
+            }
+            None => {}
+        }
+    }
+
+    pub(super) fn is_enabled() -> bool {
+        // SAFETY: as in `apply`.
+        unsafe { SMAppService::mainAppService().status() == SMAppServiceStatus::Enabled }
+    }
+}
+
+/// A login entry that is a file: the pre-13 macOS LaunchAgent, or the XDG
+/// autostart entry.
+#[cfg(not(target_os = "windows"))]
+fn apply_entry(enabled: bool, minimized: bool) {
     let Some(path) = entry_path() else { return };
     if !enabled {
         // On Linux the deb/rpm packages ship /etc/xdg/autostart/hydra.desktop,
@@ -246,6 +348,9 @@ pub(crate) fn unix_desktop_entry_content(exe: &str, minimized: bool) -> String {
 /// still exists. Used by the permissions guide.
 #[cfg(target_os = "macos")]
 pub fn is_registered() -> bool {
+    if objc2::available!(macos = 13.0) {
+        return main_app::is_enabled();
+    }
     let Some(path) = entry_path() else {
         return false;
     };
@@ -292,6 +397,38 @@ mod tests {
         ] {
             assert_eq!(stable_bundle_exe(PathBuf::from(p)), None, "{p}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn open_at_login_follows_the_setting_but_not_over_a_user_switch_off() {
+        use super::main_app::{change, Change};
+        use objc2_service_management::SMAppServiceStatus as S;
+
+        assert_eq!(change(true, S::NotRegistered), Some(Change::Register));
+        assert_eq!(change(true, S::NotFound), Some(Change::Register));
+        assert_eq!(change(true, S::Enabled), None);
+        assert_eq!(change(true, S::RequiresApproval), None);
+
+        assert_eq!(change(false, S::Enabled), Some(Change::Unregister));
+        assert_eq!(change(false, S::RequiresApproval), Some(Change::Unregister));
+        assert_eq!(change(false, S::NotRegistered), None);
+        assert_eq!(change(false, S::NotFound), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dmg_and_translocated_launches_are_transient() {
+        use std::path::Path;
+        assert!(super::is_transient(Path::new(
+            "/private/var/folders/ab/T/AppTranslocation/1/d/Hydra.app/Contents/MacOS/Hydra"
+        )));
+        assert!(super::is_transient(Path::new(
+            "/Volumes/Hydra/Hydra.app/Contents/MacOS/Hydra"
+        )));
+        assert!(!super::is_transient(Path::new(
+            "/Applications/Hydra.app/Contents/MacOS/Hydra"
+        )));
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
