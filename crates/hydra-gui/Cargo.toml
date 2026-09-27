@@ -47,6 +47,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `config.toml` in ~/.config/hydra (or %APPDATA%\hydra): user-editable
 # configuration; an unparsable file falls back to defaults instead of failing.
 toml = "1"
+# Compresses the File > Export settings file (.hydata). Already in the graph
+# through hya-updater.
+flate2 = "1"
 # "Open" / "Open folder" on completed downloads, delegated to the OS.
 open = "5"
 # Shut down / log off the machine when a queue or download finishes.

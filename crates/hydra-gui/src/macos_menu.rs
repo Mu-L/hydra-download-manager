@@ -119,8 +119,7 @@ pub fn reinstall(
             MenuAction::AddBatchFile,
         ),
         &PredefinedMenuItem::separator(),
-        &item("Export", MenuAction::ExportList),
-        &item("Import", MenuAction::ImportList),
+        &item("Export download URLs", MenuAction::ExportUrls),
     ]);
     let _ = menu.append(&tasks);
 
@@ -130,6 +129,9 @@ pub fn reinstall(
         &item("Remove", MenuAction::Remove),
         &item("Download Now", MenuAction::DownloadNow),
         &item("Redownload", MenuAction::Redownload),
+        &PredefinedMenuItem::separator(),
+        &item("Export settings", MenuAction::ExportSettings),
+        &item("Import settings", MenuAction::ImportSettings),
     ]);
     let _ = menu.append(&file);
 

@@ -17,6 +17,7 @@ mod extbus;
 mod files;
 mod fmt;
 mod font;
+mod hydata;
 mod i18n;
 mod icons;
 #[cfg(target_os = "linux")]

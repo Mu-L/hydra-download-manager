@@ -153,8 +153,7 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
             ),
             Entry::disabled(tr("Run site grabber")),
             Entry::disabled(tr("Show drop target")).sep(),
-            Entry::item(tr("Export"), MenuAction::ExportList).sep(),
-            Entry::item(tr("Import"), MenuAction::ImportList),
+            Entry::item(tr("Export download URLs"), MenuAction::ExportUrls).sep(),
             Entry::item(tr("Exit"), MenuAction::Exit).sep(),
         ],
         MenuBarKind::File => vec![
@@ -174,6 +173,8 @@ pub fn entries(kind: MenuBarKind, app: &App) -> Vec<Entry> {
                 enabled: sel.is_some(),
                 ..Entry::item(tr("Redownload"), MenuAction::Redownload)
             },
+            Entry::item(tr("Export settings"), MenuAction::ExportSettings).sep(),
+            Entry::item(tr("Import settings"), MenuAction::ImportSettings),
         ],
         MenuBarKind::Downloads => {
             let queues: Vec<Entry> = app

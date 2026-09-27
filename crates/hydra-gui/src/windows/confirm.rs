@@ -76,6 +76,15 @@ pub fn view(app: &App) -> El<'_> {
             tr("The interface font for this language applies the next time Hydra starts."),
             false,
         ),
+        Some(ConfirmKind::SettingsImported) => (tr("Settings imported."), false),
+        Some(ConfirmKind::SettingsExportFailed(e)) => (
+            format!("{}\n\n{e}", tr("The settings could not be exported.")),
+            false,
+        ),
+        Some(ConfirmKind::SettingsImportFailed(e)) => (
+            format!("{}\n\n{e}", tr("The settings could not be imported.")),
+            false,
+        ),
         Some(ConfirmKind::MoveFailed(e)) => (
             format!("{}\n\n{e}", tr("The file could not be moved.")),
             false,
@@ -218,7 +227,9 @@ pub fn view(app: &App) -> El<'_> {
 
     // Good news gets the info bubble; everything else warns.
     let icon = match &app.confirm {
-        Some(ConfirmKind::UpToDate) | Some(ConfirmKind::FontNeedsRestart) => icons::info(),
+        Some(
+            ConfirmKind::UpToDate | ConfirmKind::FontNeedsRestart | ConfirmKind::SettingsImported,
+        ) => icons::info(),
         _ => icons::warning(),
     };
     container(
