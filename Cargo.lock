@@ -2165,6 +2165,7 @@ dependencies = [
  "dirs",
  "display-info",
  "embed-resource",
+ "flate2",
  "hya-core",
  "hya-net",
  "hya-stream",

@@ -359,6 +359,15 @@ fn downloads_dir() -> String {
         .into_owned()
 }
 
+/// Where a category's files go on a fresh install.
+pub fn default_category_dir(name: &str) -> String {
+    if name == DEFAULT_CATEGORY {
+        downloads_dir()
+    } else {
+        sub(name)
+    }
+}
+
 fn sub(cat: &str) -> String {
     PathBuf::from(downloads_dir())
         .join(cat)
@@ -1642,13 +1651,19 @@ impl Default for StateFile {
 
 pub fn load_config() -> ConfigFile {
     let path = app_dir().join("config.toml");
-    let mut cfg: ConfigFile = match std::fs::read_to_string(&path) {
+    let cfg = match std::fs::read_to_string(&path) {
         Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
             crate::log::warn(&format!("config.toml unparsable ({e}); using defaults"));
             ConfigFile::default()
         }),
         Err(_) => ConfigFile::default(),
     };
+    normalize_config(cfg)
+}
+
+/// Fill in defaults and migrate older keys — whatever version of Hydra, on
+/// whatever machine, wrote `cfg`.
+pub fn normalize_config(mut cfg: ConfigFile) -> ConfigFile {
     if cfg.categories.is_empty() {
         cfg.categories = default_categories();
     }

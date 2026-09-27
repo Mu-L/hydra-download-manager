@@ -6,11 +6,12 @@
 use crate::engine::{self, Cmd, StartSpec};
 use crate::model::{
     self, categorize, CategoryDef, Column, ColumnPref, ConfigFile, DlId, DlQuota, DlState,
-    DownloadItem, PowerAction, ProxyChoice, ProxyMode, ProxyPick, SiteLogin, StateFile, ThemeMode,
+    DownloadItem, PowerAction, ProxyChoice, ProxyMode, ProxyPick, Settings, SiteLogin, StateFile,
+    ThemeMode,
 };
 use crate::picker::{self, Ask};
 use crate::sounds;
-use crate::{fmt, i18n};
+use crate::{fmt, hydata, i18n};
 use iced::window;
 use iced::{Point, Task};
 use std::collections::HashMap;
@@ -82,8 +83,9 @@ pub enum MenuAction {
     AddBatchFile,
     SiteGrabber,
     DropTarget,
-    ExportList,
-    ImportList,
+    ExportUrls,
+    ExportSettings,
+    ImportSettings,
     Exit,
     StopDownload,
     Remove,
@@ -156,8 +158,9 @@ impl MenuAction {
             MenuAction::AddBatchFile => "add_batch_file".into(),
             MenuAction::SiteGrabber => "grabber".into(),
             MenuAction::DropTarget => "drop_target".into(),
-            MenuAction::ExportList => "export".into(),
-            MenuAction::ImportList => "import".into(),
+            MenuAction::ExportUrls => "export_urls".into(),
+            MenuAction::ExportSettings => "export_settings".into(),
+            MenuAction::ImportSettings => "import_settings".into(),
             MenuAction::Exit => "exit".into(),
             MenuAction::StopDownload => "stop_dl".into(),
             MenuAction::Remove => "remove".into(),
@@ -255,8 +258,9 @@ impl MenuAction {
             "add_batch_file" => MenuAction::AddBatchFile,
             "grabber" => MenuAction::SiteGrabber,
             "drop_target" => MenuAction::DropTarget,
-            "export" => MenuAction::ExportList,
-            "import" => MenuAction::ImportList,
+            "export_urls" => MenuAction::ExportUrls,
+            "export_settings" => MenuAction::ExportSettings,
+            "import_settings" => MenuAction::ImportSettings,
             "exit" => MenuAction::Exit,
             "stop_dl" => MenuAction::StopDownload,
             "remove" => MenuAction::Remove,
@@ -1183,6 +1187,12 @@ pub enum ConfirmKind {
         ids: Vec<DlId>,
         stop_queues: bool,
     },
+    /// File > Import settings replaced the configuration (info box, OK).
+    SettingsImported,
+    /// File > Export settings could not write the file; carries why.
+    SettingsExportFailed(String),
+    /// File > Import settings refused the file; carries why.
+    SettingsImportFailed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -1443,10 +1453,12 @@ pub enum Message {
     /// The folder the user chose after a download failed for want of write
     /// permission on the one it had.
     SaveDirRegranted(DlId, std::path::PathBuf),
-    /// Tasks > Export: where the picker said the list should go.
-    ExportListTo(Option<std::path::PathBuf>),
-    /// Tasks > Import: the text of the file the picker chose.
-    ImportListFrom(Option<String>),
+    /// Tasks > Export download URLs: where the picker said the list should go.
+    ExportUrlsTo(Option<std::path::PathBuf>),
+    /// File > Export settings: where the picker said the file should go.
+    ExportSettingsTo(Option<std::path::PathBuf>),
+    /// File > Import settings: the file the picker chose.
+    ImportSettingsFrom(Option<std::path::PathBuf>),
     CloseThis(window::Id),
 }
 
@@ -2369,6 +2381,147 @@ impl App {
         if moved {
             self.save_state();
         }
+    }
+
+    /// Carry a settings change out to what is already running: the
+    /// transfers, the menus, the proxy, the OS integrations and the open
+    /// progress boxes. `before` is the settings as they were.
+    fn settings_changed(&mut self, before: &Settings) -> Task<Message> {
+        let details = self.cfg.settings.show_conn_details;
+        let details_changed = details != before.show_conn_details;
+        let capture_changed = self.cfg.settings.portable_capture != before.portable_capture;
+        if self.cfg.settings.power_save != before.power_save {
+            self.set_power_save(self.cfg.settings.power_save);
+        }
+        // A tab switched off here has nothing to show in a progress
+        // box already sitting on it.
+        for p in self.prog.values_mut() {
+            let gone = (p.tab == ProgTab::Speed && !self.cfg.settings.show_speed_tab)
+                || (p.tab == ProgTab::Completion && !self.cfg.settings.show_completion_tab);
+            if gone {
+                p.tab = ProgTab::Status;
+            }
+        }
+        // The Speed Limiter is editable here as well as from the
+        // toolbar, and the transfers it applies to are running while
+        // this window is open.
+        self.apply_speed_limiter();
+        // The profile list feeds the native menu's Speed limit
+        // submenu, so a renamed or deleted profile has to rebuild it.
+        self.refresh_native_menu();
+        // A portable copy taking browser capture over (or handing it
+        // back) does so now rather than at the next start: the
+        // manifests and the pointer file are all it takes, and this
+        // instance is already publishing the socket they lead to.
+        if capture_changed {
+            crate::nmhost::ensure_registered(self.cfg.settings.portable_capture);
+        }
+        // Re-resolve the proxy here rather than at the next transfer:
+        // a route the app cannot take must be reported while the user
+        // is still looking at the tab they set it on.
+        crate::proxy::apply(&self.cfg.settings);
+        // Re-assert Dock policy for the new setting. Windows are
+        // still open here (Options itself), so this stays Regular;
+        // the actual hide happens when the last window closes —
+        // Accessory apps get no menu bar, so hiding the Dock while
+        // a window is up would strip every Hydra menu.
+        #[cfg(target_os = "macos")]
+        crate::macos_dock::sync(self.cfg.settings.hide_from_taskbar, true);
+        crate::autostart::apply(
+            self.cfg.settings.launch_on_startup,
+            self.cfg.settings.start_in_tray,
+        );
+        // X11: the hint is per window and lives on the windows that
+        // are already open, so re-assert it on all of them.
+        let skip_taskbar = Task::batch(
+            self.windows
+                .keys()
+                .copied()
+                .map(|id| self.skip_taskbar_task(id))
+                .collect::<Vec<_>>(),
+        );
+        // A progress box keeps its own Show/Hide details state for
+        // the session, so without this the new default would not
+        // reach a download whose box has already been opened once —
+        // the very boxes the person changing it is looking at.
+        let details_task = if details_changed {
+            for p in self.prog.values_mut() {
+                p.details = details;
+            }
+            Task::batch(
+                self.prog
+                    .keys()
+                    .map(|id| self.resize_open(WinKind::Progress(*id)))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            Task::none()
+        };
+        Task::batch([skip_taskbar, details_task])
+    }
+
+    fn export_settings(&mut self, path: &std::path::Path) -> Task<Message> {
+        let written = hydata::encode(&self.cfg, dirs::home_dir().as_deref())
+            .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| e.to_string()));
+        match written {
+            Ok(()) => Task::none(),
+            Err(e) => {
+                crate::log::warn(&format!("export settings {}: {e}", path.display()));
+                self.ask(ConfirmKind::SettingsExportFailed(e))
+            }
+        }
+    }
+
+    /// Replace the configuration with the one in `path` and apply it as
+    /// Options > OK would. A file that fails to decode changes nothing.
+    fn import_settings(&mut self, path: &std::path::Path) -> Task<Message> {
+        let decoded = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| hydata::decode(&bytes, dirs::home_dir().as_deref()));
+        let cfg = match decoded {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                crate::log::warn(&format!("import settings {}: {e}", path.display()));
+                return self.ask(ConfirmKind::SettingsImportFailed(e));
+            }
+        };
+        crate::log::info(&format!("imported settings from {}", path.display()));
+        let (before, language) = self.adopt_config(cfg);
+        let applied = self.settings_changed(&before.settings);
+        let relabelled = match language {
+            Some(l) => self.on_menu(MenuAction::Language(l)),
+            None => {
+                let queues: Vec<String> = self.cfg.queues.iter().map(|q| q.name.clone()).collect();
+                crate::tray::reinstall(&queues, self.cfg.settings.power_save);
+                Task::none()
+            }
+        };
+        // Its draft was taken from the configuration just replaced.
+        let options = self.close_window(WinKind::Options);
+        let done = self.ask(ConfirmKind::SettingsImported);
+        Task::batch([applied, relabelled, options, done])
+    }
+
+    /// Swap `cfg` in for the configuration in force, keeping what an export
+    /// leaves out, and refile the downloads onto its categories. Returns the
+    /// configuration replaced and the language still to switch to: the
+    /// Language action compares against the one in force, so that stays
+    /// until it runs.
+    fn adopt_config(&mut self, mut cfg: ConfigFile) -> (ConfigFile, Option<String>) {
+        hydata::keep_local(&mut cfg, &self.cfg);
+        let language = cfg
+            .language
+            .take()
+            .filter(|l| Some(l) != self.cfg.language.as_ref());
+        cfg.language = self.cfg.language.clone();
+        let before = std::mem::replace(&mut self.cfg, cfg);
+        let no_renames = HashMap::new();
+        if refile_downloads(&mut self.state.downloads, &no_renames, &self.cfg.categories) {
+            self.save_state();
+        }
+        self.tree_sel = follow_tree_sel(&self.tree_sel, &no_renames, &self.cfg.categories);
+        self.save_config();
+        (before, language)
     }
 
     /// The View > Scale ratio the windows are laid out at.
@@ -6196,89 +6349,14 @@ impl App {
                 }
                 self.options.error = None;
                 self.options.commit_cat_exts();
-                let details = self.options.draft.show_conn_details;
-                let details_changed = details != self.cfg.settings.show_conn_details;
-                let capture_changed =
-                    self.options.draft.portable_capture != self.cfg.settings.portable_capture;
-                let power_save_changed =
-                    self.options.draft.power_save != self.cfg.settings.power_save;
+                let before = self.cfg.settings.clone();
                 let (base, draft) = (self.options.base.clone(), self.options.draft.clone());
                 self.cfg.settings.apply_options_draft(&base, &draft);
                 self.cfg.categories = self.options.draft_cats.clone();
                 self.apply_category_edits();
                 self.save_config();
-                if power_save_changed {
-                    self.set_power_save(self.cfg.settings.power_save);
-                }
-                // A tab switched off here has nothing to show in a progress
-                // box already sitting on it.
-                for p in self.prog.values_mut() {
-                    let gone = (p.tab == ProgTab::Speed && !self.cfg.settings.show_speed_tab)
-                        || (p.tab == ProgTab::Completion && !self.cfg.settings.show_completion_tab);
-                    if gone {
-                        p.tab = ProgTab::Status;
-                    }
-                }
-                // The Speed Limiter is editable here as well as from the
-                // toolbar, and the transfers it applies to are running while
-                // this window is open.
-                self.apply_speed_limiter();
-                // The profile list feeds the native menu's Speed limit
-                // submenu, so a renamed or deleted profile has to rebuild it.
-                self.refresh_native_menu();
-                // A portable copy taking browser capture over (or handing it
-                // back) does so now rather than at the next start: the
-                // manifests and the pointer file are all it takes, and this
-                // instance is already publishing the socket they lead to.
-                if capture_changed {
-                    crate::nmhost::ensure_registered(self.cfg.settings.portable_capture);
-                }
-                // Re-resolve the proxy here rather than at the next transfer:
-                // a route the app cannot take must be reported while the user
-                // is still looking at the tab they set it on.
-                crate::proxy::apply(&self.cfg.settings);
-                // Re-assert Dock policy for the new setting. Windows are
-                // still open here (Options itself), so this stays Regular;
-                // the actual hide happens when the last window closes —
-                // Accessory apps get no menu bar, so hiding the Dock while
-                // a window is up would strip every Hydra menu.
-                #[cfg(target_os = "macos")]
-                crate::macos_dock::sync(self.cfg.settings.hide_from_taskbar, true);
-                crate::autostart::apply(
-                    self.cfg.settings.launch_on_startup,
-                    self.cfg.settings.start_in_tray,
-                );
-                // X11: the hint is per window and lives on the windows that
-                // are already open, so re-assert it on all of them.
-                let skip_taskbar = Task::batch(
-                    self.windows
-                        .keys()
-                        .copied()
-                        .map(|id| self.skip_taskbar_task(id))
-                        .collect::<Vec<_>>(),
-                );
-                // A progress box keeps its own Show/Hide details state for
-                // the session, so without this the new default would not
-                // reach a download whose box has already been opened once —
-                // the very boxes the person changing it is looking at.
-                let details_task = if details_changed {
-                    for p in self.prog.values_mut() {
-                        p.details = details;
-                    }
-                    Task::batch(
-                        self.prog
-                            .keys()
-                            .map(|id| self.resize_open(WinKind::Progress(*id)))
-                            .collect::<Vec<_>>(),
-                    )
-                } else {
-                    Task::none()
-                };
-                Task::batch([
-                    skip_taskbar,
-                    details_task,
-                    self.close_window(WinKind::Options),
-                ])
+                let applied = self.settings_changed(&before);
+                Task::batch([applied, self.close_window(WinKind::Options)])
             }
             Message::OptDraft(f) => self.on_opt_field(f),
 
@@ -6969,7 +7047,7 @@ impl App {
                 task
             }
             Message::MoveRenameTo(id, to) => self.move_rename_to(id, to),
-            Message::ExportListTo(path) => {
+            Message::ExportUrlsTo(path) => {
                 if let Some(path) = path {
                     let urls: Vec<&str> = self
                         .state
@@ -6983,18 +7061,14 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ImportListFrom(text) => {
-                for line in text.iter().flat_map(|t| t.lines()).map(str::trim) {
-                    // A list exported from this very app is mostly what is
-                    // already here; each address is added once.
-                    if engine::parse_url(line).is_ok()
-                        && !self.state.downloads.iter().any(|d| d.url == line)
-                    {
-                        self.add_item(line.to_string(), None, None);
-                    }
-                }
-                Task::none()
-            }
+            Message::ExportSettingsTo(path) => match path {
+                Some(path) => self.export_settings(&path),
+                None => Task::none(),
+            },
+            Message::ImportSettingsFrom(path) => match path {
+                Some(path) => self.import_settings(&path),
+                None => Task::none(),
+            },
             Message::SaveDirRegranted(id, dir) => {
                 self.save_dir_regranted(id, dir);
                 self.start_download(id, false)
@@ -7212,22 +7286,28 @@ impl App {
                 open.chain(pick)
             }
             MenuAction::SiteGrabber | MenuAction::DropTarget | MenuAction::Find => Task::none(),
-            MenuAction::ExportList => {
+            MenuAction::ExportUrls => {
                 let ask = Ask {
                     file_name: Some("hydra-downloads.txt".into()),
                     filter: Some(("Text", &["txt"])),
                     ..Ask::default()
                 };
-                picker::save(self.win_of(WinKind::Main), ask).map(Message::ExportListTo)
+                picker::save(self.win_of(WinKind::Main), ask).map(Message::ExportUrlsTo)
             }
-            MenuAction::ImportList => {
+            MenuAction::ExportSettings => {
                 let ask = Ask {
-                    filter: Some(("Text", &["txt", "text", "lst"])),
+                    file_name: Some(format!("hydra-settings.{}", hydata::EXTENSION)),
+                    filter: Some(("Hydra settings", &[hydata::EXTENSION])),
                     ..Ask::default()
                 };
-                picker::file(self.win_of(WinKind::Main), ask).map(|p| {
-                    Message::ImportListFrom(p.and_then(|p| std::fs::read_to_string(p).ok()))
-                })
+                picker::save(self.win_of(WinKind::Main), ask).map(Message::ExportSettingsTo)
+            }
+            MenuAction::ImportSettings => {
+                let ask = Ask {
+                    filter: Some(("Hydra settings", &[hydata::EXTENSION])),
+                    ..Ask::default()
+                };
+                picker::file(self.win_of(WinKind::Main), ask).map(Message::ImportSettingsFrom)
             }
             MenuAction::Exit => {
                 self.save_state();
@@ -11381,21 +11461,118 @@ mod tests {
         assert_eq!(app.selected, vec![id]);
     }
 
-    /// Tasks > Import added every line, including the ones already listed.
+    fn exported_settings(cfg: ConfigFile) -> ConfigFile {
+        let path = std::env::temp_dir().join(format!(
+            "hydra-settings-{}-{:?}.hydata",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut from = App {
+            cfg,
+            ..App::default()
+        };
+        let _ = from.update(Message::ExportSettingsTo(Some(path.clone())));
+        assert!(from.confirm.is_none(), "{:?}", from.confirm);
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        hydata::decode(&bytes, dirs::home_dir().as_deref()).unwrap()
+    }
+
     #[test]
-    fn importing_a_list_adds_each_address_once() {
+    fn exported_settings_are_adopted_by_another_install() {
+        let mut theirs = model::normalize_config(ConfigFile::default());
+        theirs.settings.default_conns = 12;
+        theirs.settings.theme_mode = Some(ThemeMode::Dark);
+        theirs.queues.retain(|q| q.builtin);
+        theirs.language = Some("de".into());
+        let mut app = App {
+            cfg: model::normalize_config(ConfigFile::default()),
+            ..App::default()
+        };
+        app.cfg.language = Some("fr".into());
+
+        let (before, language) = app.adopt_config(exported_settings(theirs));
+        assert_eq!(app.cfg.settings.default_conns, 12);
+        assert_eq!(app.cfg.settings.theme_mode, Some(ThemeMode::Dark));
+        assert!(app.cfg_dirty, "the imported settings have to reach disk");
+        assert_eq!(before.language.as_deref(), Some("fr"));
+        assert_eq!(language.as_deref(), Some("de"), "switched to afterwards");
+        assert_eq!(app.cfg.language.as_deref(), Some("fr"), "until then");
+    }
+
+    #[test]
+    fn importing_settings_refiles_downloads_off_a_missing_category() {
+        let mut theirs = model::normalize_config(ConfigFile::default());
+        theirs.categories.retain(|c| c.name != "Video");
+        let mut app = App {
+            cfg: model::normalize_config(ConfigFile::default()),
+            ..App::default()
+        };
+        let id = app.add_item("https://a.b/x.mp4".into(), None, None);
+        app.item_mut(id).unwrap().category = Some("Video".into());
+        app.tree_sel = TreeSel::Cat("Video".into());
+
+        let _ = app.adopt_config(exported_settings(theirs));
+        assert_eq!(app.item(id).unwrap().category, None);
+        assert_eq!(app.tree_sel, TreeSel::All);
+        assert!(app.state_dirty);
+    }
+
+    #[test]
+    fn a_file_that_is_not_settings_changes_nothing() {
+        let path =
+            std::env::temp_dir().join(format!("hydra-not-settings-{}.hydata", std::process::id()));
+        std::fs::write(&path, "https://a.b/x.zip\n").unwrap();
         let mut app = App::default();
-        app.add_item("https://a.b/x.zip".into(), None, None);
-        let text = "https://a.b/x.zip\nhttps://a.b/y.zip\nhttps://a.b/y.zip\nnot a link\n";
-        let _ = app.update(Message::ImportListFrom(Some(text.into())));
-        let urls: Vec<&str> = app.state.downloads.iter().map(|d| d.url.as_str()).collect();
-        assert_eq!(urls, ["https://a.b/x.zip", "https://a.b/y.zip"]);
-        let _ = app.update(Message::ImportListFrom(None));
-        assert_eq!(
-            app.state.downloads.len(),
-            2,
-            "a cancelled picker adds nothing"
-        );
+        app.cfg.settings.default_conns = 5;
+
+        let _ = app.update(Message::ImportSettingsFrom(Some(path.clone())));
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmKind::SettingsImportFailed(_))
+        ));
+        assert_eq!(app.cfg.settings.default_conns, 5);
+        assert!(!app.cfg_dirty);
+
+        let _ = app.update(Message::ImportSettingsFrom(None));
+        assert_eq!(app.cfg.settings.default_conns, 5, "a cancelled picker");
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_written_is_reported() {
+        let mut app = App::default();
+        let nowhere = std::env::temp_dir().join("no-such-dir").join("x.hydata");
+        let _ = app.update(Message::ExportSettingsTo(Some(nowhere)));
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmKind::SettingsExportFailed(_))
+        ));
+    }
+
+    #[test]
+    fn download_urls_export_from_tasks_and_settings_move_through_file() {
+        let app = App::default();
+        let actions = |kind| -> Vec<MenuAction> {
+            crate::ui::menu::entries(kind, &app)
+                .into_iter()
+                .filter_map(|e| e.action)
+                .collect()
+        };
+        let tasks = actions(MenuBarKind::Tasks);
+        assert!(tasks.contains(&MenuAction::ExportUrls));
+        assert!(!tasks.contains(&MenuAction::ExportSettings));
+        assert!(!tasks.contains(&MenuAction::ImportSettings));
+        let file = actions(MenuBarKind::File);
+        assert!(file.contains(&MenuAction::ExportSettings));
+        assert!(file.contains(&MenuAction::ImportSettings));
+        for a in [
+            MenuAction::ExportUrls,
+            MenuAction::ExportSettings,
+            MenuAction::ImportSettings,
+        ] {
+            assert_eq!(MenuAction::from_id(&a.id()), Some(a.clone()));
+        }
     }
 
     /// A deleted row takes every window that describes it with it; a
