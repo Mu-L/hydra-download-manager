@@ -30,10 +30,6 @@ use crate::model::{Column, ColumnPref, DlState, DownloadItem};
 /// off. A stale glyph or rule is tens of levels.
 const VISIBLE_DELTA: u32 = 2;
 
-/// Where the first data row starts in the default main window: toolbar plus
-/// the list header.
-const LIST_TOP: f32 = 108.0;
-
 #[derive(Default, Clone, Copy)]
 struct Stages {
     update: Duration,
@@ -55,6 +51,10 @@ struct Harness {
     clip: tiny_skia::Mask,
     last: Option<Vec<Layer>>,
     verify: bool,
+    /// Top of the first data row in the main window, found by
+    /// [`main_window`]: the toolbar above it is taller where the menu bar
+    /// lives in the window rather than in the system's.
+    list_top: f32,
     frames: Vec<Stages>,
     mismatches: Vec<String>,
 }
@@ -84,6 +84,7 @@ impl Harness {
             clip: tiny_skia::Mask::new(phys.width, phys.height).expect("clip mask"),
             last: None,
             verify,
+            list_top: 0.0,
             frames: vec![],
             mismatches: vec![],
         }
@@ -390,16 +391,28 @@ fn app_with(downloads: u64) -> App {
 fn main_window(downloads: u64, logical: Size, scale: f32, verify: bool) -> Harness {
     let mut h = Harness::new(app_with(downloads), WinKind::Main, logical, scale, verify);
     h.step("first", &[]);
+    h.list_top = (0..logical.height as u32)
+        .step_by(2)
+        .map(|y| y as f32)
+        .find(|&y| {
+            h.hover("find the list", Point::new(LIST_X, y));
+            h.app.hover_row.is_some()
+        })
+        .expect("no row of the list reacts to the pointer");
     h
 }
 
-fn row_point(row: usize) -> Point {
-    Point::new(420.0, LIST_TOP + 25.0 * row as f32 + 12.0)
+/// A column inside the list, clear of the category tree on its left.
+const LIST_X: f32 = 420.0;
+
+fn row_point(h: &Harness, row: usize) -> Point {
+    Point::new(LIST_X, h.list_top + 25.0 * row as f32 + 12.0)
 }
 
 fn sweep(h: &mut Harness, rows: usize) {
     for r in 0..rows {
-        h.hover(&format!("hover row {r}"), row_point(r));
+        let p = row_point(h, r);
+        h.hover(&format!("hover row {r}"), p);
     }
 }
 
@@ -422,7 +435,8 @@ fn tick_progress(h: &mut Harness, frames: usize) {
 }
 
 fn scroll(h: &mut Harness, steps: usize) {
-    h.hover("scroll start", row_point(3));
+    let p = row_point(h, 3);
+    h.hover("scroll start", p);
     for s in 0..steps {
         h.step(
             &format!("scroll {s}"),
@@ -437,7 +451,8 @@ fn scroll(h: &mut Harness, steps: usize) {
 #[test]
 fn the_simulated_pointer_hovers_and_scrolls_the_real_list() {
     let mut h = main_window(60, Size::new(1100.0, 700.0), 1.0, false);
-    h.hover("row 2", row_point(2));
+    let p = row_point(&h, 2);
+    h.hover("row 2", p);
     assert_eq!(
         h.app.hover_row,
         Some(57),
