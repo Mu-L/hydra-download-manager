@@ -34,6 +34,8 @@ mod model;
 mod nmhost;
 mod picker;
 mod proxy;
+#[cfg(test)]
+mod render_check;
 mod scan;
 mod sounds;
 mod theme;

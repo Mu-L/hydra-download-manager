@@ -77,6 +77,24 @@ rustls-pki-types = "1"
 # the suite reports to stdout and JSON, and nothing here renders SVGs.
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
+# iced 0.14 from our fork, for tiny-skia fixes upstream has not released yet
+# (branch `hydra-0.14`, one commit per fix on top of upstream `0.14`). Every
+# iced crate is patched: patching only some would link two `iced_core`s.
+# `cargo update -p iced` picks up new commits on the branch.
+[patch.crates-io]
+iced = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_core = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_debug = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_futures = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_graphics = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_program = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_renderer = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_runtime = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_tiny_skia = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_wgpu = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_widget = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+iced_winit = { git = "https://github.com/ja7ad/iced", branch = "hydra-0.14" }
+
 [workspace.lints.clippy]
 # The scheduler does real arithmetic on measured quantities; these lints fight it.
 too_many_arguments = "allow"

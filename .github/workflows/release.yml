@@ -1123,8 +1123,10 @@ jobs:
             # Enable passive FTP for dput globally
             printf '[DEFAULT]\npassive_ftp = 1\n' > ~/.dput.cf
 
-            # Vendor dependencies for offline building
-            cargo vendor vendor/
+            # Vendor dependencies for offline building. cargo prints the source
+            # replacement it needs, crates.io and git sources (the iced fork)
+            # alike; debian/rules installs it as the build's cargo config.
+            cargo vendor vendor/ > cargo-vendor.toml
 
             # Remove per-crate checksum manifests (they list paths that dpkg-source
             # omits and cargo would reject)
@@ -1133,6 +1135,7 @@ jobs:
 
             # Copy Debian packaging files to debian/ directory
             cp -r packaging/debian debian
+            mv cargo-vendor.toml debian/cargo-vendor.toml
 
             # Which series to upload to is Launchpad's answer, not a list kept
             # here. Launchpad refuses an upload to a series that has gone
