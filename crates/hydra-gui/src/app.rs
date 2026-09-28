@@ -1193,6 +1193,9 @@ pub enum ConfirmKind {
     SettingsExportFailed(String),
     /// File > Import settings refused the file; carries why.
     SettingsImportFailed(String),
+    /// An extension with no token to show keeps knocking (see
+    /// `extbus::TrustLedger`); Yes admits its origin from then on.
+    TrustExtension(String),
 }
 
 #[derive(Clone, Debug)]
@@ -1479,6 +1482,8 @@ pub enum OptField {
     Browser(usize, bool),
     /// Only offered by a `--config DIR` instance (Options > Extensions).
     PortableCapture(bool),
+    /// Remove a trusted extension origin, by index.
+    Untrust(usize),
     AutoTypesEdit(iced::widget::text_editor::Action),
     SitesEdit(iced::widget::text_editor::Action),
     RememberLast(bool),
@@ -2821,6 +2826,15 @@ impl App {
         }
     }
 
+    fn trust_extension(&mut self, origin: String) {
+        let trusted = &mut self.cfg.settings.trusted_extensions;
+        if !trusted.contains(&origin) {
+            crate::log::info(&format!("extbus: trusting {origin}"));
+            trusted.push(origin);
+            self.save_config();
+        }
+    }
+
     /// Close the confirmation window and move on to the next question.
     fn dismiss_confirm(&mut self) -> Task<Message> {
         let close = self.close_window(WinKind::Confirm);
@@ -3752,6 +3766,9 @@ impl App {
                 Task::batch([open, self.update(Message::BatchLoaded(Some(text)))])
             }
             crate::extbus::ExtEvent::Open => self.open_window(WinKind::Main),
+            crate::extbus::ExtEvent::TrustRequest(origin) => {
+                self.ask(ConfirmKind::TrustExtension(origin))
+            }
             crate::extbus::ExtEvent::Shutdown => {
                 // A newer build is taking over the single-instance slot
                 // (extbus::signal_existing): leave the way tray Exit does.
@@ -6960,6 +6977,10 @@ impl App {
                         self.stop_ids(ids, stop_queues);
                         close
                     }
+                    Some(ConfirmKind::TrustExtension(origin)) => {
+                        self.trust_extension(origin);
+                        close
+                    }
                     _ => close,
                 }
             }
@@ -8539,7 +8560,10 @@ fn dialog_primary(app: &App, kind: WinKind, id: window::Id) -> Option<Message> {
                 | ConfirmKind::StopWarn { .. },
             ) => Message::ConfirmYes,
             Some(ConfirmKind::PermissionWarn { .. }) => Message::OpenPermissions,
-            Some(ConfirmKind::Duplicate { .. }) | None => return None,
+            // Trusting an extension is not a question to answer blind.
+            Some(ConfirmKind::Duplicate { .. } | ConfirmKind::TrustExtension(_)) | None => {
+                return None
+            }
             Some(_) => Message::CloseThis(id),
         },
         WinKind::AddUrl => Message::AddUrlOk,
@@ -11406,6 +11430,47 @@ mod tests {
         app.windows.insert(main, WinKind::Main);
         let _ = app.update(key(Named::Escape, main));
         assert!(app.win_of(WinKind::Main).is_some());
+    }
+
+    /// A hostless extension's knock becomes a question; Enter does not
+    /// answer it, No trusts nothing, and Yes admits that origin once.
+    #[test]
+    fn a_trust_request_is_asked_and_only_yes_trusts_the_origin() {
+        use iced::keyboard::{key::Named, Key, Modifiers};
+        let origin = "moz-extension://e88b5464-98e6-41c8-a457-f4887b0486e1";
+        let request = || Message::Ext(crate::extbus::ExtEvent::TrustRequest(origin.into()));
+        let mut app = App::default();
+
+        let _ = app.update(request());
+        assert!(matches!(&app.confirm, Some(ConfirmKind::TrustExtension(o)) if o == origin));
+        let win = app
+            .win_of(WinKind::Confirm)
+            .expect("the question is on screen");
+        let _ = app.update(Message::RawKey(
+            Key::Named(Named::Enter),
+            Modifiers::empty(),
+            win,
+        ));
+        assert!(app.win_of(WinKind::Confirm).is_some(), "Enter answered");
+        {
+            let _question: El<'_> = crate::windows::confirm::view(&app);
+        }
+        let _ = app.update(Message::CloseThis(win));
+        assert!(
+            app.cfg.settings.trusted_extensions.is_empty(),
+            "No trusted it"
+        );
+
+        for _ in 0..2 {
+            let _ = app.update(request());
+            let _ = app.update(Message::ConfirmYes);
+        }
+        assert_eq!(app.cfg.settings.trusted_extensions, [origin]);
+
+        app.options.draft = app.cfg.settings.clone();
+        app.options.apply(OptField::Untrust(0));
+        app.options.apply(OptField::Untrust(0));
+        assert!(app.options.draft.trusted_extensions.is_empty());
     }
 
     /// The Shortcuts dialog accepted anything. On close the table holds one

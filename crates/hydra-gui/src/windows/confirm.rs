@@ -96,6 +96,14 @@ pub fn view(app: &App) -> El<'_> {
             ),
             false,
         ),
+        Some(ConfirmKind::TrustExtension(origin)) => (
+            format!(
+                "{}\n\n{origin}\n\n{}",
+                tr("A browser extension without Hydra's native host wants to send downloads to Hydra. Allow it?"),
+                tr("Allow it only if it is the Hydra extension you installed. It connects within half a minute; remove it under Options > Extensions.")
+            ),
+            true,
+        ),
         Some(ConfirmKind::Duplicate { existing, file, .. }) => {
             let msg = match (existing, file) {
                 (Some(_), _) => tr("This address is already in the download list. What do you want to do?"),
