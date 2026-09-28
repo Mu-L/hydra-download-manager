@@ -2422,6 +2422,7 @@
               <button class="tab" role="tab" aria-selected="false" data-target="cmd-aur">Arch AUR</button>
               <button class="tab" role="tab" aria-selected="false" data-target="cmd-brew">Homebrew</button>
               <button class="tab" role="tab" aria-selected="false" data-target="cmd-win">Windows</button>
+              <button class="tab" role="tab" aria-selected="false" data-target="cmd-winget">Winget</button>
             </div>
             <div class="cmd active" id="cmd-unix">
               <code><b>curl</b> -fsSL https://raw.githubusercontent.com/ja7ad/hydra/main/install.sh | <b>bash</b></code>
@@ -2487,6 +2488,16 @@
                 </svg>
               </button>
             </div>
+            <div class="cmd" id="cmd-winget">
+              <code><b>winget install</b> ja7ad.Hydra</code>
+              <button class="copy" aria-label="Copy install command" data-copy="winget install ja7ad.Hydra">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+                  stroke-linejoin="round" aria-hidden="true">
+                  <rect x="8" y="8" width="13" height="13" rx="2" />
+                  <path d="M16 8V6a2 2 0 00-2-2H5a2 2 0 00-2 2v9a2 2 0 002 2h2" />
+                </svg>
+              </button>
+            </div>
             <p class="tab-repo-links">
               Repositories:
               <a href="https://launchpad.net/~sonycore/+archive/ubuntu/hydra" target="_blank" rel="noopener">Launchpad
@@ -2494,7 +2505,9 @@
               <a href="https://copr.fedorainfracloud.org/coprs/sonycore/hydra/" target="_blank" rel="noopener">Fedora
                 COPR</a> ·
               <a href="https://aur.archlinux.org/packages/hydra-download-manager-bin" target="_blank"
-                rel="noopener">Arch Linux AUR</a>
+                rel="noopener">Arch Linux AUR</a> ·
+              <a href="https://github.com/microsoft/winget-pkgs/tree/master/manifests/j/ja7ad/Hydra" target="_blank"
+                rel="noopener">Windows Package Manager</a>
             </p>
           </div>
         </div>

@@ -30,6 +30,7 @@
 - [Installation](#installation)
   - [Quick Install (Bash / PowerShell)](#quick-install-bash--powershell)
   - [Homebrew (macOS / Linux)](#homebrew-macos--linux)
+  - [Winget (Windows)](#winget-windows)
   - [Linux Packages (Ubuntu PPA / Fedora COPR / Arch Linux AUR)](#linux-packages-ubuntu-ppa--fedora-copr--arch-linux-aur)
   - [AppImage (portable, self-updating)](#appimage-portable-self-updating)
   - [From Source](#from-source)
@@ -179,6 +180,16 @@ brew install ja7ad/tap/hydra
 ```bash
 brew install --cask ja7ad/tap/hydra
 ```
+
+### Winget (Windows)
+
+Hydra Download Manager is in the Windows Package Manager repository as `ja7ad.Hydra`:
+
+```powershell
+winget install ja7ad.Hydra
+```
+
+Update it later with `winget upgrade ja7ad.Hydra`, or remove it with `winget uninstall ja7ad.Hydra`.
 
 ### Linux Packages (Ubuntu PPA / Fedora COPR / Arch Linux AUR)
 
@@ -390,6 +401,12 @@ To also delete config and state:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/ja7ad/hydra/main/uninstall.ps1))) -Purge
+```
+
+**Winget**:
+
+```powershell
+winget uninstall ja7ad.Hydra
 ```
 
 **Homebrew**:
