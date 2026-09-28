@@ -597,6 +597,11 @@ impl OptionsState {
             OptField::GpuRender(b) => s.gpu_render = b,
             OptField::Clipboard(b) => s.monitor_clipboard = b,
             OptField::PortableCapture(b) => s.portable_capture = b,
+            OptField::Untrust(i) => {
+                if i < s.allowed_extensions.len() {
+                    s.allowed_extensions.remove(i);
+                }
+            }
             OptField::Browser(i, b) => {
                 if let Some(x) = s.capture_browsers.get_mut(i) {
                     x.1 = b;
@@ -1590,6 +1595,28 @@ fn extensions(app: &App) -> El<'_> {
         ),
     ]
     .spacing(10);
+    let allowed = &app.options.draft.allowed_extensions;
+    if !allowed.is_empty() {
+        let mut list = column![
+            section(tr("Trusted extensions")),
+            text(tr("Allowed to connect without Hydra's native host."))
+                .size(theme::FONT_SIZE - 1.0)
+                .color(theme::dim_text(&iced::Theme::Light)),
+        ]
+        .spacing(6);
+        for (i, origin) in allowed.iter().enumerate() {
+            list = list.push(
+                row![
+                    text(origin.clone())
+                        .size(theme::FONT_SIZE)
+                        .width(Length::Fill),
+                    dlg_btn_auto(tr("Remove"), Some(o(OptField::Untrust(i)))),
+                ]
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        col = col.push(list);
+    }
     if let Some(el) = portable {
         col = col.push(el);
     }
@@ -2106,6 +2133,13 @@ mod tests {
         {
             let _speed: El<'_> = conn_speed(&app);
         }
+    }
+
+    #[test]
+    fn the_extensions_page_lays_out_its_trusted_origins() {
+        let mut app = App::default();
+        app.options.draft.allowed_extensions = vec!["moz-extension://a".into()];
+        let _page: El<'_> = extensions(&app);
     }
 
     /// A budget the file name alone cannot meet still shows the file name:

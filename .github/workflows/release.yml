@@ -1226,3 +1226,30 @@ jobs:
           else
             echo "note: AUR_SSH_PRIVATE_KEY not set; skipping automated AUR publish"
           fi
+
+      - name: Submit to winget
+        if: needs.verify-version.outputs.prerelease == 'false'
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          KOMAC_VERSION: 2.16.0
+        run: |
+          set -euo pipefail
+          if [ -n "${WINGET_TOKEN:-}" ]; then
+            KOMAC_TAR="komac-${KOMAC_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            KOMAC_URL="https://github.com/russellbanks/Komac/releases/download/v${KOMAC_VERSION}"
+            curl -fsSL --retry 3 -o "$KOMAC_TAR" "$KOMAC_URL/$KOMAC_TAR"
+            curl -fsSL --retry 3 "$KOMAC_URL/SHA256SUMS" | grep -F " *$KOMAC_TAR" | sed 's/ \*/  /' | sha256sum -c -
+            tar xzf "$KOMAC_TAR" komac
+
+            ASSETS="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}"
+            ./komac update ja7ad.Hydra \
+              --version "$VERSION" \
+              --urls "$ASSETS/hydra-${VERSION}-windows-x64-setup.exe" \
+                     "$ASSETS/hydra-${VERSION}-windows-arm64-setup.exe" \
+              --release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/${GITHUB_REF_NAME}" \
+              --submit \
+              --token "$WINGET_TOKEN"
+          else
+            echo "note: WINGET_TOKEN not set; skipping winget submission"
+          fi

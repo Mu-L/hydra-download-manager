@@ -26,8 +26,10 @@
 //!    carries the same ipc.json token — which the extension obtains from
 //!    the native host with `{"type":"ws-token"}`, so any extension the host
 //!    manifest allow-lists can prove itself. The pinned Chromium ids in
-//!    `nmhost::CHROMIUM_EXT_IDS` skip the token. A live, authenticated WS
-//!    connection doubles as the extension's "hydra is running" indicator.
+//!    `nmhost::CHROMIUM_EXT_IDS` skip the token, and so do the origins the
+//!    user allowed when an extension with no host to ask kept knocking
+//!    (see [`TrustLedger`]). A live, authenticated WS connection doubles as
+//!    the extension's "hydra is running" indicator.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -176,6 +178,8 @@ pub enum ExtEvent {
     Links(Vec<String>),
     /// Popup's "Open Hydra": surface the main window.
     Open,
+    /// An extension origin with no token to show asks to be allowed.
+    TrustRequest(String),
     /// A newer build launched and asked this instance to step aside so the
     /// surviving process is the new version (see `signal_existing`).
     Shutdown,
@@ -197,6 +201,9 @@ pub struct ExtConfig {
     /// itself, not about the user's other browsers.
     #[serde(skip)]
     pub browsers: Vec<(String, bool)>,
+    /// Extension origins admitted to the WebSocket without the token.
+    #[serde(skip)]
+    pub allowed: Vec<String>,
 }
 
 static TX: OnceLock<UnboundedSender<ExtEvent>> = OnceLock::new();
@@ -237,6 +244,7 @@ pub fn publish_config(cfg: &crate::model::ConfigFile) {
         auto_types: cfg.settings.auto_types.clone(),
         dont_start_sites: cfg.settings.dont_start_sites.clone(),
         browsers,
+        allowed: cfg.settings.allowed_extensions.clone(),
     };
     if let Ok(mut g) = CFG.lock() {
         *g = Some(snap);
@@ -466,16 +474,20 @@ pub fn start() {
         .ok();
 
     if let Some(ws) = ws {
-        let token = ws_token;
+        let gate = std::sync::Arc::new(WsGate::new(
+            ws_token,
+            || config_snapshot().allowed,
+            sender(),
+        ));
         std::thread::Builder::new()
             .name("extbus-ws-accept".into())
             .spawn(move || {
                 for conn in ws.incoming() {
                     let Ok(stream) = conn else { continue };
-                    let tok = token.clone();
+                    let gate = gate.clone();
                     let _ = std::thread::Builder::new()
                         .name("extbus-ws".into())
-                        .spawn(move || serve_ws(stream, &tok));
+                        .spawn(move || serve_ws(stream, &gate));
                 }
             })
             .ok();
@@ -505,10 +517,10 @@ fn without_credentials(spec: &str) -> String {
 
 /// Handle one authenticated request; the reply always carries the capture
 /// settings and echoes any `id` (the WebSocket path multiplexes on it).
-/// `trusted` is true for the token-bearing line protocol only — the
+/// `allowed` is true for the token-bearing line protocol only — the
 /// WebSocket path is origin-authenticated, which any extension context
 /// satisfies, so takeover commands are refused there.
-fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
+fn dispatch(req: &serde_json::Value, allowed: bool) -> serde_json::Value {
     let (ok, err): (bool, Option<&str>) = match req.get("type").and_then(|t| t.as_str()) {
         Some("ping") | Some("config") => (true, None),
         Some("open") => {
@@ -517,7 +529,7 @@ fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
         }
         // Version-mismatch takeover from signal_existing: quit gracefully
         // so the newly launched build can become the instance.
-        Some("shutdown") if trusted => {
+        Some("shutdown") if allowed => {
             let _ = sender().send(ExtEvent::Shutdown);
             (true, None)
         }
@@ -681,9 +693,68 @@ fn serve(stream: TcpStream, token: &str) {
 const WS_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// What every WebSocket connection checks its peer against.
+struct WsGate {
+    token: String,
+    /// The origins the user allowed, read per connection: the list changes
+    /// under a running listener when the user answers or revokes.
+    allowed: fn() -> Vec<String>,
+    ledger: Mutex<TrustLedger>,
+    events: UnboundedSender<ExtEvent>,
+}
+
+impl WsGate {
+    fn new(token: String, allowed: fn() -> Vec<String>, events: UnboundedSender<ExtEvent>) -> Self {
+        WsGate {
+            token,
+            allowed,
+            ledger: Mutex::new(TrustLedger::default()),
+            events,
+        }
+    }
+}
+
+/// When to ask the user about an extension that cannot show the token.
+///
+/// With a native host, one refusal is routine: the extension's cached token
+/// is stale or missing, it asks the host, and the redial authenticates.
+/// Without one (a registry-free portable copy, a Firefox install whose
+/// origin cannot be pinned) the same origin is refused again 30 s later.
+/// That second refusal, with no token in between, is what raises the
+/// question, and each origin is asked at most once per run.
+#[derive(Debug, Default)]
+struct TrustLedger {
+    refused_once: Vec<String>,
+    asked: Vec<String>,
+}
+
+impl TrustLedger {
+    /// Records a refusal; `true` when it is the one to ask the user about.
+    fn refused(&mut self, origin: &str) -> bool {
+        if self.asked.iter().any(|o| o == origin) {
+            return false;
+        }
+        match self.refused_once.iter().position(|o| o == origin) {
+            Some(i) => {
+                self.refused_once.swap_remove(i);
+                self.asked.push(origin.to_string());
+                true
+            }
+            None => {
+                self.refused_once.push(origin.to_string());
+                false
+            }
+        }
+    }
+
+    fn authenticated(&mut self, origin: &str) {
+        self.refused_once.retain(|o| o != origin);
+    }
+}
+
 /// Minimal RFC 6455 server side: enough for one browser extension speaking
 /// small text frames. No fragmentation, no extensions, no TLS (loopback).
-fn serve_ws(stream: TcpStream, token: &str) {
+fn serve_ws(stream: TcpStream, gate: &WsGate) {
     let _ = stream.set_read_timeout(Some(WS_IDLE_TIMEOUT));
     let _ = stream.set_nodelay(true);
     let mut out = match stream.try_clone() {
@@ -752,7 +823,7 @@ fn serve_ws(stream: TcpStream, token: &str) {
     {
         return;
     }
-    let mut authed = origin_preauthorized(&origin);
+    let mut authed = origin_preauthorized(&origin, &(gate.allowed)());
     crate::log::info(&format!(
         "extbus: ws connected ({origin}; {})",
         if authed {
@@ -768,9 +839,12 @@ fn serve_ws(stream: TcpStream, token: &str) {
     // ---- frames --------------------------------------------------------
     while let Some((opcode, payload)) = ws_read_frame(&mut reader) {
         if !authed {
-            match ws_authenticate(opcode, &payload, token) {
+            match ws_authenticate(opcode, &payload, &gate.token) {
                 Ok(reply) => {
                     authed = true;
+                    if let Ok(mut ledger) = gate.ledger.lock() {
+                        ledger.authenticated(&origin);
+                    }
                     let _ = out.set_read_timeout(Some(WS_IDLE_TIMEOUT));
                     crate::log::info(&format!("extbus: ws authenticated ({origin})"));
                     if ws_write_frame(&mut out, 0x1, reply.to_string().as_bytes()).is_err() {
@@ -781,6 +855,14 @@ fn serve_ws(stream: TcpStream, token: &str) {
                     crate::log::warn(&format!("extbus: ws refused ({origin}): unauthorized"));
                     let _ = ws_write_frame(&mut out, 0x1, reply.to_string().as_bytes());
                     let _ = ws_write_frame(&mut out, 0x8, &[]);
+                    let ask = gate
+                        .ledger
+                        .lock()
+                        .is_ok_and(|mut ledger| ledger.refused(&origin));
+                    if ask {
+                        crate::log::info(&format!("extbus: asking whether to trust {origin}"));
+                        let _ = gate.events.send(ExtEvent::TrustRequest(origin));
+                    }
                     break;
                 }
             }
@@ -883,11 +965,13 @@ fn origin_is_extension(origin: &str) -> bool {
 }
 
 /// The Chromium ids Hydra ships under (`nmhost::CHROMIUM_EXT_IDS`) are known
-/// in advance and need no token.
-fn origin_preauthorized(origin: &str) -> bool {
-    origin
+/// in advance and need no token; nor do the origins the user `allowed`.
+fn origin_preauthorized(origin: &str, allowed: &[String]) -> bool {
+    let origin = origin.trim_end_matches('/');
+    let pinned = origin
         .strip_prefix("chrome-extension://")
-        .is_some_and(|id| crate::nmhost::CHROMIUM_EXT_IDS.contains(&id.trim_end_matches('/')))
+        .is_some_and(|id| crate::nmhost::CHROMIUM_EXT_IDS.contains(&id));
+    pinned || allowed.iter().any(|t| t.trim_end_matches('/') == origin)
 }
 
 /// The one frame an unauthenticated socket may send: `auth` with the
@@ -982,28 +1066,69 @@ mod tests {
 
     /// Any extension context may open the socket — a side-loaded Chromium
     /// build, every Firefox and Safari install — but only the ids Hydra
-    /// ships under are trusted on sight; the rest prove themselves with the
+    /// ships under are allowed on sight; the rest prove themselves with the
     /// token. A web page never gets past the handshake.
     #[test]
     fn any_extension_may_connect_but_only_pinned_ids_skip_the_token() {
         for id in crate::nmhost::CHROMIUM_EXT_IDS {
             assert!(origin_is_extension(&format!("chrome-extension://{id}")));
-            assert!(origin_preauthorized(&format!("chrome-extension://{id}")));
-            assert!(origin_preauthorized(&format!("chrome-extension://{id}/")));
+            assert!(origin_preauthorized(
+                &format!("chrome-extension://{id}"),
+                &[]
+            ));
+            assert!(origin_preauthorized(
+                &format!("chrome-extension://{id}/"),
+                &[]
+            ));
         }
         let sideloaded = "chrome-extension://kbopajngnjmmidookpofpjllbjfdlbhp";
         assert!(origin_is_extension(sideloaded));
-        assert!(!origin_preauthorized(sideloaded));
+        assert!(!origin_preauthorized(sideloaded, &[]));
         for origin in [
             "moz-extension://8b2c1f0e-1d2e-4c5a-9f00-000000000000",
             "safari-web-extension://ABCDEF",
         ] {
             assert!(origin_is_extension(origin));
-            assert!(!origin_preauthorized(origin));
+            assert!(!origin_preauthorized(origin, &[]));
         }
         for origin in ["chrome-extension://", "https://example.com", ""] {
             assert!(!origin_is_extension(origin), "{origin:?}");
-            assert!(!origin_preauthorized(origin), "{origin:?}");
+            assert!(!origin_preauthorized(origin, &[]), "{origin:?}");
+        }
+    }
+
+    /// A Firefox origin is a per-install UUID nobody can pin, so the user's
+    /// own answer is what admits it — that origin exactly, and no other.
+    #[test]
+    fn an_allowed_origin_skips_the_token_and_only_that_one() {
+        let allowed = vec!["moz-extension://e88b5464-98e6-41c8-a457-f4887b0486e1".to_string()];
+        assert!(origin_preauthorized(&allowed[0], &allowed));
+        assert!(origin_preauthorized(&format!("{}/", allowed[0]), &allowed));
+        for other in [
+            "moz-extension://00000000-98e6-41c8-a457-f4887b0486e1",
+            "moz-extension://e88b5464-98e6-41c8-a457-f4887b0486e",
+            "chrome-extension://e88b5464-98e6-41c8-a457-f4887b0486e1",
+        ] {
+            assert!(!origin_preauthorized(other, &allowed), "{other}");
+        }
+    }
+
+    /// With a native host the extension is refused once (stale token), asks
+    /// the host and comes back with the token: nobody is bothered. Without
+    /// one, the second refusal asks — once per run, whatever the answer.
+    #[test]
+    fn only_a_second_tokenless_refusal_asks_and_only_once() {
+        let mut ledger = TrustLedger::default();
+        let (hosted, hostless) = ("moz-extension://hosted", "moz-extension://hostless");
+
+        assert!(!ledger.refused(hosted));
+        ledger.authenticated(hosted);
+        assert!(!ledger.refused(hosted), "a token in between starts over");
+
+        assert!(!ledger.refused(hostless));
+        assert!(ledger.refused(hostless));
+        for _ in 0..3 {
+            assert!(!ledger.refused(hostless), "asked already this run");
         }
     }
 
@@ -1066,19 +1191,38 @@ mod tests {
         Some((hdr[0] & 0x0F, body))
     }
 
-    /// A server serving `serve_ws` with token "tok" on an ephemeral port.
-    fn ws_server() -> u16 {
+    /// A server serving `serve_ws` with token "tok" on an ephemeral port,
+    /// with its own event channel so no test sees another's trust requests.
+    fn ws_server_with_events() -> (u16, UnboundedReceiver<ExtEvent>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
         let port = listener.local_addr().expect("address").port();
+        let (tx, rx) = unbounded_channel();
+        let allowed = || vec![ALLOWED.to_string()];
+        let gate = std::sync::Arc::new(WsGate::new("tok".into(), allowed, tx));
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                std::thread::spawn(move || serve_ws(stream, "tok"));
+                let gate = gate.clone();
+                std::thread::spawn(move || serve_ws(stream, &gate));
             }
         });
-        port
+        (port, rx)
+    }
+
+    fn ws_server() -> u16 {
+        ws_server_with_events().0
+    }
+
+    /// Opens a socket, sends a tokenless `auth` and reads to the close.
+    fn knock_without_token(port: u16, origin: &str) -> serde_json::Value {
+        let (mut reader, mut out) = ws_client(port, origin).expect("admitted");
+        client_send(&mut out, r#"{"type":"auth","id":1}"#);
+        let (_, reply) = client_recv(&mut reader).expect("auth reply");
+        while client_recv(&mut reader).is_some() {}
+        reply
     }
 
     const SIDELOADED: &str = "chrome-extension://kbopajngnjmmidookpofpjllbjfdlbhp";
+    const ALLOWED: &str = "moz-extension://7d0c1a4e-allowed-by-the-user";
 
     /// The defect: a freshly loaded unpacked build was thrown out at the
     /// handshake. Now it gets in, and the ipc.json token — which it can only
@@ -1130,7 +1274,7 @@ mod tests {
         }
     }
 
-    /// The ids Hydra ships under are trusted on sight: a request goes
+    /// The ids Hydra ships under are allowed on sight: a request goes
     /// through at once, and the `auth` the extension sends anyway (it does
     /// not know which id it has) is agreed to whatever it carries.
     #[test]
@@ -1151,6 +1295,42 @@ mod tests {
             (reply["ok"].as_bool(), reply["id"].as_u64()),
             (Some(true), Some(2))
         );
+    }
+
+    /// The reported defect: Firefox with no native host to fetch a token was
+    /// refused forever. Its second tokenless knock now puts the question to
+    /// the user, and still admits nothing by itself.
+    #[test]
+    fn a_hostless_extension_is_refused_but_raises_one_trust_request() {
+        let (port, mut events) = ws_server_with_events();
+        let origin = "moz-extension://e88b5464-98e6-41c8-a457-f4887b0486e1";
+        for _ in 0..3 {
+            let reply = knock_without_token(port, origin);
+            assert_eq!(reply["error"], "unauthorized");
+        }
+        match events.try_recv() {
+            Ok(ExtEvent::TrustRequest(o)) => assert_eq!(o, origin),
+            other => panic!("expected one trust request, got {other:?}"),
+        }
+        assert!(events.try_recv().is_err(), "asked once, not per knock");
+    }
+
+    /// Once allowed, the same tokenless `auth` is agreed to and requests go
+    /// through, without a token ever reaching the extension.
+    #[test]
+    fn an_allowed_origin_is_admitted_without_a_token() {
+        let (port, mut events) = ws_server_with_events();
+        let (mut reader, mut out) = ws_client(port, ALLOWED).expect("admitted");
+        client_send(&mut out, r#"{"type":"auth","id":1}"#);
+        let (_, reply) = client_recv(&mut reader).expect("auth reply");
+        assert_eq!(reply["ok"], true);
+        client_send(&mut out, r#"{"type":"ping","id":2}"#);
+        let (_, reply) = client_recv(&mut reader).expect("ping reply");
+        assert_eq!(
+            (reply["ok"].as_bool(), reply["id"].as_u64()),
+            (Some(true), Some(2))
+        );
+        assert!(events.try_recv().is_err());
     }
 
     /// A page is not an extension, and no token helps it.

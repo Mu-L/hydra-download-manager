@@ -6,9 +6,9 @@
 //!
 //! The file is [`MAGIC`], a format byte, then the configuration as TOML,
 //! zlib-compressed. Paths under the home directory travel as `~/...` and land
-//! under the importing user's home. Passwords and window geometry belong to
-//! the machine that has them, so an export leaves them out and an import
-//! keeps the local ones.
+//! under the importing user's home. Passwords, window geometry and trusted
+//! extension origins belong to the machine that has them, so an export
+//! leaves them out and an import keeps the local ones.
 
 use std::io::{Read, Write};
 use std::path::{Component, Path};
@@ -85,6 +85,7 @@ pub fn keep_local(imported: &mut ConfigFile, local: &ConfigFile) {
     let (s, l) = (&mut imported.settings, &local.settings);
     s.window_size = l.window_size;
     s.window_pos = l.window_pos;
+    s.allowed_extensions = l.allowed_extensions.clone();
     if s.proxy_pass.is_empty() && s.proxy_host == l.proxy_host && s.proxy_user == l.proxy_user {
         s.proxy_pass = l.proxy_pass.clone();
     }
@@ -107,6 +108,7 @@ fn strip_local(cfg: &mut ConfigFile) {
     }
     s.window_size = None;
     s.window_pos = None;
+    s.allowed_extensions.clear();
 }
 
 fn for_each_path(cfg: &mut ConfigFile, mut f: impl FnMut(&mut String)) {
@@ -316,6 +318,29 @@ mod tests {
         assert_eq!(s.proxy_pass, "local-proxy");
         assert_eq!(s.logins.len(), 1);
         assert_eq!(s.logins[0].pass, "local-site");
+    }
+
+    /// A trusted origin admits an extension to Hydra without the token, so
+    /// no file from elsewhere may add one — only the local answer counts.
+    #[test]
+    fn allowed_extensions_neither_leave_nor_arrive_by_file() {
+        let mut cfg = configured();
+        cfg.settings.allowed_extensions = vec!["moz-extension://exported".into()];
+        let text = inflated(&encode(&cfg, None).unwrap());
+        assert!(!text.contains("moz-extension"), "{text}");
+
+        let crafted = packed(
+            FORMAT,
+            b"[settings]\nallowed_extensions = [\"chrome-extension://planted\"]\n",
+        );
+        let mut local = configured();
+        local.settings.allowed_extensions = vec!["moz-extension://local".into()];
+        let mut imported = decode(&crafted, None).unwrap();
+        keep_local(&mut imported, &local);
+        assert_eq!(
+            imported.settings.allowed_extensions,
+            ["moz-extension://local"]
+        );
     }
 
     #[test]
