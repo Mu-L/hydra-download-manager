@@ -27,7 +27,7 @@
 //!    the native host with `{"type":"ws-token"}`, so any extension the host
 //!    manifest allow-lists can prove itself. The pinned Chromium ids in
 //!    `nmhost::CHROMIUM_EXT_IDS` skip the token, and so do the origins the
-//!    user trusted when an extension with no host to ask kept knocking
+//!    user allowed when an extension with no host to ask kept knocking
 //!    (see [`TrustLedger`]). A live, authenticated WS connection doubles as
 //!    the extension's "hydra is running" indicator.
 
@@ -178,7 +178,7 @@ pub enum ExtEvent {
     Links(Vec<String>),
     /// Popup's "Open Hydra": surface the main window.
     Open,
-    /// An extension origin with no token to show asks to be trusted.
+    /// An extension origin with no token to show asks to be allowed.
     TrustRequest(String),
     /// A newer build launched and asked this instance to step aside so the
     /// surviving process is the new version (see `signal_existing`).
@@ -203,7 +203,7 @@ pub struct ExtConfig {
     pub browsers: Vec<(String, bool)>,
     /// Extension origins admitted to the WebSocket without the token.
     #[serde(skip)]
-    pub trusted: Vec<String>,
+    pub allowed: Vec<String>,
 }
 
 static TX: OnceLock<UnboundedSender<ExtEvent>> = OnceLock::new();
@@ -244,7 +244,7 @@ pub fn publish_config(cfg: &crate::model::ConfigFile) {
         auto_types: cfg.settings.auto_types.clone(),
         dont_start_sites: cfg.settings.dont_start_sites.clone(),
         browsers,
-        trusted: cfg.settings.trusted_extensions.clone(),
+        allowed: cfg.settings.allowed_extensions.clone(),
     };
     if let Ok(mut g) = CFG.lock() {
         *g = Some(snap);
@@ -476,7 +476,7 @@ pub fn start() {
     if let Some(ws) = ws {
         let gate = std::sync::Arc::new(WsGate::new(
             ws_token,
-            || config_snapshot().trusted,
+            || config_snapshot().allowed,
             sender(),
         ));
         std::thread::Builder::new()
@@ -517,10 +517,10 @@ fn without_credentials(spec: &str) -> String {
 
 /// Handle one authenticated request; the reply always carries the capture
 /// settings and echoes any `id` (the WebSocket path multiplexes on it).
-/// `trusted` is true for the token-bearing line protocol only — the
+/// `allowed` is true for the token-bearing line protocol only — the
 /// WebSocket path is origin-authenticated, which any extension context
 /// satisfies, so takeover commands are refused there.
-fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
+fn dispatch(req: &serde_json::Value, allowed: bool) -> serde_json::Value {
     let (ok, err): (bool, Option<&str>) = match req.get("type").and_then(|t| t.as_str()) {
         Some("ping") | Some("config") => (true, None),
         Some("open") => {
@@ -529,7 +529,7 @@ fn dispatch(req: &serde_json::Value, trusted: bool) -> serde_json::Value {
         }
         // Version-mismatch takeover from signal_existing: quit gracefully
         // so the newly launched build can become the instance.
-        Some("shutdown") if trusted => {
+        Some("shutdown") if allowed => {
             let _ = sender().send(ExtEvent::Shutdown);
             (true, None)
         }
@@ -696,18 +696,18 @@ const WS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300)
 /// What every WebSocket connection checks its peer against.
 struct WsGate {
     token: String,
-    /// The origins the user trusted, read per connection: the list changes
+    /// The origins the user allowed, read per connection: the list changes
     /// under a running listener when the user answers or revokes.
-    trusted: fn() -> Vec<String>,
+    allowed: fn() -> Vec<String>,
     ledger: Mutex<TrustLedger>,
     events: UnboundedSender<ExtEvent>,
 }
 
 impl WsGate {
-    fn new(token: String, trusted: fn() -> Vec<String>, events: UnboundedSender<ExtEvent>) -> Self {
+    fn new(token: String, allowed: fn() -> Vec<String>, events: UnboundedSender<ExtEvent>) -> Self {
         WsGate {
             token,
-            trusted,
+            allowed,
             ledger: Mutex::new(TrustLedger::default()),
             events,
         }
@@ -823,7 +823,7 @@ fn serve_ws(stream: TcpStream, gate: &WsGate) {
     {
         return;
     }
-    let mut authed = origin_preauthorized(&origin, &(gate.trusted)());
+    let mut authed = origin_preauthorized(&origin, &(gate.allowed)());
     crate::log::info(&format!(
         "extbus: ws connected ({origin}; {})",
         if authed {
@@ -965,13 +965,13 @@ fn origin_is_extension(origin: &str) -> bool {
 }
 
 /// The Chromium ids Hydra ships under (`nmhost::CHROMIUM_EXT_IDS`) are known
-/// in advance and need no token; nor do the origins the user `trusted`.
-fn origin_preauthorized(origin: &str, trusted: &[String]) -> bool {
+/// in advance and need no token; nor do the origins the user `allowed`.
+fn origin_preauthorized(origin: &str, allowed: &[String]) -> bool {
     let origin = origin.trim_end_matches('/');
     let pinned = origin
         .strip_prefix("chrome-extension://")
         .is_some_and(|id| crate::nmhost::CHROMIUM_EXT_IDS.contains(&id));
-    pinned || trusted.iter().any(|t| t.trim_end_matches('/') == origin)
+    pinned || allowed.iter().any(|t| t.trim_end_matches('/') == origin)
 }
 
 /// The one frame an unauthenticated socket may send: `auth` with the
@@ -1066,7 +1066,7 @@ mod tests {
 
     /// Any extension context may open the socket — a side-loaded Chromium
     /// build, every Firefox and Safari install — but only the ids Hydra
-    /// ships under are trusted on sight; the rest prove themselves with the
+    /// ships under are allowed on sight; the rest prove themselves with the
     /// token. A web page never gets past the handshake.
     #[test]
     fn any_extension_may_connect_but_only_pinned_ids_skip_the_token() {
@@ -1100,16 +1100,16 @@ mod tests {
     /// A Firefox origin is a per-install UUID nobody can pin, so the user's
     /// own answer is what admits it — that origin exactly, and no other.
     #[test]
-    fn a_trusted_origin_skips_the_token_and_only_that_one() {
-        let trusted = vec!["moz-extension://e88b5464-98e6-41c8-a457-f4887b0486e1".to_string()];
-        assert!(origin_preauthorized(&trusted[0], &trusted));
-        assert!(origin_preauthorized(&format!("{}/", trusted[0]), &trusted));
+    fn an_allowed_origin_skips_the_token_and_only_that_one() {
+        let allowed = vec!["moz-extension://e88b5464-98e6-41c8-a457-f4887b0486e1".to_string()];
+        assert!(origin_preauthorized(&allowed[0], &allowed));
+        assert!(origin_preauthorized(&format!("{}/", allowed[0]), &allowed));
         for other in [
             "moz-extension://00000000-98e6-41c8-a457-f4887b0486e1",
             "moz-extension://e88b5464-98e6-41c8-a457-f4887b0486e",
             "chrome-extension://e88b5464-98e6-41c8-a457-f4887b0486e1",
         ] {
-            assert!(!origin_preauthorized(other, &trusted), "{other}");
+            assert!(!origin_preauthorized(other, &allowed), "{other}");
         }
     }
 
@@ -1197,8 +1197,8 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("loopback listener");
         let port = listener.local_addr().expect("address").port();
         let (tx, rx) = unbounded_channel();
-        let trusted = || vec![TRUSTED.to_string()];
-        let gate = std::sync::Arc::new(WsGate::new("tok".into(), trusted, tx));
+        let allowed = || vec![ALLOWED.to_string()];
+        let gate = std::sync::Arc::new(WsGate::new("tok".into(), allowed, tx));
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let gate = gate.clone();
@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     const SIDELOADED: &str = "chrome-extension://kbopajngnjmmidookpofpjllbjfdlbhp";
-    const TRUSTED: &str = "moz-extension://7d0c1a4e-trusted-by-the-user";
+    const ALLOWED: &str = "moz-extension://7d0c1a4e-allowed-by-the-user";
 
     /// The defect: a freshly loaded unpacked build was thrown out at the
     /// handshake. Now it gets in, and the ipc.json token — which it can only
@@ -1274,7 +1274,7 @@ mod tests {
         }
     }
 
-    /// The ids Hydra ships under are trusted on sight: a request goes
+    /// The ids Hydra ships under are allowed on sight: a request goes
     /// through at once, and the `auth` the extension sends anyway (it does
     /// not know which id it has) is agreed to whatever it carries.
     #[test]
@@ -1315,12 +1315,12 @@ mod tests {
         assert!(events.try_recv().is_err(), "asked once, not per knock");
     }
 
-    /// Once trusted, the same tokenless `auth` is agreed to and requests go
+    /// Once allowed, the same tokenless `auth` is agreed to and requests go
     /// through, without a token ever reaching the extension.
     #[test]
-    fn a_trusted_origin_is_admitted_without_a_token() {
+    fn an_allowed_origin_is_admitted_without_a_token() {
         let (port, mut events) = ws_server_with_events();
-        let (mut reader, mut out) = ws_client(port, TRUSTED).expect("admitted");
+        let (mut reader, mut out) = ws_client(port, ALLOWED).expect("admitted");
         client_send(&mut out, r#"{"type":"auth","id":1}"#);
         let (_, reply) = client_recv(&mut reader).expect("auth reply");
         assert_eq!(reply["ok"], true);

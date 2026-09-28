@@ -1010,7 +1010,7 @@ pub struct Settings {
     /// WebSocket origins (`moz-extension://<uuid>`, ...) the user allowed to
     /// connect without the native host's token. Local to this profile: an
     /// origin names one browser install, so it neither exports nor imports.
-    pub trusted_extensions: Vec<String>,
+    pub allowed_extensions: Vec<String>,
     pub dont_start_sites: String,
     // Save to tab
     pub remember_last_dir: bool,
@@ -1158,7 +1158,7 @@ impl Default for Settings {
             // A fresh config already has them, so there is nothing to add.
             ai_formats_seeded: true,
             portable_capture: false,
-            trusted_extensions: Vec::new(),
+            allowed_extensions: Vec::new(),
             dont_start_sites: "*.update.microsoft.com download.windowsupdate.com".into(),
             remember_last_dir: true,
             server_file_date: false,
@@ -1277,7 +1277,7 @@ impl Settings {
             capture_browsers,
             auto_types,
             portable_capture,
-            trusted_extensions,
+            allowed_extensions,
             dont_start_sites,
             remember_last_dir,
             server_file_date,

@@ -2827,10 +2827,10 @@ impl App {
     }
 
     fn trust_extension(&mut self, origin: String) {
-        let trusted = &mut self.cfg.settings.trusted_extensions;
-        if !trusted.contains(&origin) {
+        let allowed = &mut self.cfg.settings.allowed_extensions;
+        if !allowed.contains(&origin) {
             crate::log::info(&format!("extbus: trusting {origin}"));
-            trusted.push(origin);
+            allowed.push(origin);
             self.save_config();
         }
     }
@@ -11457,7 +11457,7 @@ mod tests {
         }
         let _ = app.update(Message::CloseThis(win));
         assert!(
-            app.cfg.settings.trusted_extensions.is_empty(),
+            app.cfg.settings.allowed_extensions.is_empty(),
             "No trusted it"
         );
 
@@ -11465,12 +11465,12 @@ mod tests {
             let _ = app.update(request());
             let _ = app.update(Message::ConfirmYes);
         }
-        assert_eq!(app.cfg.settings.trusted_extensions, [origin]);
+        assert_eq!(app.cfg.settings.allowed_extensions, [origin]);
 
         app.options.draft = app.cfg.settings.clone();
         app.options.apply(OptField::Untrust(0));
         app.options.apply(OptField::Untrust(0));
-        assert!(app.options.draft.trusted_extensions.is_empty());
+        assert!(app.options.draft.allowed_extensions.is_empty());
     }
 
     /// The Shortcuts dialog accepted anything. On close the table holds one

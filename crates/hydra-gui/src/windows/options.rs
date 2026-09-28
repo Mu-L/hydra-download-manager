@@ -598,8 +598,8 @@ impl OptionsState {
             OptField::Clipboard(b) => s.monitor_clipboard = b,
             OptField::PortableCapture(b) => s.portable_capture = b,
             OptField::Untrust(i) => {
-                if i < s.trusted_extensions.len() {
-                    s.trusted_extensions.remove(i);
+                if i < s.allowed_extensions.len() {
+                    s.allowed_extensions.remove(i);
                 }
             }
             OptField::Browser(i, b) => {
@@ -1595,8 +1595,8 @@ fn extensions(app: &App) -> El<'_> {
         ),
     ]
     .spacing(10);
-    let trusted = &app.options.draft.trusted_extensions;
-    if !trusted.is_empty() {
+    let allowed = &app.options.draft.allowed_extensions;
+    if !allowed.is_empty() {
         let mut list = column![
             section(tr("Trusted extensions")),
             text(tr("Allowed to connect without Hydra's native host."))
@@ -1604,7 +1604,7 @@ fn extensions(app: &App) -> El<'_> {
                 .color(theme::dim_text(&iced::Theme::Light)),
         ]
         .spacing(6);
-        for (i, origin) in trusted.iter().enumerate() {
+        for (i, origin) in allowed.iter().enumerate() {
             list = list.push(
                 row![
                     text(origin.clone())
@@ -2138,7 +2138,7 @@ mod tests {
     #[test]
     fn the_extensions_page_lays_out_its_trusted_origins() {
         let mut app = App::default();
-        app.options.draft.trusted_extensions = vec!["moz-extension://a".into()];
+        app.options.draft.allowed_extensions = vec!["moz-extension://a".into()];
         let _page: El<'_> = extensions(&app);
     }
 

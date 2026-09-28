@@ -85,7 +85,7 @@ pub fn keep_local(imported: &mut ConfigFile, local: &ConfigFile) {
     let (s, l) = (&mut imported.settings, &local.settings);
     s.window_size = l.window_size;
     s.window_pos = l.window_pos;
-    s.trusted_extensions = l.trusted_extensions.clone();
+    s.allowed_extensions = l.allowed_extensions.clone();
     if s.proxy_pass.is_empty() && s.proxy_host == l.proxy_host && s.proxy_user == l.proxy_user {
         s.proxy_pass = l.proxy_pass.clone();
     }
@@ -108,7 +108,7 @@ fn strip_local(cfg: &mut ConfigFile) {
     }
     s.window_size = None;
     s.window_pos = None;
-    s.trusted_extensions.clear();
+    s.allowed_extensions.clear();
 }
 
 fn for_each_path(cfg: &mut ConfigFile, mut f: impl FnMut(&mut String)) {
@@ -323,22 +323,22 @@ mod tests {
     /// A trusted origin admits an extension to Hydra without the token, so
     /// no file from elsewhere may add one — only the local answer counts.
     #[test]
-    fn trusted_extensions_neither_leave_nor_arrive_by_file() {
+    fn allowed_extensions_neither_leave_nor_arrive_by_file() {
         let mut cfg = configured();
-        cfg.settings.trusted_extensions = vec!["moz-extension://exported".into()];
+        cfg.settings.allowed_extensions = vec!["moz-extension://exported".into()];
         let text = inflated(&encode(&cfg, None).unwrap());
         assert!(!text.contains("moz-extension"), "{text}");
 
         let crafted = packed(
             FORMAT,
-            b"[settings]\ntrusted_extensions = [\"chrome-extension://planted\"]\n",
+            b"[settings]\nallowed_extensions = [\"chrome-extension://planted\"]\n",
         );
         let mut local = configured();
-        local.settings.trusted_extensions = vec!["moz-extension://local".into()];
+        local.settings.allowed_extensions = vec!["moz-extension://local".into()];
         let mut imported = decode(&crafted, None).unwrap();
         keep_local(&mut imported, &local);
         assert_eq!(
-            imported.settings.trusted_extensions,
+            imported.settings.allowed_extensions,
             ["moz-extension://local"]
         );
     }
