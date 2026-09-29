@@ -277,6 +277,19 @@ pub fn live_progress(max_seconds: Option<u64>, recorded: Option<f64>) -> f32 {
 }
 
 impl DownloadItem {
+    /// Name the file, made portable first: every name in the list is one
+    /// Windows, macOS and Linux can all create, whoever supplied it. A name
+    /// with nothing writable left in it is ignored. Returns whether the
+    /// stored name changed.
+    pub fn set_file_name(&mut self, name: &str) -> bool {
+        let Some(name) = hya_net::filename::portable(name) else {
+            return false;
+        };
+        let changed = self.file_name != name;
+        self.file_name = name;
+        changed
+    }
+
     pub fn full_path(&self) -> PathBuf {
         PathBuf::from(&self.save_dir).join(&self.file_name)
     }

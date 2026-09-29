@@ -46,6 +46,7 @@
 pub mod base64;
 pub mod cookies;
 pub mod digest;
+pub mod filename;
 pub mod framebuf;
 pub mod ftp;
 pub mod ftp_origin;

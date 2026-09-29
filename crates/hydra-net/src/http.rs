@@ -374,7 +374,7 @@ impl Probe {
         let name = named("filename*")
             .and_then(|v| decode_ext_value(v))
             .or_else(|| named("filename").map(|v| decode_legacy_filename(v)))?;
-        safe_leaf(&name)
+        crate::filename::portable(&name)
     }
 }
 
@@ -510,106 +510,6 @@ fn unquote(v: &str) -> String {
         }
     }
     out
-}
-
-/// A server-supplied name reduced to a leaf that is safe to write: inside the
-/// output directory, free of the characters that only ever lie about what a
-/// name says, and short enough for a filesystem to accept.
-///
-/// Both path separators are cut, not just the platform's. A Windows path in
-/// the header (`..\..\evil.exe`) reaches a Unix client as a string
-/// `file_name` sees no separator in and hands back whole — at best a
-/// bizarrely named file, and on a Windows client a write outside the download
-/// folder. `file_name` still runs after the cut, because it is what strips a
-/// drive-relative `C:` prefix on the platform where that means something.
-fn safe_leaf(name: &str) -> Option<String> {
-    let leaf = strip_invisibles(name.rsplit(['/', '\\']).next().unwrap_or(name));
-    let base = std::path::Path::new(leaf.trim())
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())?;
-    if base.is_empty() || base == "." || base == ".." {
-        None
-    } else {
-        Some(clamp_name(&base))
-    }
-}
-
-/// The characters a filename is never made of, removed.
-///
-/// Controls (C0, DEL, C1) go because a newline or a NUL in a name is a
-/// truncated write or a mangled log line, never a name.
-///
-/// The bidi formatting characters go for a sharper reason, and it is the one
-/// that makes this matter for Persian, Arabic and Hebrew names specifically.
-/// `U+202E` (RIGHT-TO-LEFT OVERRIDE) reverses the display of everything after
-/// it, so a server can offer `عکس\u{202e}gpj.exe` and have every renderer —
-/// the download list, the File Info dialog, the system file manager — draw it
-/// as `عکس‏exe.jpg`, while what lands on disk and runs is an `.exe`. Nothing
-/// in the header distinguishes that from a real RTL name, and no RTL name
-/// needs it: the bidi algorithm takes direction from the letters themselves,
-/// so Arabic script and Hebrew render right-to-left with no marks at all.
-///
-/// Two invisible characters are deliberately KEPT, because removing them
-/// corrupts real names rather than protecting them: `U+200C` (ZERO WIDTH
-/// NON-JOINER) is the نیم‌فاصله that Persian spelling depends on — `می‌روم`
-/// is one word, `میروم` is a misspelling — and `U+200D` (ZERO WIDTH JOINER)
-/// is what holds Indic conjuncts and multi-person emoji together. Neither
-/// reorders anything, so neither can spoof an extension.
-fn strip_invisibles(s: &str) -> String {
-    s.chars()
-        .filter(|&c| {
-            !matches!(c,
-                '\u{0}'..='\u{1f}'      // C0 controls
-                | '\u{7f}'..='\u{9f}'   // DEL and the C1 controls
-                | '\u{200b}'            // zero width space
-                | '\u{200e}' | '\u{200f}' // LRM / RLM
-                | '\u{202a}'..='\u{202e}' // embeddings and overrides
-                | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-                | '\u{2066}'..='\u{2069}' // isolates
-                | '\u{feff}') // BOM, when a decode left one in front
-        })
-        .collect()
-}
-
-/// The longest name mainstream filesystems accept: 255 **bytes** on ext4,
-/// APFS and exFAT; NTFS counts 255 UTF-16 units, which 255 UTF-8 bytes can
-/// never exceed.
-///
-/// The unit is the whole point. A 200-character name is unremarkable in
-/// English and unwritable in Persian, Korean or Chinese, where characters
-/// cost two and three bytes each — so a limit counted in characters passes
-/// every Latin test and fails with `ENAMETOOLONG` on exactly the names that
-/// need this code to work.
-const MAX_NAME_BYTES: usize = 255;
-
-/// `name` shortened to fit [`MAX_NAME_BYTES`], cutting the stem and keeping
-/// the extension.
-///
-/// The extension survives because it decides how the file opens and which
-/// category it is filed under; a truncation that ate it would turn a long
-/// Korean title into an extensionless blob. The cut lands on a character
-/// boundary, because half a character is not one: slicing mid-way through a
-/// three-byte `한` leaves bytes no filesystem stores and no UI draws.
-fn clamp_name(name: &str) -> String {
-    if name.len() <= MAX_NAME_BYTES {
-        return name.to_string();
-    }
-    // A leading dot is not an extension separator, and a long tail is not an
-    // extension — `report.نسخهٔ نهایی` keeps its whole name as the stem.
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() && e.len() <= 16 => (s, Some(e)),
-        _ => (name, None),
-    };
-    let budget = MAX_NAME_BYTES - ext.map_or(0, |e| e.len() + 1);
-    let mut cut = budget.min(stem.len());
-    while cut > 0 && !stem.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let stem = stem[..cut].trim_end();
-    match ext {
-        Some(e) => format!("{stem}.{e}"),
-        None => stem.to_string(),
-    }
 }
 
 /// Build a complete HTTP/1.1 request head for `t`: request line, `Host`,
@@ -3498,10 +3398,11 @@ mod tests {
             named("attachment; filename=\"Live; Loud.mp3\"").suggested_filename(),
             Some("Live; Loud.mp3".into())
         );
-        // An escaped quote is one character of the name.
+        // An escaped quote is one character of the name, and one Windows
+        // cannot store, so it is written as `_`.
         assert_eq!(
             named("attachment; filename=\"say \\\"hi\\\".txt\"").suggested_filename(),
-            Some("say \"hi\".txt".into())
+            Some("say _hi_.txt".into())
         );
         // Unquoted token, with a parameter after it.
         assert_eq!(
