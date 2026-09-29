@@ -3096,6 +3096,7 @@ impl App {
         d.status_line = i18n::tr("Connecting...");
         d.last_try = Some(fmt::now_unix());
         d.conns.clear();
+        repair_unstarted_name(d);
         let part = d.part_file().to_string_lossy().into_owned();
         d.part_path = Some(part.clone());
         if let Some(si) = d.stream.clone() {
@@ -3424,7 +3425,7 @@ impl App {
             .or_else(|| self.cat_dir(None))
             .unwrap_or_default();
         if let Some(d) = self.item_mut(id) {
-            d.file_name = name;
+            d.set_file_name(&name);
             d.category = cat;
             d.save_dir = dir;
         }
@@ -3726,7 +3727,7 @@ impl App {
                     .unwrap_or_else(|| ".".into());
                 let id = self.add_item(s.url.clone(), None, None);
                 if let Some(d) = self.item_mut(id) {
-                    d.file_name = file_name;
+                    d.set_file_name(&file_name);
                     d.category = category;
                     d.save_dir = save_dir;
                     d.cookies = s.cookies.clone();
@@ -3862,7 +3863,7 @@ impl App {
             d.category = Some(fi.category.clone());
             d.save_dir = fi.save_dir.clone();
             if !fi.file_name.trim().is_empty() {
-                d.file_name = fi.file_name.trim().to_string();
+                d.set_file_name(&fi.file_name);
                 // Typing in the box is the user naming the file:
                 // pin it so the probe this Start Download is about
                 // to fire cannot hand the name back to the server.
@@ -4051,7 +4052,7 @@ impl App {
                 let cat = categorize(&name, &self.cfg.categories);
                 let dir = self.cat_dir(cat.as_deref());
                 if let Some(d) = self.item_mut(id) {
-                    d.file_name = name;
+                    d.set_file_name(&name);
                     if let Some(c) = cat {
                         d.category = Some(c);
                     }
@@ -4582,8 +4583,7 @@ impl App {
             }
             if let Some(name) = name.filter(|n| !n.is_empty()) {
                 if may_adopt_name(d) {
-                    adopted = d.file_name != name;
-                    d.file_name = name;
+                    adopted = d.set_file_name(&name);
                 }
             }
         }
@@ -8068,7 +8068,7 @@ fn write_capture_extras(
         d.proxy = p;
     }
     if let Some(n) = extras.name {
-        d.file_name = n;
+        d.set_file_name(&n);
         if let Some((cat, dir)) = filing {
             d.category = cat;
             if let Some(dir) = dir {
@@ -8209,6 +8209,19 @@ fn may_adopt_name(d: &DownloadItem) -> bool {
     !d.name_locked && d.downloaded == 0 && d.held.is_empty()
 }
 
+/// Make the name of a download with nothing on disk yet portable.
+///
+/// A list saved before every name went through `set_file_name` can hold one
+/// Windows refuses (`a:b.mp4`); such an entry failed on every start with
+/// `os error 123` and had to be deleted. With no bytes written there is no
+/// file to lose, so the name, and the staging path derived from it, are fixed.
+fn repair_unstarted_name(d: &mut DownloadItem) {
+    let name = d.file_name.clone();
+    if d.downloaded == 0 && d.held.is_empty() && d.set_file_name(&name) {
+        d.part_path = None;
+    }
+}
+
 /// Carry the edits typed into a still-open File Info dialog onto its item, and
 /// move the finished file to match.
 ///
@@ -8230,7 +8243,7 @@ fn adopt_dialog_edits(
     let old = d.full_path();
     let name = fi.file_name.trim();
     if fi.name_touched && !name.is_empty() {
-        d.file_name = name.to_string();
+        d.set_file_name(name);
         d.name_locked = true;
     }
     if fi.dir_touched && !fi.save_dir.trim().is_empty() {
@@ -9954,6 +9967,60 @@ mod tests {
     /// the item's own value alone. A capture that arrives with the browser's
     /// proxy is reachable through that proxy and nowhere else, so it becomes
     /// this download's route — Options is never touched.
+    #[test]
+    fn a_captured_title_windows_cannot_store_is_made_writable() {
+        let mut d = item(1, "/downloads", "index.html", None, DlState::Queued);
+        write_capture_extras(
+            &mut d,
+            CaptureExtras {
+                name: Some("Q:ماینکرفت از هیچ (3) | شوکه شدیم!!.mp4".into()),
+                ..CaptureExtras::default()
+            },
+            None,
+        );
+        assert_eq!(d.file_name, "Q_ماینکرفت از هیچ (3) _ شوکه شدیم!!.mp4");
+    }
+
+    #[test]
+    fn an_unstarted_download_saved_with_a_bad_name_is_repaired_on_start() {
+        let mut d = item(1, "/dl", "Q:clip | part.mp4", None, DlState::Error);
+        d.part_path = Some("/dl/Q:clip | part.mp4.part".into());
+
+        repair_unstarted_name(&mut d);
+
+        assert_eq!(d.file_name, "Q_clip _ part.mp4");
+        assert_eq!(
+            d.part_file(),
+            std::path::Path::new("/dl/Q_clip _ part.mp4.part")
+        );
+    }
+
+    #[test]
+    fn a_download_with_bytes_on_disk_keeps_the_name_they_were_written_under() {
+        let mut d = item(1, "/dl", "a:b.iso", None, DlState::Paused);
+        d.part_path = Some("/dl/a:b.iso.part".into());
+        d.held = vec![(0, 4096)];
+        d.downloaded = 4096;
+
+        repair_unstarted_name(&mut d);
+
+        assert_eq!(d.file_name, "a:b.iso");
+        assert_eq!(d.part_path.as_deref(), Some("/dl/a:b.iso.part"));
+    }
+
+    #[test]
+    fn a_name_typed_in_the_dialog_is_made_writable() {
+        let mut d = item(1, "/dl", "x.zip", None, DlState::Paused);
+        let fi = FileInfoState {
+            file_name: "report: final?.pdf".into(),
+            save_dir: "/dl".into(),
+            name_touched: true,
+            ..FileInfoState::default()
+        };
+        let _ = adopt_dialog_edits(&mut d, &fi);
+        assert_eq!(d.file_name, "report_ final_.pdf");
+    }
+
     #[test]
     fn a_capture_writes_only_what_the_browser_actually_knew() {
         let mut d = item(1, "/downloads", "pack.zip", None, DlState::Queued);

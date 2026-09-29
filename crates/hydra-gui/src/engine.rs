@@ -1156,8 +1156,7 @@ pub fn url_file_name(url: &str) -> Option<String> {
         .rsplit('/')
         .next()
         .unwrap_or("");
-    let name = hya_net::url::percent_decode(seg);
-    (!name.is_empty()).then_some(name)
+    hya_net::filename::portable(&hya_net::url::percent_decode(seg))
 }
 
 pub fn file_name_from_url(url: &str) -> String {

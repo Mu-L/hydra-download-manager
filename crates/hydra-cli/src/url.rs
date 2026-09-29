@@ -225,7 +225,8 @@ impl Url {
     /// Decoding admits characters the encoded segment could not contain, so the result
     /// is reduced to its own basename afterwards — `%2F` and `%5C` are separators and
     /// `%00` truncates the name at the OS boundary, and a URL must not get to pick a
-    /// directory for a download that was never told one.
+    /// directory for a download that was never told one. The characters Windows
+    /// refuses in a name (`%3A` is `:`) are replaced, so the same URL saves anywhere.
     pub fn suggested_filename(&self) -> String {
         // Query strings and fragments are not part of a filename, and they are stripped
         // BEFORE the path is split: a query may itself contain '/', and taking the last
@@ -233,19 +234,8 @@ impl Url {
         let path = self.path.split(['?', '#']).next().unwrap_or("");
         let segment = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
         let decoded = percent_decode(segment);
-        let base = decoded
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("")
-            .split('\0')
-            .next()
-            .unwrap_or("")
-            .trim();
-        if base.is_empty() || base == "." || base == ".." {
-            "download".to_string()
-        } else {
-            base.to_string()
-        }
+        let before_nul = decoded.split('\0').next().unwrap_or("");
+        hya_net::filename::portable(before_nul).unwrap_or_else(|| "download".to_string())
     }
 
     /// Build a transport target, routing through `proxy` when one is configured.
@@ -754,6 +744,20 @@ mod tests {
                 want,
                 "{url} must not name a path outside the output directory"
             );
+        }
+    }
+
+    #[test]
+    fn a_decoded_name_windows_would_refuse_is_made_writable() {
+        for (url, want) in [
+            (
+                "https://x.org/Q%3Aclip%20%7C%20part%202.mp4",
+                "Q_clip _ part 2.mp4",
+            ),
+            ("https://x.org/notes.txt.", "notes.txt"),
+            ("https://x.org/nul.txt", "_nul.txt"),
+        ] {
+            assert_eq!(Url::parse(url).unwrap().suggested_filename(), want, "{url}");
         }
     }
 
