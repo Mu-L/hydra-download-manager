@@ -190,6 +190,15 @@ cbc = { workspace = true }
 # Writes the archive the Zip-preview end-to-end test serves back over a local
 # socket: real archiver output rather than bytes laid out by the code under test.
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# The render harness in src/render_check.rs: drives the real views through
+# iced's UserInterface and rasterizes with tiny-skia the way the software
+# compositor does, damage included — no window, no GPU.
+iced_graphics = "0.14"
+iced_renderer = "0.14"
+iced_runtime = "0.14"
+iced_tiny_skia = "0.14"
+tiny-skia = "0.11"
+bytemuck = "1"
 
 [lints]
 workspace = true
