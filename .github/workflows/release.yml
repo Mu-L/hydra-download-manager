@@ -548,8 +548,10 @@ jobs:
           docker run --rm -i -v "$IMG:/hydra.AppImage:ro" -e APPIMAGE_EXTRACT_AND_RUN=1 \
             -e GUI_CHECK="$GUI_CHECK" -e DEBIAN_FRONTEND=noninteractive \
             "ubuntu:$RELEASE" /bin/bash -s <<'SCRIPT'
+          # pipefail: no reader here may stop early (head, grep -q), or the
+          # writer's SIGPIPE fails the pipeline — exit 141, or a false `if`.
           set -euo pipefail
-          ldd --version | head -1
+          ldd --version | sed -n 1p
           cp /hydra.AppImage /tmp/hydra.AppImage
           chmod +x /tmp/hydra.AppImage
           /tmp/hydra.AppImage --hydra-version
@@ -566,7 +568,7 @@ jobs:
           apt-cache show libasound2t64 >/dev/null 2>&1 && ALSA=libasound2t64
           apt-get install -y -qq --no-install-recommends xvfb x11-utils procps \
             "$ALSA" libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 >/dev/null
-          if ldconfig -p | grep -q libxkbcommon-x11; then
+          if ldconfig -p | grep libxkbcommon-x11 >/dev/null; then
             echo "the test host has libxkbcommon-x11, so it proves nothing about the fallback" >&2
             exit 1
           fi
@@ -576,7 +578,7 @@ jobs:
           mkdir -p /tmp/gui-home
           HOME=/tmp/gui-home /tmp/hydra.AppImage >/tmp/gui.log 2>&1 &
           sleep 15
-          if ! xwininfo -root -tree | grep -q '"Hydra Download Manager"'; then
+          if ! xwininfo -root -tree | grep '"Hydra Download Manager"' >/dev/null; then
             echo "the GUI did not open its window:" >&2
             cat /tmp/gui.log >&2
             exit 1

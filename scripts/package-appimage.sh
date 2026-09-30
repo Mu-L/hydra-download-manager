@@ -117,7 +117,7 @@ done
 # GUI and every program it starts resolve.
 FALLBACK_LIBS="libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1"
 for lib in $FALLBACK_LIBS; do
-  src=$(PATH="$PATH:/sbin:/usr/sbin" ldconfig -p | awk -v lib="$lib" '$1 == lib { print $NF; exit }')
+  src=$(PATH="$PATH:/sbin:/usr/sbin" ldconfig -p | awk -v lib="$lib" '$1 == lib && !src { src = $NF } END { print src }')
   [ -n "$src" ] || { echo "error: $lib is not installed on the build machine" >&2; exit 1; }
   install -Dm644 "$(readlink -f "$src")" "$APPDIR/usr/lib/fallback/$lib/$lib"
 done
