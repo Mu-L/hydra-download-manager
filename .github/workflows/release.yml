@@ -389,6 +389,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     container: ubuntu:20.04
+    # Inside a container `run` defaults to sh, which is dash here and has no
+    # `set -o pipefail`.
+    defaults:
+      run:
+        shell: bash
     env:
       VERSION: ${{ needs.verify-version.outputs.version }}
       TARGET: ${{ matrix.target }}
