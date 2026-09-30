@@ -22,13 +22,17 @@
 # did not test. Those libraries are present on every Linux desktop that can
 # run a GTK application at all; the portability that matters here — no
 # install, no root, no package database — does not depend on shipping them.
-# What DOES set the floor is glibc, so release CI builds this on the oldest
-# supported Ubuntu (.github/workflows/release.yml).
+# What DOES set the floor is glibc, so release CI builds this in an Ubuntu
+# 20.04 container (.github/workflows/release.yml).
+#
+# The exception is xkbcommon (see FALLBACK_LIBS): winit dlopens it, and it is
+# missing often enough that its absence is a crash at startup.
 #
 # Layout inside the image:
 #   AppRun                                 dispatcher + desktop integration
 #   hydra.desktop, hydra.png, .DirIcon     what the runtime and stores read
 #   usr/bin/{hydra,hydra-gui,hydra-host,hydra-updater}
+#   usr/lib/fallback/<soname>/<soname>    used only when the host lacks it
 #   usr/share/applications/hydra.desktop
 #   usr/share/icons/hicolor/<N>x<N>/apps/hydra.png
 #   usr/share/metainfo/io.github.ja7ad.hydra.appdata.xml
@@ -103,6 +107,19 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
 
 for b in hydra hydra-gui hydra-host hydra-updater; do
   install -Dm755 "$BIN/$b" "$APPDIR/usr/bin/$b"
+done
+
+# --- fallback libraries --------------------------------------------------------
+# winit dlopens these when the GUI opens its first window, so ldd never lists
+# them, and a host without them panics at startup. None is on the AppImage
+# excludelist. Each sits in a directory of its own so AppRun can add only the
+# ones the host lacks: a host copy is usually newer, and must stay the one the
+# GUI and every program it starts resolve.
+FALLBACK_LIBS="libxkbcommon.so.0 libxkbcommon-x11.so.0 libxcb-xkb.so.1"
+for lib in $FALLBACK_LIBS; do
+  src=$(PATH="$PATH:/sbin:/usr/sbin" ldconfig -p | awk -v lib="$lib" '$1 == lib { print $NF; exit }')
+  [ -n "$src" ] || { echo "error: $lib is not installed on the build machine" >&2; exit 1; }
+  install -Dm644 "$(readlink -f "$src")" "$APPDIR/usr/lib/fallback/$lib/$lib"
 done
 
 # --- icons --------------------------------------------------------------------
@@ -349,6 +366,27 @@ DESKTOPEOF
   return 0
 }
 
+# Puts on the search path only the fallback libraries this host has no copy of
+# for this architecture. With no ldconfig cache to ask (NixOS) all of them go on.
+use_fallback_libs() {
+  case "$(uname -m)" in
+    x86_64) abi='libc6,x86-64' ;;
+    aarch64) abi='libc6,AArch64' ;;
+    *) abi='' ;;
+  esac
+  cache=$(PATH="$PATH:/sbin:/usr/sbin" ldconfig -p 2>/dev/null || true)
+  for dir in "$HERE"/usr/lib/fallback/*; do
+    [ -d "$dir" ] || continue
+    case "$cache" in
+      *"${dir##*/} ($abi"*) ;;
+      *) LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+    esac
+  done
+  if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    export LD_LIBRARY_PATH
+  fi
+}
+
 unintegrate() {
   DATA=$(data_home)/hydra
   rm -f "$(data_home)/applications/hydra.desktop" "$DATA/hydra-host" "$DATA/hydra.png"
@@ -414,6 +452,7 @@ esac
 # program that has no business writing desktop files.
 if [ "$TARGET" = hydra-gui ]; then
   integrate
+  use_fallback_libs
 fi
 
 exec "$HERE/usr/bin/$TARGET" "$@"

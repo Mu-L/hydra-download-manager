@@ -128,8 +128,8 @@ jobs:
           # compatibility floor. `ubuntu-latest` follows GitHub's image
           # rotation, which silently raised that floor to 24.04's glibc 2.39
           # and left the artifacts unable to start on any older distribution.
-          # Pin to the same oldest-supported release the AppImage is built on
-          # (22.04, glibc 2.35) so the whole Linux line has one floor.
+          # Pin to the oldest release with a hosted runner (22.04, glibc 2.35).
+          # The AppImage goes lower, in a 20.04 container (see build-appimage).
           - os: linux
             arch: amd64
             runner: ubuntu-22.04
@@ -363,11 +363,11 @@ jobs:
 
   # ---------------------------------------------------------------- AppImage
   #
-  # A separate job from `build`, on the OLDEST supported Ubuntu, and that is
-  # the whole point: an AppImage's compatibility floor is the glibc it was
-  # linked against, and the release matrix runs on ubuntu-latest, whose glibc
-  # is newer than Debian stable's. Building here gives one file that runs on
-  # everything from Ubuntu 22.04 and Debian 12 upwards.
+  # A separate job from `build`, in an Ubuntu 20.04 container, and that is the
+  # whole point: an AppImage's compatibility floor is the glibc it was linked
+  # against. 20.04 has no hosted runner any more, and its glibc 2.31 gives one
+  # file that runs on Ubuntu 20.04, Debian 11, RHEL 9 and everything newer —
+  # the older base AppImageHub asks catalogued images to be built on.
   #
   # It is also the only Linux artifact Hydra can update itself from: the deb
   # and the rpm install into /usr, which only dpkg or rpm may rewrite, so the
@@ -382,32 +382,39 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-22.04
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - arch: aarch64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
+    container: ubuntu:20.04
     env:
       VERSION: ${{ needs.verify-version.outputs.version }}
       TARGET: ${{ matrix.target }}
+      DEBIAN_FRONTEND: noninteractive
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      # Before checkout: without git in the container, checkout falls back to
+      # a tarball with no history.
+      #
       # The same build dependencies as the linux legs of `build`, plus the
       # AppImage toolchain: zsync for the delta-update information the image
       # advertises, desktop-file-utils for the desktop-entry validation
-      # appimagetool runs, squashfs-tools for the image itself. No FUSE:
-      # appimagetool is an AppImage and the runners have none, so it is run
+      # appimagetool runs, squashfs-tools for the image itself, and the
+      # xkbcommon runtime libraries the image carries as fallbacks. No FUSE:
+      # appimagetool is an AppImage and containers have none, so it is run
       # with APPIMAGE_EXTRACT_AND_RUN instead.
       - name: Install build and packaging dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential python3 file \
             pkg-config libasound2-dev libx11-dev libxrandr-dev \
-            libxcb1-dev libxkbcommon-dev imagemagick \
-            zsync desktop-file-utils squashfs-tools
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-0 libxcb-xkb1 \
+            imagemagick zsync desktop-file-utils squashfs-tools
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -417,7 +424,9 @@ jobs:
       - name: Set up Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: appimage-${{ matrix.target }}
+          # Keyed apart from the old 22.04 builds: objects compiled against a newer
+          # glibc would carry its symbol versions into the image.
+          key: appimage-focal-${{ matrix.target }}
 
       - name: Build CLI, GUI, native-messaging host, and update finisher
         run: cargo build --release --locked --target ${{ matrix.target }} -p hya-cli -p hya-gui -p hya-host -p hya-updater
@@ -481,16 +490,22 @@ jobs:
   # There is deliberately no second BUILD here. An AppImage's compatibility
   # floor is the glibc it was linked against, so building the same image again
   # on 24.04 or 26.04 would produce a file that runs on strictly FEWER systems
-  # than the 22.04 one — and, sharing its name, would race it into the release.
+  # than the 20.04 one — and, sharing its name, would race it into the release.
   # Building once on the oldest supported release and proving the result
-  # forward is the only arrangement where "supports 22.04 through 26.10" is a
+  # forward is the only arrangement where "supports 20.04 through 26.10" is a
   # tested claim.
   #
-  # Containers, because GitHub hosts runner images for LTS releases only —
-  # 22.10 and 24.10 have no runner label and never will. The image is started
+  # Containers, because GitHub hosts runner images for current LTS releases
+  # only — 20.04, 22.10 and 24.10 have no runner label. The image is started
   # with APPIMAGE_EXTRACT_AND_RUN because containers have no FUSE; that skips
   # the runtime's mount, which is the one part of an AppImage that does not
   # depend on the host's libraries, and exercises everything that does.
+  #
+  # On the LTS releases the GUI is also opened on Xvfb, on a host that has what
+  # every X11 desktop has and no xkbcommon: winit dlopens that at the first
+  # window, so only a real window shows whether the image's fallback copies
+  # work. Interim releases are skipped there because their archives move to
+  # old-releases once they go end-of-life, and apt can no longer install Xvfb.
   verify-appimage:
     name: AppImage runs on Ubuntu ${{ matrix.release }}
     needs: [build-appimage]
@@ -498,7 +513,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        release: ["22.04", "22.10", "24.04", "24.10", "25.04", "25.10", "26.04", "26.10"]
+        release: ["20.04", "22.04", "22.10", "24.04", "24.10", "25.04", "25.10", "26.04", "26.10"]
     steps:
       - name: Download the AppImage
         uses: actions/download-artifact@v4
@@ -519,23 +534,51 @@ jobs:
             echo "::notice::ubuntu:$RELEASE is not on Docker Hub yet; nothing to verify against"
             exit 0
           fi
+          GUI_CHECK=0
+          case "$RELEASE" in
+            [0-9][02468].04) GUI_CHECK=1 ;;
+          esac
           IMG=$(readlink -f "$(ls -1 dist/*.AppImage | head -1)")
           chmod +x "$IMG"
-          docker run --rm -v "$IMG:/hydra.AppImage:ro" -e APPIMAGE_EXTRACT_AND_RUN=1 \
-            "ubuntu:$RELEASE" /bin/sh -euc '
-              ldd --version | head -1
-              cp /hydra.AppImage /tmp/hydra.AppImage
-              chmod +x /tmp/hydra.AppImage
-              # The CLI and the finisher link the same C library the GUI does;
-              # what a container cannot exercise is the display server, not
-              # the loader, so these two answer the portability question.
-              /tmp/hydra.AppImage --hydra-version
-              /tmp/hydra.AppImage --hydra-exec hydra --version
-              /tmp/hydra.AppImage --hydra-exec hydra-updater --help >/dev/null
-              mkdir -p /tmp/home
-              HOME=/tmp/home /tmp/hydra.AppImage --hydra-install
-              test -x /tmp/home/.local/share/hydra/hydra-host
-            '
+          docker run --rm -i -v "$IMG:/hydra.AppImage:ro" -e APPIMAGE_EXTRACT_AND_RUN=1 \
+            -e GUI_CHECK="$GUI_CHECK" -e DEBIAN_FRONTEND=noninteractive \
+            "ubuntu:$RELEASE" /bin/bash -s <<'SCRIPT'
+          set -euo pipefail
+          ldd --version | head -1
+          cp /hydra.AppImage /tmp/hydra.AppImage
+          chmod +x /tmp/hydra.AppImage
+          /tmp/hydra.AppImage --hydra-version
+          /tmp/hydra.AppImage --hydra-exec hydra --version
+          /tmp/hydra.AppImage --hydra-exec hydra-updater --help >/dev/null
+          mkdir -p /tmp/home
+          HOME=/tmp/home /tmp/hydra.AppImage --hydra-install
+          test -x /tmp/home/.local/share/hydra/hydra-host
+          [ "$GUI_CHECK" = 1 ] || exit 0
+
+          apt-get update -qq
+          # Renamed for the 64-bit time_t transition in 24.04.
+          ALSA=libasound2
+          apt-cache show libasound2t64 >/dev/null 2>&1 && ALSA=libasound2t64
+          apt-get install -y -qq --no-install-recommends xvfb x11-utils procps \
+            "$ALSA" libx11-6 libx11-xcb1 libxcursor1 libxrandr2 libxi6 >/dev/null
+          if ldconfig -p | grep -q libxkbcommon-x11; then
+            echo "the test host has libxkbcommon-x11, so it proves nothing about the fallback" >&2
+            exit 1
+          fi
+          Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
+          export DISPLAY=:99
+          sleep 2
+          mkdir -p /tmp/gui-home
+          HOME=/tmp/gui-home /tmp/hydra.AppImage >/tmp/gui.log 2>&1 &
+          sleep 15
+          if ! xwininfo -root -tree | grep -q '"Hydra Download Manager"'; then
+            echo "the GUI did not open its window:" >&2
+            cat /tmp/gui.log >&2
+            exit 1
+          fi
+          echo "GUI window is up"
+          pkill -f usr/bin/hydra-gui || true
+          SCRIPT
 
   # ---------------------------------------------------------------- Flatpak
   #
