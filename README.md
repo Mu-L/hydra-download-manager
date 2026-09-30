@@ -137,9 +137,10 @@ The scripts detect your OS and architecture (amd64/arm64), fetch the matching ar
 **Linux compatibility.** The CLI archive is a static musl build with no shared
 library of any kind, so `--cli` works on any distribution — old LTS releases,
 minimal containers, Alpine — regardless of its glibc. The desktop artifacts
-(GUI archive, `.deb`, `.rpm`, AppImage) link the system's GTK, X11 and ALSA and
-are built on Ubuntu 22.04, which puts their floor at glibc 2.35: Ubuntu 22.04,
-Debian 12, RHEL 9 and newer.
+(GUI archive, `.deb`, `.rpm`) link the system's GTK, X11 and ALSA and are built
+on Ubuntu 22.04, which puts their floor at glibc 2.35: Ubuntu 22.04, Debian 12,
+RHEL 9 and newer. The AppImage is built on Ubuntu 20.04 and goes further back,
+to glibc 2.31: Ubuntu 20.04, Debian 11 and newer.
 
 A GUI install is a real desktop app, not a loose binary:
 
@@ -260,9 +261,9 @@ chmod +x Hydra-*-x86_64.AppImage
 ```
 
 `aarch64` images are published alongside the `x86_64` ones. Every release is
-built on the oldest supported Ubuntu and verified to run on 22.04 through the
-current release, so one image covers the whole line and the distributions
-downstream of it.
+built on Ubuntu 20.04 and verified to run on 20.04 through the current
+release, so one image covers the whole line and the distributions downstream
+of it.
 
 The image carries the GUI, the `hydra` CLI, the `hydra-host` native-messaging
 bridge and the update finisher. On its first start it writes a menu entry, a
